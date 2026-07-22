@@ -1,0 +1,34 @@
+[project]
+name = "neoversity-ml-final"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "catboost>=1.2.10",
+    "ipykernel>=7.3.0",
+    "joblib>=1.5.3",
+    "jupyterlab>=4.6.2",
+    "lightgbm>=4.7.0",
+    "matplotlib>=3.11.1",
+    "mlflow>=3.14.0",
+    "numba>=0.59",
+    "numpy>=2.0,<2.5",
+    "optuna>=4.9.0",
+    "pandas>=2.3.3",
+    "plotly>=6.9.0",
+    "pyarrow>=24.0.0",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.9.0",
+    "scipy>=1.18.0",
+    "shap>=0.49.1",
+    "tqdm>=4.69.0",
+    "xgboost>=3.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+    "pytest>=9.1.1",
+    "ruff>=0.15.22",
+]
