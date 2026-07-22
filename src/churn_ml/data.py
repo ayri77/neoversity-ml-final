@@ -167,7 +167,7 @@ def compare_feature_distributions(
 
     def _format_feature_value(value: Any) -> str | Any:
         """Return a readable representation of a feature value."""
-        return "<MISSING>" if pd.isna(value) else value  
+        return "<MISSING>" if pd.isna(value) else value
 
     missing_columns = sorted(
         set(columns) - set(train.columns) - set(test.columns)
