@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (
+    average_precision_score,
+    balanced_accuracy_score,
+    log_loss,
+    roc_auc_score,
+)
+
+
+@dataclass(frozen=True)
+class PredictionResult:
+    probabilities: np.ndarray
+    predictions: np.ndarray
+    threshold: float
+
+    @classmethod
+    def from_probabilities(
+        cls,
+        probabilities: np.ndarray,
+        threshold: float,
+    ) -> "PredictionResult":
+        """Create binary predictions from positive-class probabilities."""
+        probabilities_array = np.asarray(
+            probabilities,
+            dtype=float,
+        )
+
+        if probabilities_array.ndim != 1:
+            raise ValueError(
+                "Probabilities must be a one-dimensional array."
+            )
+
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(
+                "Threshold must be between 0 and 1."
+            )
+
+        predictions = (
+            probabilities_array >= threshold
+        ).astype(int)
+
+        return cls(
+            probabilities=probabilities_array,
+            predictions=predictions,
+            threshold=float(threshold),
+        )
+
+
+@dataclass(frozen=True)
+class ThresholdOptimizationResult:
+    threshold: float
+    balanced_accuracy: float
+    scores: pd.DataFrame
+
+
+def calculate_binary_metrics(
+    y_true: pd.Series | np.ndarray,
+    prediction_result: PredictionResult,
+) -> dict[str, float]:
+    """Calculate threshold-based and probability-based metrics."""
+    y_true_array = np.asarray(y_true)
+
+    return {
+        "balanced_accuracy": float(
+            balanced_accuracy_score(
+                y_true_array,
+                prediction_result.predictions,
+            )
+        ),
+        "roc_auc": float(
+            roc_auc_score(
+                y_true_array,
+                prediction_result.probabilities,
+            )
+        ),
+        "average_precision": float(
+            average_precision_score(
+                y_true_array,
+                prediction_result.probabilities,
+            )
+        ),
+        "log_loss": float(
+            log_loss(
+                y_true_array,
+                prediction_result.probabilities,
+            )
+        ),
+        "decision_threshold": prediction_result.threshold,
+    }
+
+
+def optimize_balanced_accuracy_threshold(
+    y_true: pd.Series | np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    thresholds: np.ndarray | None = None,
+) -> ThresholdOptimizationResult:
+    """Find the threshold maximizing balanced accuracy."""
+    y_true_array = np.asarray(y_true)
+    probabilities_array = np.asarray(
+        probabilities,
+        dtype=float,
+    )
+
+    if probabilities_array.ndim != 1:
+        raise ValueError(
+            "Probabilities must be a one-dimensional array."
+        )
+
+    if len(y_true_array) != len(probabilities_array):
+        raise ValueError(
+            "y_true and probabilities must have the same length."
+        )
+
+    if thresholds is None:
+        thresholds = np.linspace(
+            0.01,
+            0.99,
+            981,
+        )
+
+    threshold_values = np.asarray(
+        thresholds,
+        dtype=float,
+    )
+
+    scores = np.array(
+        [
+            balanced_accuracy_score(
+                y_true_array,
+                (
+                    probabilities_array >= threshold
+                ).astype(int),
+            )
+            for threshold in threshold_values
+        ],
+        dtype=float,
+    )
+
+    best_position = int(np.argmax(scores))
+
+    scores_frame = pd.DataFrame(
+        {
+            "threshold": threshold_values,
+            "balanced_accuracy": scores,
+        }
+    )
+
+    return ThresholdOptimizationResult(
+        threshold=float(
+            threshold_values[best_position]
+        ),
+        balanced_accuracy=float(
+            scores[best_position]
+        ),
+        scores=scores_frame,
+    )
