@@ -34,7 +34,8 @@ data/processed/*
 # Experiment artifacts
 artifacts/
 mlruns/
-sandbox/
+sandbox/*
+!sandbox/autogluon
 notebooks/sandbox/
 
 # Models and predictions

@@ -1,0 +1,33 @@
+# Pinned, GPU-enabled dependencies for .venv-autogluon (Python 3.12.12, uv-managed).
+# Install with:
+#   uv pip install --python .venv-autogluon/Scripts/python.exe -r sandbox/autogluon/requirements-autogluon.txt --index-url https://download.pytorch.org/whl/cu128 --extra-index-url https://pypi.org/simple
+#
+# Do NOT `uv add` these into the root pyproject.toml — this environment is intentionally
+# isolated from the main .venv and is managed only through this file.
+
+autogluon.tabular[fastai,ray]==1.5.0
+
+# CUDA-enabled build (RTX 4080 Laptop, driver 610.62, CUDA UMD 13.3 -> cu128 wheels).
+# Version window required by autogluon.tabular==1.5.0: torch<2.10,>=2.6
+torch==2.9.1+cu128
+torchvision==0.24.1+cu128
+
+# fastai 2.8.7 calls the removed `L.starmap` API -> fastcore must stay < 2.0.
+# (fastai's own constraint is only fastcore>=1.8.0, so this must be pinned manually.)
+fastai==2.8.7
+fastcore==1.14.5
+
+# fastprogress>=1.1.0 unconditionally imports python-fasthtml, which requires
+# fastcore>=2.1.2 - directly incompatible with the fastcore<2.0 pin above.
+# 1.0.5 is the last release with no fasthtml dependency.
+fastprogress==1.0.5
+
+# Within autogluon.tabular's declared bounds (lightgbm<4.7,>=4.0); the _mem_early_stop
+# TypeError is a runtime/config issue (see sandbox/autogluon/README.md), not a version pin.
+lightgbm==4.6.0
+
+# Within autogluon.core's declared bounds (ray<2.53,>=2.43.0).
+ray==2.52.1
+
+catboost==1.2.10
+xgboost==3.1.3
