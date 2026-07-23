@@ -77,6 +77,7 @@ class LoadedExperiment:
     fold_metrics: pd.DataFrame
     oof_predictions: pd.DataFrame
     test_predictions: pd.DataFrame
+    fitted_models: list[Any] | None
 
 
 def load_experiment(
@@ -109,11 +110,21 @@ def load_experiment(
 
     result = ExperimentResult(**result_payload)
 
+    model_path = experiment_dir / "model.joblib"
+
+    fitted_models = None
+
+    if model_path.exists():
+        import joblib
+
+        fitted_models = joblib.load(model_path)
+
     return LoadedExperiment(
         result=result,
         fold_metrics=pd.read_csv(required_files["fold_metrics"]),
         oof_predictions=pd.read_parquet(required_files["oof_predictions"]),
         test_predictions=pd.read_parquet(required_files["test_predictions"]),
+        fitted_models=fitted_models,
     )
 
 
