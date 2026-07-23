@@ -63,3 +63,6 @@ notebooks/sandbox/
 # OS
 .DS_Store
 Thumbs.db
+
+# Competition submissions
+submissions/
