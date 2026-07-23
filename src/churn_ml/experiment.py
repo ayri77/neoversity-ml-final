@@ -107,7 +107,7 @@ class Experiment:
         models_dir.mkdir()
 
         reports_dir = run_root / "reports"
-        reports_dir.mkdir()        
+        reports_dir.mkdir()
 
         self.paths = ExperimentPaths(
             root=run_root,
@@ -157,19 +157,14 @@ class Experiment:
             "created_at": self.created_at.isoformat(),
             "started_at": self.started_at.isoformat(),
             "finished_at": (
-                self.finished_at.isoformat()
-                if self.finished_at is not None
-                else None
+                self.finished_at.isoformat() if self.finished_at is not None else None
             ),
             "duration_seconds": self.duration_seconds,
             "seed": self.seed,
             "n_folds": self.n_folds,
             "git": self.git_info,
             "data": self.data_fingerprints,
-            "paths": {
-                key: str(value)
-                for key, value in asdict(self.paths).items()
-            },
+            "paths": {key: str(value) for key, value in asdict(self.paths).items()},
         }
 
         self._write_json(self.paths.metadata, metadata)
@@ -244,7 +239,6 @@ class Experiment:
 
         dataframe.to_csv(path, index=index)
         return path
-
 
     def save_json(
         self,
@@ -347,11 +341,7 @@ class Experiment:
             "public_score": self._metrics.get("public_score", ""),
             "duration_seconds": self.duration_seconds or "",
             "seed": self.seed if self.seed is not None else "",
-            "n_folds": (
-                self.n_folds
-                if self.n_folds is not None
-                else ""
-            ),
+            "n_folds": (self.n_folds if self.n_folds is not None else ""),
             "git_commit": self.git_info.get("commit", ""),
             "git_dirty": self.git_info.get("dirty", ""),
             "notes": self.notes,
@@ -362,9 +352,7 @@ class Experiment:
     def _make_safe_name(value: str) -> str:
         normalized = value.strip().lower()
         safe = "".join(
-            character
-            if character.isalnum() or character in {"-", "_"}
-            else "_"
+            character if character.isalnum() or character in {"-", "_"} else "_"
             for character in normalized
         )
         return safe.strip("_") or "experiment"
@@ -469,6 +457,5 @@ class Experiment:
             return value.isoformat()
 
         raise TypeError(
-            f"Object of type {type(value).__name__} "
-            "is not JSON serializable"
+            f"Object of type {type(value).__name__} is not JSON serializable"
         )

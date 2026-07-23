@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+
 @dataclass(frozen=True)
 class CompetitionData:
     train: pd.DataFrame
@@ -18,9 +19,7 @@ class CompetitionData:
 def load_competition_data(
     train_path: str | Path = "data/raw/final_proj_data.csv",
     test_path: str | Path = "data/raw/final_proj_test.csv",
-    sample_submission_path: str | Path = (
-        "data/raw/final_proj_sample_submission.csv"
-    ),
+    sample_submission_path: str | Path = ("data/raw/final_proj_sample_submission.csv"),
     *,
     target_column: str = "y",
 ) -> CompetitionData:
@@ -37,20 +36,14 @@ def load_competition_data(
     sample_submission = pd.read_csv(sample_submission_path)
 
     if target_column not in train.columns:
-        raise ValueError(
-            f"Target column '{target_column}' is absent from train data."
-        )
+        raise ValueError(f"Target column '{target_column}' is absent from train data.")
 
     if target_column in test.columns:
         raise ValueError(
             f"Target column '{target_column}' must not be present in test data."
         )
 
-    feature_columns = [
-        column
-        for column in train.columns
-        if column != target_column
-    ]
+    feature_columns = [column for column in train.columns if column != target_column]
 
     missing_in_test = sorted(set(feature_columns) - set(test.columns))
     extra_in_test = sorted(set(test.columns) - set(feature_columns))
@@ -96,17 +89,9 @@ def audit_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                 "dtype": str(series.dtype),
                 "n_rows": row_count,
                 "n_missing": n_missing,
-                "missing_rate": (
-                    n_missing / row_count
-                    if row_count > 0
-                    else 0.0
-                ),
+                "missing_rate": (n_missing / row_count if row_count > 0 else 0.0),
                 "n_unique": n_unique,
-                "unique_rate": (
-                    n_unique / row_count
-                    if row_count > 0
-                    else 0.0
-                ),
+                "unique_rate": (n_unique / row_count if row_count > 0 else 0.0),
                 "is_constant": n_unique <= 1,
                 "is_all_missing": n_missing == row_count,
                 "is_numeric": pd.api.types.is_numeric_dtype(series),
@@ -142,19 +127,12 @@ def summarize_dataframe(df: pd.DataFrame) -> dict[str, int | float]:
         "n_rows": row_count,
         "n_columns": column_count,
         "duplicate_rows": duplicate_rows,
-        "duplicate_rate": (
-            duplicate_rows / row_count
-            if row_count > 0
-            else 0.0
-        ),
+        "duplicate_rate": (duplicate_rows / row_count if row_count > 0 else 0.0),
         "total_missing": total_missing,
-        "columns_with_missing": int(
-            df.isna().any(axis=0).sum()
-        ),
-        "constant_columns": int(
-            (df.nunique(dropna=True) <= 1).sum()
-        ),
+        "columns_with_missing": int(df.isna().any(axis=0).sum()),
+        "constant_columns": int((df.nunique(dropna=True) <= 1).sum()),
     }
+
 
 def compare_feature_distributions(
     train: pd.DataFrame,
@@ -169,13 +147,9 @@ def compare_feature_distributions(
         """Return a readable representation of a feature value."""
         return "<MISSING>" if pd.isna(value) else value
 
-    missing_columns = sorted(
-        set(columns) - set(train.columns) - set(test.columns)
-    )
+    missing_columns = sorted(set(columns) - set(train.columns) - set(test.columns))
     if missing_columns:
-        raise KeyError(
-            f"Columns not found in train or test: {missing_columns}"
-        )
+        raise KeyError(f"Columns not found in train or test: {missing_columns}")
 
     summary_records: list[dict[str, object]] = []
     distribution_records: list[dict[str, object]] = []
@@ -198,9 +172,7 @@ def compare_feature_distributions(
                 }
             )
 
-            value_counts = series.value_counts(
-                dropna=not include_missing
-            )
+            value_counts = series.value_counts(dropna=not include_missing)
 
             for value, count in value_counts.items():
                 distribution_records.append(
@@ -218,6 +190,7 @@ def compare_feature_distributions(
 
     return summary, distributions
 
+
 def analyze_missing_values(
     dataframe: pd.DataFrame,
 ) -> pd.DataFrame:
@@ -233,18 +206,11 @@ def analyze_missing_values(
         }
     )
 
-    summary["n_present"] = (
-        summary["n_rows"] - summary["n_missing"]
-    )
+    summary["n_present"] = summary["n_rows"] - summary["n_missing"]
 
-    summary["missing_rate"] = (
-        summary["n_missing"] / summary["n_rows"]
-    )
+    summary["missing_rate"] = summary["n_missing"] / summary["n_rows"]
 
-    summary["missing_bucket"] = (
-        summary["missing_rate"]
-        .map(categorize_missing_rate)
-    )    
+    summary["missing_bucket"] = summary["missing_rate"].map(categorize_missing_rate)
 
     summary = summary.sort_values(
         ["missing_rate", "column"],
@@ -252,6 +218,7 @@ def analyze_missing_values(
     ).reset_index(drop=True)
 
     return summary
+
 
 def categorize_missing_rate(
     missing_rate: float,
@@ -269,6 +236,7 @@ def categorize_missing_rate(
     if missing_rate < 1:
         return "Very high (75–100%)"
     return "All missing"
+
 
 def analyze_feature_types(
     dataframe: pd.DataFrame,
@@ -299,13 +267,9 @@ def analyze_feature_types(
         }
     )
 
-    type_summary["feature_rate"] = (
-        type_summary["feature_count"] / dataframe.shape[1]
-    )
+    type_summary["feature_rate"] = type_summary["feature_count"] / dataframe.shape[1]
 
-    type_summary["feature_rate_pct"] = (
-        type_summary["feature_rate"] * 100
-    ).round(1)    
+    type_summary["feature_rate_pct"] = (type_summary["feature_rate"] * 100).round(1)
 
     type_summary["description"] = [
         "Integer and floating-point features",
@@ -314,9 +278,10 @@ def analyze_feature_types(
         "Boolean features",
         "Object (string) features",
         "Pandas categorical features",
-    ]            
+    ]
 
     return type_summary
+
 
 def categorize_cardinality(
     n_unique: int,
@@ -337,6 +302,7 @@ def categorize_cardinality(
         return "Medium (51–200)"
     return "High (>200)"
 
+
 def analyze_cardinality(
     dataframe: pd.DataFrame,
 ) -> pd.DataFrame:
@@ -352,20 +318,11 @@ def analyze_cardinality(
         }
     )
 
-    summary["unique_rate"] = (
-        summary["n_unique"] / n_rows
-        if n_rows > 0
-        else 0.0
-    )
+    summary["unique_rate"] = summary["n_unique"] / n_rows if n_rows > 0 else 0.0
 
-    summary["is_constant"] = (
-        summary["n_unique"] <= 1
-    )
+    summary["is_constant"] = summary["n_unique"] <= 1
 
-    summary["cardinality_bucket"] = (
-        summary["n_unique"]
-        .map(categorize_cardinality)
-    )
+    summary["cardinality_bucket"] = summary["n_unique"].map(categorize_cardinality)
 
     summary = summary.sort_values(
         ["n_unique", "column"],
@@ -373,6 +330,7 @@ def analyze_cardinality(
     ).reset_index(drop=True)
 
     return summary
+
 
 def analyze_numeric_features(
     dataframe: pd.DataFrame,
@@ -405,9 +363,7 @@ def analyze_numeric_features(
     )
 
     summary["missing_rate"] = (
-        summary["n_missing"] / summary["n_rows"]
-        if len(numeric_data) > 0
-        else 0.0
+        summary["n_missing"] / summary["n_rows"] if len(numeric_data) > 0 else 0.0
     )
 
     summary["iqr"] = summary["q3"] - summary["q1"]
@@ -422,6 +378,7 @@ def analyze_numeric_features(
     ).reset_index(drop=True)
 
     return summary
+
 
 def analyze_categorical_features(
     dataframe: pd.DataFrame,
@@ -452,9 +409,7 @@ def analyze_categorical_features(
     if not 0 <= rare_threshold <= 1:
         raise ValueError("rare_threshold must be between 0 and 1.")
 
-    categorical_data = dataframe.select_dtypes(
-        include=["object", "category"]
-    )
+    categorical_data = dataframe.select_dtypes(include=["object", "category"])
 
     records: list[dict[str, object]] = []
 
@@ -506,14 +461,11 @@ def analyze_categorical_features(
     if summary.empty:
         return summary
 
-    return (
-        summary
-        .sort_values(
-            ["n_unique", "missing_rate", "column"],
-            ascending=[False, False, True],
-        )
-        .reset_index(drop=True)
-    )
+    return summary.sort_values(
+        ["n_unique", "missing_rate", "column"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+
 
 def categorize_top_rate(rate: float) -> str:
     """

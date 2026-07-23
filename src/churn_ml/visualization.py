@@ -59,9 +59,7 @@ def plot_numeric_distribution(
     values = dataframe[column].dropna()
 
     if values.empty:
-        raise ValueError(
-            f"Column contains no non-missing values: {column}"
-        )
+        raise ValueError(f"Column contains no non-missing values: {column}")
 
     use_log = include_log and values.min() >= 0
 
@@ -120,13 +118,11 @@ def plot_numeric_distribution(
         f"Skewness: {skewness:.2f}"
     )
 
-    figure.suptitle(
-        f"Numerical feature distribution — {column}\n"
-        f"{statistics_text}"
-    )
+    figure.suptitle(f"Numerical feature distribution — {column}\n{statistics_text}")
     figure.tight_layout()
 
     return figure
+
 
 def plot_categorical_distribution(
     dataframe: pd.DataFrame,
@@ -259,9 +255,7 @@ def plot_categorical_distribution(
     axis.set_ylabel("Category")
 
     if normalize:
-        axis.xaxis.set_major_formatter(
-            FuncFormatter(lambda value, _: f"{value:.0%}")
-        )
+        axis.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0%}"))
 
     # Leave space for labels placed after the bars.
     axis.margins(x=0.08)

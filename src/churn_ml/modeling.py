@@ -10,6 +10,7 @@ import pandas as pd
 
 from sklearn.model_selection import StratifiedKFold
 
+
 @dataclass(frozen=True)
 class ExperimentConfig:
     random_state: int
@@ -36,6 +37,7 @@ class ExperimentConfig:
             decision_threshold=0.5,
         )
 
+
 @dataclass(frozen=True)
 class ExperimentResult:
     experiment_id: str
@@ -49,6 +51,7 @@ class ExperimentResult:
     training_time_seconds: float
     created_at_utc: str
 
+
 @dataclass(frozen=True)
 class CrossValidationOutput:
     fold_metrics: pd.DataFrame
@@ -58,6 +61,7 @@ class CrossValidationOutput:
     fitted_models: list[Any]
     training_time_seconds: float
 
+
 @dataclass(frozen=True)
 class ExperimentOutput:
     result: ExperimentResult
@@ -66,12 +70,14 @@ class ExperimentOutput:
     test_predictions: pd.DataFrame
     fitted_models: list[Any]
 
+
 @dataclass(frozen=True)
 class LoadedExperiment:
     result: ExperimentResult
     fold_metrics: pd.DataFrame
     oof_predictions: pd.DataFrame
     test_predictions: pd.DataFrame
+
 
 def load_experiment(
     experiment_id: str,
@@ -87,11 +93,7 @@ def load_experiment(
         "test_predictions": experiment_dir / "test_predictions.parquet",
     }
 
-    missing_files = [
-        path.name
-        for path in required_files.values()
-        if not path.exists()
-    ]
+    missing_files = [path.name for path in required_files.values() if not path.exists()]
 
     if missing_files:
         raise FileNotFoundError(
@@ -109,16 +111,11 @@ def load_experiment(
 
     return LoadedExperiment(
         result=result,
-        fold_metrics=pd.read_csv(
-            required_files["fold_metrics"]
-        ),
-        oof_predictions=pd.read_parquet(
-            required_files["oof_predictions"]
-        ),
-        test_predictions=pd.read_parquet(
-            required_files["test_predictions"]
-        ),
+        fold_metrics=pd.read_csv(required_files["fold_metrics"]),
+        oof_predictions=pd.read_parquet(required_files["oof_predictions"]),
+        test_predictions=pd.read_parquet(required_files["test_predictions"]),
     )
+
 
 def create_stratified_cv(
     config: ExperimentConfig,
@@ -133,12 +130,11 @@ def create_stratified_cv(
         random_state=config.random_state,
     )
 
+
 def summarize_target(y: pd.Series) -> pd.DataFrame:
     """Return class counts and proportions for a target variable."""
     summary = (
-        y.value_counts(dropna=False)
-        .rename_axis("class")
-        .reset_index(name="count")
+        y.value_counts(dropna=False).rename_axis("class").reset_index(name="count")
     )
 
     summary["proportion"] = summary["count"] / len(y)
@@ -159,11 +155,7 @@ def save_experiment_result(
     """Save experiment metadata, metrics, predictions, and model."""
     experiment_dir = experiments_dir / result.experiment_id
 
-    if (
-        experiment_dir.exists()
-        and any(experiment_dir.iterdir())
-        and not overwrite
-    ):
+    if experiment_dir.exists() and any(experiment_dir.iterdir()) and not overwrite:
         raise FileExistsError(
             f"Experiment already exists: {experiment_dir}. "
             "Use overwrite=True to replace it."
@@ -229,9 +221,7 @@ def load_experiment_results(
         validation = record.pop("validation_strategy", {})
         parameters = record.pop("parameters", {})
 
-        record.update(
-            {f"metric_{name}": value for name, value in metrics.items()}
-        )
+        record.update({f"metric_{name}": value for name, value in metrics.items()})
         record["validation_strategy"] = validation
         record["parameters"] = parameters
 
@@ -243,6 +233,7 @@ def load_experiment_results(
 def utc_timestamp() -> str:
     """Return the current UTC timestamp in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat()
+
 
 def build_experiment_summary(
     result: ExperimentResult,

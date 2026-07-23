@@ -33,14 +33,11 @@ def save_dataset(
         )
 
     if len(dataset.X_train) != len(dataset.y_train):
-        raise ValueError(
-            "X_train and y_train must contain the same number of rows."
-        )
+        raise ValueError("X_train and y_train must contain the same number of rows.")
 
     if list(dataset.X_train.columns) != list(dataset.X_test.columns):
         raise ValueError(
-            "X_train and X_test must contain the same columns "
-            "in the same order."
+            "X_train and X_test must contain the same columns in the same order."
         )
 
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -49,9 +46,7 @@ def save_dataset(
         dataset_dir / "X_train.parquet",
         index=False,
     )
-    dataset.y_train.to_frame(
-        name=dataset.y_train.name or "target"
-    ).to_parquet(
+    dataset.y_train.to_frame(name=dataset.y_train.name or "target").to_parquet(
         dataset_dir / "y_train.parquet",
         index=False,
     )
@@ -93,14 +88,11 @@ def load_dataset(
         dataset_dir / "metadata.json",
     ]
 
-    missing_files = [
-        path.name for path in required_files if not path.exists()
-    ]
+    missing_files = [path.name for path in required_files if not path.exists()]
 
     if missing_files:
         raise FileNotFoundError(
-            f"Dataset version '{version}' is incomplete. "
-            f"Missing files: {missing_files}"
+            f"Dataset version '{version}' is incomplete. Missing files: {missing_files}"
         )
 
     X_train = pd.read_parquet(dataset_dir / "X_train.parquet")
@@ -108,9 +100,7 @@ def load_dataset(
     X_test = pd.read_parquet(dataset_dir / "X_test.parquet")
 
     if y_frame.shape[1] != 1:
-        raise ValueError(
-            "The stored target file must contain exactly one column."
-        )
+        raise ValueError("The stored target file must contain exactly one column.")
 
     with (dataset_dir / "metadata.json").open(
         "r",
@@ -122,19 +112,14 @@ def load_dataset(
 
     if stored_version != version:
         raise ValueError(
-            f"Requested version '{version}', but metadata contains "
-            f"'{stored_version}'."
+            f"Requested version '{version}', but metadata contains '{stored_version}'."
         )
 
     if len(X_train) != len(y_frame):
-        raise ValueError(
-            "Loaded X_train and y_train contain different row counts."
-        )
+        raise ValueError("Loaded X_train and y_train contain different row counts.")
 
     if list(X_train.columns) != list(X_test.columns):
-        raise ValueError(
-            "Loaded X_train and X_test contain different columns."
-        )
+        raise ValueError("Loaded X_train and X_test contain different columns.")
 
     return PreparedDataset(
         version=stored_version,

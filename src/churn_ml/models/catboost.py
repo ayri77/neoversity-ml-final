@@ -25,6 +25,7 @@ from src.churn_ml.modeling import (
     utc_timestamp,
 )
 
+
 @dataclass(frozen=True)
 class CatBoostConfig:
     iterations: int = 1000
@@ -57,13 +58,13 @@ class CatBoostConfig:
 
         return parameters
 
+
 def get_catboost_categorical_features(
     X: pd.DataFrame,
 ) -> list[str]:
     """Return categorical feature names for CatBoost."""
-    return X.select_dtypes(
-        include=["object", "category"]
-    ).columns.tolist()
+    return X.select_dtypes(include=["object", "category"]).columns.tolist()
+
 
 def prepare_catboost_data(
     X_train: pd.DataFrame,
@@ -83,19 +84,13 @@ def prepare_catboost_data(
 
     for column in categorical_features:
         X_train_prepared[column] = (
-            X_train_prepared[column]
-            .astype("string")
-            .fillna("__MISSING__")
+            X_train_prepared[column].astype("string").fillna("__MISSING__")
         )
         X_valid_prepared[column] = (
-            X_valid_prepared[column]
-            .astype("string")
-            .fillna("__MISSING__")
+            X_valid_prepared[column].astype("string").fillna("__MISSING__")
         )
         X_test_prepared[column] = (
-            X_test_prepared[column]
-            .astype("string")
-            .fillna("__MISSING__")
+            X_test_prepared[column].astype("string").fillna("__MISSING__")
         )
 
     return X_train_prepared, X_valid_prepared, X_test_prepared
@@ -129,6 +124,7 @@ def fit_catboost_fold(
     )
 
     return model
+
 
 def run_catboost_cross_validation(
     X: pd.DataFrame,
@@ -180,8 +176,7 @@ def run_catboost_cross_validation(
     for fold_number, (train_idx, valid_idx) in enumerate(
         fold_iterator,
         start=1,
-    ):        
-
+    ):
         oof_folds[valid_idx] = fold_number
 
         X_train_fold = X.iloc[train_idx]
@@ -212,33 +207,21 @@ def run_catboost_cross_validation(
             X_valid=X_valid_prepared,
             y_valid=y_valid_fold,
             categorical_features=categorical_features,
-            early_stopping_rounds=(
-                model_config.early_stopping_rounds
-            ),
+            early_stopping_rounds=(model_config.early_stopping_rounds),
         )
 
         fold_training_time = perf_counter() - fold_start_time
 
-        valid_probabilities = model.predict_proba(
-            X_valid_prepared
-        )[:, 1]
+        valid_probabilities = model.predict_proba(X_valid_prepared)[:, 1]
 
-        test_probabilities = model.predict_proba(
-            X_test_prepared
-        )[:, 1]
+        test_probabilities = model.predict_proba(X_test_prepared)[:, 1]
 
         oof_probabilities[valid_idx] = valid_probabilities
-        test_fold_probabilities[:, fold_number - 1] = (
-            test_probabilities
-        )
+        test_fold_probabilities[:, fold_number - 1] = test_probabilities
 
-        fold_prediction_result = (
-            PredictionResult.from_probabilities(
-                probabilities=valid_probabilities,
-                threshold=(
-                    experiment_config.decision_threshold
-                ),
-            )
+        fold_prediction_result = PredictionResult.from_probabilities(
+            probabilities=valid_probabilities,
+            threshold=(experiment_config.decision_threshold),
         )
 
         fold_metrics = calculate_binary_metrics(
@@ -260,23 +243,16 @@ def run_catboost_cross_validation(
         fitted_models.append(model)
 
         fold_iterator.set_postfix(
-            balanced_accuracy=(
-                f"{fold_metrics['balanced_accuracy']:.4f}"
-            ),
+            balanced_accuracy=(f"{fold_metrics['balanced_accuracy']:.4f}"),
             roc_auc=f"{fold_metrics['roc_auc']:.4f}",
             best_iteration=best_iteration,
         )
 
-
     total_training_time = perf_counter() - start_time
 
-    oof_prediction_result = (
-        PredictionResult.from_probabilities(
-            probabilities=oof_probabilities,
-            threshold=(
-                experiment_config.decision_threshold
-            ),
-        )
+    oof_prediction_result = PredictionResult.from_probabilities(
+        probabilities=oof_probabilities,
+        threshold=(experiment_config.decision_threshold),
     )
 
     overall_metrics = calculate_binary_metrics(
@@ -284,18 +260,14 @@ def run_catboost_cross_validation(
         prediction_result=oof_prediction_result,
     )
 
-    threshold_optimization = (
-        optimize_balanced_accuracy_threshold(
-            y_true=y,
-            probabilities=oof_probabilities,
-        )
+    threshold_optimization = optimize_balanced_accuracy_threshold(
+        y_true=y,
+        probabilities=oof_probabilities,
     )
 
     overall_metrics.update(
         {
-            "optimized_threshold_oof": (
-                threshold_optimization.threshold
-            ),
+            "optimized_threshold_oof": (threshold_optimization.threshold),
             "optimized_balanced_accuracy_oof": (
                 threshold_optimization.balanced_accuracy
             ),
@@ -307,51 +279,35 @@ def run_catboost_cross_validation(
     overall_metrics.update(
         {
             "balanced_accuracy_mean": float(
-                fold_metrics_frame[
-                    "balanced_accuracy"
-                ].mean()
+                fold_metrics_frame["balanced_accuracy"].mean()
             ),
             "balanced_accuracy_std": float(
-                fold_metrics_frame[
-                    "balanced_accuracy"
-                ].std(ddof=1)
+                fold_metrics_frame["balanced_accuracy"].std(ddof=1)
             ),
-            "roc_auc_mean": float(
-                fold_metrics_frame["roc_auc"].mean()
-            ),
-            "roc_auc_std": float(
-                fold_metrics_frame["roc_auc"].std(ddof=1)
-            ),
+            "roc_auc_mean": float(fold_metrics_frame["roc_auc"].mean()),
+            "roc_auc_std": float(fold_metrics_frame["roc_auc"].std(ddof=1)),
             "average_precision_mean": float(
                 fold_metrics_frame["average_precision"].mean()
             ),
             "average_precision_std": float(
                 fold_metrics_frame["average_precision"].std(ddof=1)
             ),
-            "log_loss_mean": float(
-                fold_metrics_frame["log_loss"].mean()
-            ),
-            "log_loss_std": float(
-                fold_metrics_frame["log_loss"].std(ddof=1)
-            ),
+            "log_loss_mean": float(fold_metrics_frame["log_loss"].mean()),
+            "log_loss_std": float(fold_metrics_frame["log_loss"].std(ddof=1)),
         }
     )
 
     test_probabilities = test_fold_probabilities.mean(axis=1)
 
-    test_default_predictions = (
-        PredictionResult.from_probabilities(
-            probabilities=test_probabilities,
-            threshold=experiment_config.decision_threshold,
-        )
+    test_default_predictions = PredictionResult.from_probabilities(
+        probabilities=test_probabilities,
+        threshold=experiment_config.decision_threshold,
     )
 
-    test_optimized_predictions = (
-        PredictionResult.from_probabilities(
-            probabilities=test_probabilities,
-            threshold=threshold_optimization.threshold,
-        )
-    )    
+    test_optimized_predictions = PredictionResult.from_probabilities(
+        probabilities=test_probabilities,
+        threshold=threshold_optimization.threshold,
+    )
 
     return CrossValidationOutput(
         fold_metrics=fold_metrics_frame,
@@ -361,9 +317,7 @@ def run_catboost_cross_validation(
                 "fold": oof_folds,
                 "target": y.to_numpy(),
                 "probability": oof_probabilities,
-                "prediction_default": (
-                    oof_prediction_result.predictions
-                ),
+                "prediction_default": (oof_prediction_result.predictions),
                 "prediction_optimized_oof": (
                     PredictionResult.from_probabilities(
                         probabilities=oof_probabilities,
@@ -376,18 +330,15 @@ def run_catboost_cross_validation(
             {
                 "row_index": X_test.index,
                 "probability": test_probabilities,
-                "prediction_default": (
-                    test_default_predictions.predictions
-                ),
-                "prediction_optimized_oof": (
-                    test_optimized_predictions.predictions
-                ),
+                "prediction_default": (test_default_predictions.predictions),
+                "prediction_optimized_oof": (test_optimized_predictions.predictions),
             }
         ),
         metrics=overall_metrics,
         fitted_models=fitted_models,
         training_time_seconds=total_training_time,
     )
+
 
 def run_catboost_experiment(
     dataset: PreparedDataset,
