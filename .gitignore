@@ -12,6 +12,7 @@ htmlcov/
 # Environments
 .venv/
 venv/
+.venv-autogluon/
 
 # Secrets and local configuration
 .env

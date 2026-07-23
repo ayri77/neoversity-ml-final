@@ -12,13 +12,6 @@ import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 
 @dataclass(frozen=True)
-class LoadedExperiment:
-    result: ExperimentResult
-    fold_metrics: pd.DataFrame
-    oof_predictions: pd.DataFrame
-    test_predictions: pd.DataFrame
-
-@dataclass(frozen=True)
 class ExperimentConfig:
     random_state: int
     n_splits: int
@@ -45,6 +38,19 @@ class ExperimentConfig:
         )
 
 @dataclass(frozen=True)
+class ExperimentResult:
+    experiment_id: str
+    dataset_version: str
+    model_name: str
+    validation_strategy: dict[str, Any]
+    metrics: dict[str, float]
+    parameters: dict[str, Any]
+    random_state: int
+    n_features: int
+    training_time_seconds: float
+    created_at_utc: str
+
+@dataclass(frozen=True)
 class CrossValidationOutput:
     fold_metrics: pd.DataFrame
     oof_predictions: pd.DataFrame
@@ -62,17 +68,11 @@ class ExperimentOutput:
     fitted_models: list[Any]
 
 @dataclass(frozen=True)
-class ExperimentResult:
-    experiment_id: str
-    dataset_version: str
-    model_name: str
-    validation_strategy: dict[str, Any]
-    metrics: dict[str, float]
-    parameters: dict[str, Any]
-    random_state: int
-    n_features: int
-    training_time_seconds: float
-    created_at_utc: str
+class LoadedExperiment:
+    result: ExperimentResult
+    fold_metrics: pd.DataFrame
+    oof_predictions: pd.DataFrame
+    test_predictions: pd.DataFrame
 
 def load_experiment(
     experiment_id: str,
@@ -244,3 +244,42 @@ def load_experiment_results(
 def utc_timestamp() -> str:
     """Return the current UTC timestamp in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat()
+
+def build_experiment_summary(
+    result: ExperimentResult,
+) -> pd.DataFrame:
+    """Build a compact experiment summary table."""
+    metrics = result.metrics
+
+    rows = [
+        {
+            "metric": "Balanced Accuracy @ default threshold",
+            "value": metrics["balanced_accuracy"],
+        },
+        {
+            "metric": "Optimized OOF Balanced Accuracy",
+            "value": metrics["optimized_balanced_accuracy_oof"],
+        },
+        {
+            "metric": "Optimized OOF threshold",
+            "value": metrics["optimized_threshold_oof"],
+        },
+        {
+            "metric": "ROC-AUC",
+            "value": metrics["roc_auc"],
+        },
+        {
+            "metric": "Average Precision",
+            "value": metrics["average_precision"],
+        },
+        {
+            "metric": "Log Loss",
+            "value": metrics["log_loss"],
+        },
+        {
+            "metric": "Training time, minutes",
+            "value": result.training_time_seconds / 60,
+        },
+    ]
+
+    return pd.DataFrame(rows)

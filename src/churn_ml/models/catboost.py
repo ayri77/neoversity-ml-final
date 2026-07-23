@@ -65,9 +65,6 @@ def get_catboost_categorical_features(
         include=["object", "category"]
     ).columns.tolist()
 
-    return categorical_features, numeric_features
-
-
 def prepare_catboost_data(
     X_train: pd.DataFrame,
     X_valid: pd.DataFrame,
@@ -178,10 +175,14 @@ def run_catboost_cross_validation(
         unit="fold",
     )
 
+    oof_folds = np.zeros(len(X), dtype=int)
+
     for fold_number, (train_idx, valid_idx) in enumerate(
         fold_iterator,
         start=1,
     ):        
+
+        oof_folds[valid_idx] = fold_number
 
         X_train_fold = X.iloc[train_idx]
         y_train_fold = y.iloc[train_idx]
@@ -357,6 +358,7 @@ def run_catboost_cross_validation(
         oof_predictions=pd.DataFrame(
             {
                 "row_index": X.index,
+                "fold": oof_folds,
                 "target": y.to_numpy(),
                 "probability": oof_probabilities,
                 "prediction_default": (

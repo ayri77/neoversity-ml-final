@@ -160,3 +160,58 @@ def optimize_balanced_accuracy_threshold(
         ),
         scores=scores_frame,
     )
+
+def optimize_threshold_by_folds(
+    fold_metrics: pd.DataFrame,
+    oof_predictions: pd.DataFrame,
+) -> pd.DataFrame:
+    """Optimize balanced-accuracy threshold separately for each fold."""
+    required_fold_columns = {"fold"}
+    required_oof_columns = {
+        "fold",
+        "target",
+        "probability",
+    }
+
+    if not required_fold_columns.issubset(fold_metrics.columns):
+        raise ValueError(
+            "fold_metrics must contain a 'fold' column."
+        )
+
+    if not required_oof_columns.issubset(
+        oof_predictions.columns
+    ):
+        raise ValueError(
+            "oof_predictions must contain fold, target, "
+            "and probability columns."
+        )
+
+    records: list[dict[str, float | int]] = []
+
+    for fold_number in sorted(
+        oof_predictions["fold"].unique()
+    ):
+        fold_data = oof_predictions.loc[
+            oof_predictions["fold"] == fold_number
+        ]
+
+        optimization = (
+            optimize_balanced_accuracy_threshold(
+                y_true=fold_data["target"],
+                probabilities=fold_data["probability"],
+            )
+        )
+
+        records.append(
+            {
+                "fold": int(fold_number),
+                "optimized_threshold": (
+                    optimization.threshold
+                ),
+                "optimized_balanced_accuracy": (
+                    optimization.balanced_accuracy
+                ),
+            }
+        )
+
+    return pd.DataFrame(records)
