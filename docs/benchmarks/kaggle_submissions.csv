@@ -1,0 +1,2 @@
+submission_date,submission_file,dataset_version,model,threshold,cv_balanced_accuracy,public_score,private_score,notes
+2026-07-23,catboost_xgboost_50_50_threshold_0130.csv,v0_raw_minimal,"CatBoost 50% + XGBoost 50%",0.130,0.8988,0.8832,,"First validated submission"
