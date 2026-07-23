@@ -32,3 +32,29 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.15.22",
 ]
+
+[tool.mypy]
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = [
+    "pandas",
+    "pandas.*",
+    "sklearn",
+    "sklearn.*",
+    "catboost",
+    "catboost.*",
+    "lightgbm",
+    "lightgbm.*",
+    "xgboost",
+    "xgboost.*",
+    "joblib",
+    "joblib.*",
+    "yaml",
+    "yaml.*",
+    "tqdm",
+    "tqdm.*",
+    "matplotlib",
+    "matplotlib.*",
+]
+ignore_missing_imports = true
