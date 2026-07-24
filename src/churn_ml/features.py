@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from collections.abc import Sequence
 
 
 @dataclass(frozen=True)
@@ -15,6 +16,145 @@ class PreparedDataset:
     y_train: pd.Series
     X_test: pd.DataFrame
     metadata: dict[str, Any]
+
+
+def add_missingness_summary_features(
+    dataframe: pd.DataFrame,
+    *,
+    very_high_missing_features: Sequence[str] = (),
+) -> pd.DataFrame:
+    """Add row-level missing-value summary features."""
+    result = dataframe.copy()
+
+    numeric_columns = dataframe.select_dtypes(include="number").columns.tolist()
+
+    categorical_columns = dataframe.select_dtypes(
+        include=["object", "category", "string"]
+    ).columns.tolist()
+
+    very_high_missing_columns = [
+        column for column in very_high_missing_features if column in dataframe.columns
+    ]
+
+    result["missing_count_total"] = dataframe.isna().sum(axis=1).astype("int16")
+    result["missing_rate_total"] = dataframe.isna().mean(axis=1).astype("float32")
+
+    result["missing_count_numeric"] = (
+        dataframe[numeric_columns].isna().sum(axis=1).astype("int16")
+    )
+    result["missing_rate_numeric"] = (
+        dataframe[numeric_columns].isna().mean(axis=1).astype("float32")
+    )
+
+    result["missing_count_categorical"] = (
+        dataframe[categorical_columns].isna().sum(axis=1).astype("int16")
+    )
+    result["missing_rate_categorical"] = (
+        dataframe[categorical_columns].isna().mean(axis=1).astype("float32")
+    )
+
+    if very_high_missing_columns:
+        result["missing_count_very_high"] = (
+            dataframe[very_high_missing_columns].isna().sum(axis=1).astype("int16")
+        )
+        result["missing_rate_very_high"] = (
+            dataframe[very_high_missing_columns].isna().mean(axis=1).astype("float32")
+        )
+    else:
+        result["missing_count_very_high"] = 0
+        result["missing_rate_very_high"] = 0.0
+
+    return result
+
+
+def add_missingness_indicator_features(
+    dataframe: pd.DataFrame,
+    *,
+    indicator_features: Sequence[str],
+    very_high_missing_features: Sequence[str] = (),
+) -> pd.DataFrame:
+    """
+    Add row-level missing counts and per-feature missing indicators.
+
+    Indicator features must be selected using the training dataset.
+    The same feature list is then applied to validation and test data.
+    """
+    result = dataframe.copy()
+
+    missing_indicator_features = sorted(
+        set(indicator_features) - set(dataframe.columns)
+    )
+
+    if missing_indicator_features:
+        raise KeyError(
+            f"Missing indicator source columns: {missing_indicator_features}"
+        )
+
+    numeric_columns = dataframe.select_dtypes(include="number").columns.tolist()
+
+    categorical_columns = dataframe.select_dtypes(
+        include=["object", "category", "string"]
+    ).columns.tolist()
+
+    very_high_missing_columns = [
+        column for column in very_high_missing_features if column in dataframe.columns
+    ]
+
+    result["missing_count_total"] = dataframe.isna().sum(axis=1).astype("int16")
+
+    result["missing_count_numeric"] = (
+        dataframe[numeric_columns].isna().sum(axis=1).astype("int16")
+    )
+
+    result["missing_count_categorical"] = (
+        dataframe[categorical_columns].isna().sum(axis=1).astype("int16")
+    )
+
+    result["missing_count_very_high"] = (
+        dataframe[very_high_missing_columns].isna().sum(axis=1).astype("int16")
+        if very_high_missing_columns
+        else pd.Series(
+            0,
+            index=dataframe.index,
+            dtype="int16",
+        )
+    )
+
+    for column in indicator_features:
+        indicator_column = f"{column}_is_missing"
+
+        if indicator_column in result.columns:
+            raise ValueError(f"Generated column already exists: {indicator_column}")
+
+        result[indicator_column] = dataframe[column].isna().astype("int8")
+
+    return result
+
+
+def add_selected_missing_indicators(
+    dataframe: pd.DataFrame,
+    *,
+    indicator_features: Sequence[str],
+) -> pd.DataFrame:
+    """Add binary missing indicators for selected source features."""
+    result = dataframe.copy()
+
+    missing_source_columns = [
+        column for column in indicator_features if column not in dataframe.columns
+    ]
+
+    if missing_source_columns:
+        raise KeyError(f"Missing indicator source columns: {missing_source_columns}")
+
+    for column in indicator_features:
+        indicator_column = f"{column}_is_missing"
+
+        if indicator_column in result.columns:
+            raise ValueError(f"Generated column already exists: {indicator_column}")
+
+        result[indicator_column] = dataframe[column].isna().astype("int8")
+
+    return result
 
 
 def save_dataset(

@@ -1,2 +1,4 @@
 submission_date,submission_file,dataset_version,model,threshold,cv_balanced_accuracy,public_score,private_score,notes
 2026-07-23,catboost_xgboost_50_50_threshold_0130.csv,v0_raw_minimal,"CatBoost 50% + XGBoost 50%",0.130,0.8988,0.8832,,"First validated submission"
+2026-07-23,autogluon_v3_extreme_threshold_0117.csv,v3_targeted_missingness,"AutoGluon extreme / LightGBMPrep_r31",0.117,0.8952,0.9112,,"Extreme preset; calibrated threshold; test positive rate 21.64%; best public score"
+2026-07-24,manual_lightgbmprep_r31_threshold_0117.csv,v3_targeted_missingness,"Manual LightGBMPrep_r31 reproduction",0.117,0.898656,0.9023,,"8-fold bagging; OOF target encoding; test positive rate 22.76%; simplified AutoGluon reproduction"
