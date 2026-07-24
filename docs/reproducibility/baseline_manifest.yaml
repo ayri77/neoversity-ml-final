@@ -1,0 +1,436 @@
+schema_version: "1.0"
+
+project:
+  name: neoversity-ml-final
+  task: binary_telecom_churn_classification
+  target_column: y
+  competition_metric: balanced_accuracy
+  train_row_count: 10000
+  test_row_count: 2500
+  raw_feature_count: 230
+  positive_target_count: 1305
+  negative_target_count: 8695
+
+git_snapshot:
+  branch: feature/experiment-platform
+  commit: bc88d5aecad667ade6b39bb90b4be46459fc09d3
+  worktree_clean_at_documentation_start: true
+
+raw_data:
+  train:
+    path: data/raw/final_proj_data.csv
+    status: local_ignored_dependency
+    sha256: 9b234389d15e8c1d3d486c7ddd327af9a21f6ec548dabb3878cf276676063dec
+    row_count: 10000
+    feature_count: 230
+    includes_target: true
+  test:
+    path: data/raw/final_proj_test.csv
+    status: local_ignored_dependency
+    sha256: 0417e23314c0fb47c2906f79a18137a05d0e79da1a9afa50fca94881d83ef544
+    row_count: 2500
+    feature_count: 230
+    includes_target: false
+  sample_submission:
+    path: data/raw/final_proj_sample_submission.csv
+    status: local_ignored_dependency
+    sha256: cb6c18e88548ab6fb28b3735afa1e436412e9dc86dfe6fca275ce43016516d95
+    row_count: 2500
+    columns:
+      - index
+      - y
+
+dataset_versions:
+  - id: v0_raw_minimal
+    status: implemented_local
+    path: data/processed/v0_raw_minimal
+    source: raw_data
+    train_row_count: 10000
+    test_row_count: 2500
+    feature_count: 205
+    expected_row_order_preservation: exact
+    defining_transformations:
+      type: drop_columns
+      description: Remove the union of constant and all-missing raw features.
+      dropped_feature_count: 25
+      dropped_features:
+        - Var118
+        - Var138
+        - Var141
+        - Var15
+        - Var167
+        - Var169
+        - Var175
+        - Var185
+        - Var191
+        - Var2
+        - Var20
+        - Var209
+        - Var213
+        - Var215
+        - Var224
+        - Var230
+        - Var31
+        - Var32
+        - Var39
+        - Var42
+        - Var48
+        - Var52
+        - Var55
+        - Var79
+        - Var8
+
+  - id: v1_missingness_summary
+    status: implemented_local
+    path: data/processed/v1_missingness_summary
+    parent: v0_raw_minimal
+    train_row_count: 10000
+    test_row_count: 2500
+    feature_count: 213
+    expected_row_order_preservation: exact
+    defining_transformations:
+      type: additive_missingness_summary
+      added_features:
+        - missing_count_total
+        - missing_rate_total
+        - missing_count_numeric
+        - missing_rate_numeric
+        - missing_count_categorical
+        - missing_rate_categorical
+        - missing_count_very_high
+        - missing_rate_very_high
+
+  - id: v2_missingness_indicators
+    status: implemented_local
+    path: data/processed/v2_missingness_indicators
+    parent: v0_raw_minimal
+    train_row_count: 10000
+    test_row_count: 2500
+    feature_count: 393
+    expected_row_order_preservation: exact
+    defining_transformations:
+      type: additive_broad_missingness_indicators
+      summary_feature_count: 4
+      summary_features:
+        - missing_count_total
+        - missing_count_numeric
+        - missing_count_categorical
+        - missing_count_very_high
+      indicator_source_rule: Every v0 feature containing at least one missing value in the training data.
+      indicator_feature_count: 184
+      indicator_suffix: _is_missing
+
+  - id: v3_targeted_missingness
+    status: implemented_local
+    path: data/processed/v3_targeted_missingness
+    parent: v1_missingness_summary
+    selection_source_experiment: xgboost_v2_missingness_indicators_cv5
+    train_row_count: 10000
+    test_row_count: 2500
+    feature_count: 217
+    expected_row_order_preservation: exact
+    defining_transformations:
+      type: additive_targeted_missingness_indicators
+      indicator_source_features:
+        - Var217
+        - Var126
+        - Var218
+        - Var192
+      added_features:
+        - Var217_is_missing
+        - Var126_is_missing
+        - Var218_is_missing
+        - Var192_is_missing
+
+legacy_validation_protocols:
+  standard_cv5_seed42:
+    status: legacy
+    splitter: StratifiedKFold
+    folds: 5
+    shuffle: true
+    seed: 42
+    default_threshold: 0.5
+    global_oof_threshold_optimization:
+      threshold_min: 0.01
+      threshold_max: 0.99
+      threshold_step: 0.001
+      interpretation: optimistic
+      reason: The threshold is selected and reported on the same OOF labels.
+    cross_fitted_threshold_method:
+      status: legacy_not_fully_nested
+      interpretation: historical_comparison_only
+      reason: Calibration OOF predictions may come from models trained on rows in the nominal holdout fold.
+
+  manual_lightgbm_outer8_inner5:
+    status: legacy_manual_reproduction
+    outer_splitter: StratifiedKFold
+    outer_folds: 8
+    outer_shuffle: true
+    outer_seed: 0
+    inner_target_encoding_splitter: StratifiedKFold
+    inner_target_encoding_folds: 5
+    inner_target_encoding_shuffle: true
+    target_encoding_seed: 42
+    fixed_submission_threshold: 0.117
+    boosting_rounds: 376
+
+baseline_experiments:
+  standard_models:
+    - id: catboost_v0_raw_minimal_cv5
+      model: CatBoostClassifier
+      dataset_version: v0_raw_minimal
+      validation_protocol: standard_cv5_seed42
+      balanced_accuracy_at_0_5: 0.79397945267351
+      global_optimized_oof_balanced_accuracy: 0.8945655119536264
+      global_optimized_threshold: 0.174
+      legacy_cross_fitted_balanced_accuracy: 0.8926116872558545
+
+    - id: catboost_v1_missingness_summary_cv5
+      model: CatBoostClassifier
+      dataset_version: v1_missingness_summary
+      validation_protocol: standard_cv5_seed42
+      balanced_accuracy_at_0_5: 0.7925425058220363
+      global_optimized_oof_balanced_accuracy: 0.8922360364766821
+      global_optimized_threshold: 0.126
+      legacy_cross_fitted_balanced_accuracy: 0.888310981561165
+
+    - id: catboost_v3_targeted_missingness_cv5
+      model: CatBoostClassifier
+      dataset_version: v3_targeted_missingness
+      validation_protocol: standard_cv5_seed42
+      balanced_accuracy_at_0_5: 0.7983658640298406
+      global_optimized_oof_balanced_accuracy: 0.8940180092050966
+      global_optimized_threshold: 0.113
+      legacy_cross_fitted_balanced_accuracy: 0.8912624289733607
+
+    - id: lightgbm_v0_raw_minimal_cv5
+      model: LGBMClassifier
+      dataset_version: v0_raw_minimal
+      validation_protocol: standard_cv5_seed42
+      balanced_accuracy_at_0_5: 0.7634237318756761
+      global_optimized_oof_balanced_accuracy: 0.8813027260569446
+      global_optimized_threshold: 0.128
+      legacy_cross_fitted_balanced_accuracy: 0.8806514511576874
+
+    - id: xgboost_v0_raw_minimal_cv5
+      model: XGBClassifier
+      dataset_version: v0_raw_minimal
+      validation_protocol: standard_cv5_seed42
+      balanced_accuracy_at_0_5: 0.7846496533217002
+      global_optimized_oof_balanced_accuracy: 0.8909594847966088
+      global_optimized_threshold: 0.041
+      legacy_cross_fitted_balanced_accuracy: 0.890729467545315
+
+    - id: xgboost_v1_missingness_summary_cv5
+      model: XGBClassifier
+      dataset_version: v1_missingness_summary
+      validation_protocol: standard_cv5_seed42
+      balanced_accuracy_at_0_5: 0.7871404052621954
+      global_optimized_oof_balanced_accuracy: 0.8938714943850674
+      global_optimized_threshold: 0.037
+      legacy_cross_fitted_balanced_accuracy: 0.8938714943850674
+
+    - id: xgboost_v2_missingness_indicators_cv5
+      model: XGBClassifier
+      dataset_version: v2_missingness_indicators
+      validation_protocol: standard_cv5_seed42
+      balanced_accuracy_at_0_5: 0.7916037093586616
+      global_optimized_oof_balanced_accuracy: 0.8925101183355035
+      global_optimized_threshold: 0.041
+      legacy_cross_fitted_balanced_accuracy: 0.890021349302347
+
+    - id: xgboost_v3_targeted_missingness_cv5
+      model: XGBClassifier
+      dataset_version: v3_targeted_missingness
+      validation_protocol: standard_cv5_seed42
+      balanced_accuracy_at_0_5: 0.7916612136714851
+      global_optimized_oof_balanced_accuracy: 0.8943147843367947
+      global_optimized_threshold: 0.047
+      legacy_cross_fitted_balanced_accuracy: 0.892628431806715
+
+  ensembles:
+    - id: catboost_xgboost_50_50_v0
+      model: probability_blend
+      dataset_version: v0_raw_minimal
+      components:
+        catboost_v0_raw_minimal_cv5: 0.5
+        xgboost_v0_raw_minimal_cv5: 0.5
+      global_optimized_oof_balanced_accuracy: 0.8988388975916488
+      global_optimized_threshold: 0.13
+      legacy_cross_fitted_balanced_accuracy: 0.8988388975916488
+
+  autogluon:
+    - id: autogluon_v3_targeted_missingness_extreme
+      dataset_version: v3_targeted_missingness
+      status: external_automl_benchmark
+      selected_reference_model: LightGBMPrep_r31_BAG_L1
+      calibrated_internal_balanced_accuracy: 0.895158
+      calibrated_threshold: 0.117
+
+manual_lightgbm_contract:
+  experiment_id: manual_lightgbmprep_r31_v3_reproduction
+  source_notebook: notebooks/sandbox/experiments/02_reproduce_autogluon_lightgbm.ipynb
+  dataset_version: v3_targeted_missingness
+  validation_protocol: manual_lightgbm_outer8_inner5
+  current_submission: submissions/manual_lightgbmprep_r31_threshold_0117.csv
+  feature_contract:
+    source_dataset_feature_count: 217
+    dropped_features:
+      - Var214
+      - Var220
+      - Var222
+      - Var218_is_missing
+    final_model_input_feature_count: 213
+    categorical_feature_count: 31
+    categorical_features:
+      - Var192
+      - Var193
+      - Var194
+      - Var195
+      - Var196
+      - Var197
+      - Var198
+      - Var199
+      - Var200
+      - Var201
+      - Var202
+      - Var203
+      - Var204
+      - Var205
+      - Var206
+      - Var207
+      - Var208
+      - Var210
+      - Var211
+      - Var212
+      - Var216
+      - Var217
+      - Var218
+      - Var219
+      - Var221
+      - Var223
+      - Var225
+      - Var226
+      - Var227
+      - Var228
+      - Var229
+  target_encoding_contract:
+    implementation: custom_autogluon_compatible_binary_oof_target_encoder
+    outer_fold_safe_fitting: true
+    inner_folds: 5
+    shuffle: true
+    random_state: 42
+    alpha: 10
+    keep_original_categorical_features: false
+    numerical_features: pass_through_unchanged
+    training_encoding: inner_oof_values
+    validation_and_test_encoding: mappings_fitted_on_complete_outer_training_fold
+    missing_and_unseen_category_fallback: prior
+    prior_definition: unweighted_mean_of_category_level_target_means
+  lightgbm_parameters:
+    n_estimators: 376
+    learning_rate: 0.0397613094741
+    num_leaves: 16
+    min_data_in_leaf: 1
+    feature_fraction: 0.5791844062459
+    bagging_fraction: 0.9591526242875
+    bagging_freq: 1
+    lambda_l1: 0.938461750637
+    lambda_l2: 0.9899852075056
+    extra_trees: false
+    min_data_per_group: 39
+    max_cat_to_onehot: 27
+    cat_l2: 1.8962346412823
+    cat_smooth: 0.0215219089995
+    seed: 0
+  prediction_policy:
+    outer_fold_model_count: 8
+    independently_fitted_outer_fold_models: true
+    test_probability_aggregation: arithmetic_mean_across_eight_outer_fold_models
+    full_data_refit: false
+    submission_threshold: 0.117
+  current_parity_environment:
+    python: "3.12.12"
+    numpy: "2.4.6"
+    pandas: "2.3.3"
+    scikit_learn: "1.9.0"
+    lightgbm: "4.7.0"
+  known_implementation_difference: >-
+    The manual reproduction omits AutoGluon ArithmeticFeatureGenerator and
+    CategoricalInteractionFeatureGenerator, so it is a controlled simplified
+    reproduction rather than a bit-exact reconstruction of LightGBMPrep_r31.
+  primary_parity_requirements:
+    submission_labels:
+      expected: exact_match_to_current_saved_submission
+      comparison: exact
+    positive_prediction_count_at_0_117:
+      expected: 569
+      comparison: exact
+    balanced_accuracy_at_0_117:
+      expected: 0.900979
+      absolute_tolerance: 0.000001
+  secondary_diagnostic_requirements:
+    global_optimized_oof_balanced_accuracy:
+      expected_approximately: 0.904078
+      absolute_tolerance: 0.000001
+    global_optimized_threshold:
+      expected_approximately: 0.096
+      absolute_tolerance: 0.000001
+    legacy_cross_fitted_balanced_accuracy:
+      expected_approximately: 0.898656
+      absolute_tolerance: 0.000001
+  excluded_acceptance_tests:
+    - Kaggle Public Score is externally observed and must not be used as a local automated acceptance test.
+
+external_kaggle_results:
+  status: externally_observed_historical_results
+  results:
+    - submission_file: submissions/catboost_xgboost_50_50_threshold_0130.csv
+      public_score: 0.8832
+    - submission_file: submissions/autogluon_v3_extreme_threshold_0117.csv
+      public_score: 0.9112
+    - submission_file: submissions/manual_lightgbmprep_r31_threshold_0117.csv
+      public_score: 0.9023
+
+artifact_references:
+  tracked_documentation:
+    - docs/benchmarks/autogluon.md
+    - docs/benchmarks/kaggle_submissions.csv
+  local_ignored_dependencies:
+    - path: data/raw
+      purpose: Competition source data.
+    - path: data/interim
+      purpose: EDA-derived feature metadata.
+    - path: data/processed
+      purpose: Implemented versioned Parquet datasets.
+    - path: artifacts/experiments
+      purpose: Standard-model, threshold, feature-importance, and blend artifacts.
+    - path: artifacts/autogluon
+      purpose: AutoGluon predictors and model files.
+    - path: artifacts/reference/autogluon_lightgbmprep_r31
+      purpose: AutoGluon reference OOF and test probabilities required by the manual reproduction.
+    - path: notebooks/sandbox
+      purpose: Experimental notebook source, including the manual LightGBM reproduction.
+    - path: submissions
+      purpose: Saved historical submission files.
+
+numerical_tolerances:
+  submission_labels: exact
+  row_counts: exact
+  raw_data_hashes: exact
+  feature_names: exact
+  feature_order: exact
+  deterministic_metric_absolute_tolerance_current_environment: 0.000001
+  cross_environment_policy: A wider tolerance may be required across hardware, drivers, or dependency versions and must be documented before use.
+
+known_limitations:
+  - Global OOF threshold optimization is optimistic.
+  - The existing cross-fitted threshold method is historical and not fully nested.
+  - Standard experiments repeatedly reuse the same five-fold split with seed 42.
+  - Processed row identity depends on preserved order rather than a persistent entity ID.
+  - Important data, artifacts, sandbox notebooks, and submissions are ignored local dependencies.
+  - Manual LightGBM OOF predictions, test probabilities, fold metrics, encoder state, and models are not currently persisted.
+  - AutoGluon extreme dependencies and downloaded model assets are not completely reconstructable from the tracked requirements file.
+  - The project has no implemented automated test suite.
+  - Configuration and script entry-point files are placeholders.
+  - The repository currently relies on nonstandard src.churn_ml imports and notebook sys.path mutation.
