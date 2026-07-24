@@ -1,0 +1,119 @@
+schema_version: 1
+
+experiment:
+  id: manual_lightgbmprep_r31_v3_reproduction
+  implementation: controlled_simplified_manual_reproduction
+
+contract:
+  manifest_path: docs/reproducibility/baseline_manifest.yaml
+  manifest_key: manual_lightgbm_contract
+
+dataset:
+  processed_dir: data/processed
+  version: v3_targeted_missingness
+  sample_submission_path: data/raw/final_proj_sample_submission.csv
+  expected_train_rows: 10000
+  expected_test_rows: 2500
+  expected_source_feature_count: 217
+
+features:
+  drop: [Var214, Var220, Var222, Var218_is_missing]
+  expected_model_feature_count: 213
+  expected_categorical_count: 31
+  expected_source_schema_sha256: fa4cd8017a05520ca7f6c0fb81fb2f05b9cabe572e757eb43e424befebb9c62e
+  expected_model_input_schema_sha256: e19efe336426c09071db296920353a0b967284a1288a1d9ab54aaa83ca179616
+  expected_transformed_schema_sha256: 7c1fe2610edaa837baf4f041faf024361b896bb52e1fd81121c5ac6652180c41
+  categorical:
+    - Var192
+    - Var193
+    - Var194
+    - Var195
+    - Var196
+    - Var197
+    - Var198
+    - Var199
+    - Var200
+    - Var201
+    - Var202
+    - Var203
+    - Var204
+    - Var205
+    - Var206
+    - Var207
+    - Var208
+    - Var210
+    - Var211
+    - Var212
+    - Var216
+    - Var217
+    - Var218
+    - Var219
+    - Var221
+    - Var223
+    - Var225
+    - Var226
+    - Var227
+    - Var228
+    - Var229
+
+outer_cv:
+  splitter: stratified_kfold
+  n_splits: 8
+  shuffle: true
+  random_state: 0
+
+target_encoder:
+  implementation: custom_autogluon_compatible_binary_oof_target_encoder
+  inner_splits: 5
+  shuffle: true
+  random_state: 42
+  alpha: 10.0
+  prior: unweighted_mean_of_category_level_target_means
+  keep_original_categorical_features: false
+
+lightgbm:
+  estimator: LGBMClassifier
+  parameters:
+    objective: binary
+    n_estimators: 376
+    learning_rate: 0.0397613094741
+    num_leaves: 16
+    min_data_in_leaf: 1
+    feature_fraction: 0.5791844062459
+    bagging_fraction: 0.9591526242875
+    bagging_freq: 1
+    lambda_l1: 0.938461750637
+    lambda_l2: 0.9899852075056
+    extra_trees: false
+    max_cat_to_onehot: 27
+    cat_l2: 1.8962346412823
+    cat_smooth: 0.0215219089995
+    min_data_per_group: 39
+    random_state: 0
+    n_jobs: -1
+    verbosity: -1
+
+thresholds:
+  submission: 0.117
+  legacy_diagnostic_grid: {minimum: 0.02, maximum: 0.30, step: 0.001}
+
+prediction:
+  test_aggregation: arithmetic_mean
+  full_data_refit: false
+
+artifacts:
+  root: artifacts/experiments/manual_lightgbmprep_r31
+  save_fold_models: true
+  save_encoder_states: true
+
+parity:
+  enabled: true
+  required: true
+  reference_submission_path: submissions/manual_lightgbmprep_r31_threshold_0117.csv
+  expected_balanced_accuracy: 0.900979
+  balanced_accuracy_tolerance: 0.000001
+  expected_positive_count: 569
+  secondary:
+    global_optimized_oof_balanced_accuracy: 0.904078
+    global_optimized_threshold: 0.096
+    legacy_cross_fitted_balanced_accuracy: 0.898656
