@@ -1,0 +1,86 @@
+schema_version: 1
+
+promotion:
+  id: manual_lightgbmprep_r31_submission_v1
+  approval:
+    mode: manual
+    approved_at_utc: "2026-07-25T16:49:31.1443662+00:00"
+    metric_policy: immutable_unbiased_research_evidence
+  research:
+    run_path: artifacts/research_evaluations/telecom_v3_nested_rs5x5_v1_09b3e1632848/manual_lightgbmprep_r31_v3/final-provenance-20260725
+    run_id: final-provenance-20260725
+    config_path: configs/research/manual_lightgbmprep_r31_nested_rs5x5.yaml
+    artifact_manifest_sha256: fec615d20631f2000e2685fce5ac02b7f74e4434770ef22f9192d186b8043fc8
+    plan_id: telecom_v3_nested_rs5x5_v1
+    plan_sha256: 09b3e1632848aafda6962166e3ee6c717d48cb959b3fbb4b49cecf311b25a479
+    candidate_id: manual_lightgbmprep_r31_v3
+    candidate_sha256: 493f18ae3ea3d694174571591f329b4ad6533bf58b29cdf8f15e3e4222d6d308
+    candidate_source_sha256: 3594b73a7b62de77da98565579428ccbd1cef119153fadc928c3f9048cd46d16
+    run_implementation_sha256: f3a240ac8eac51daec1dfc21056efedf8b09c3b6a1e18960313cf71ce8c3cccd
+    loaded_modules_sha256: 59a9efcd8694c075b22bc64a4d9eb241086ce6663bea36da4c08b92a1c6f953f
+    approved_metrics:
+      label: unbiased_nested_research_estimate
+      balanced_accuracy_mean: 0.8987948770487287
+      balanced_accuracy_sample_sd: 0.003193257338353148
+
+threshold:
+  strategy: averaged_repeated_outer_oos_grid_ba_v1
+  expected_repeats_per_row: 5
+  metric: balanced_accuracy
+  minimum: 0.010
+  maximum: 0.990
+  step: 0.001
+  comparison: greater_than_or_equal
+  maximizer_absolute_tolerance: 1.0e-12
+  tie_break: median_maximizer_lower_on_even
+  constant_probability_fallback: 0.500
+  expected_selected_threshold: 0.107
+  expected_diagnostic_balanced_accuracy: 0.9079100376972717
+  diagnostic_label: operational_threshold_selection_diagnostic
+
+final_fit:
+  policy: single_full_data_model_oof_target_encoding_v1
+  implementation: manual_lightgbm_r31
+  model_count: 1
+  boosting_rounds: 376
+  parameter_tuning: false
+  test_probability_aggregation: none
+
+inputs:
+  processed_dir: data/processed
+  dataset_version: v3_targeted_missingness
+  train_features:
+    name: X_train.parquet
+    sha256: afd6780fd15c67118acb178c69c6045ace3c21d44ab41a415153834036564188
+  target:
+    name: y_train.parquet
+    sha256: 5a69ce6e53be83e7fe88e328808e2eeec549bbc96fc7d96b46dd5fc050143d04
+  test_features:
+    name: X_test.parquet
+    sha256: 94f0f14088e11925c68f459ae2889d0f2695f9a3aaf08cb8023440ed02893586
+  metadata:
+    name: metadata.json
+    sha256: 9662f8e95c0f9a2d66dd3d73d0feda92f4266d4c37a10365f7344a3648888636
+  sample_submission:
+    path: data/raw/final_proj_sample_submission.csv
+    sha256: cb6c18e88548ab6fb28b3735afa1e436412e9dc86dfe6fca275ce43016516d95
+    columns:
+      - index
+      - y
+    target_column: y
+    expected_rows: 2500
+
+artifacts:
+  root: artifacts/final_submissions
+  submission_filename: manual_lightgbmprep_r31_submission_v1.csv
+  persist_encoder: true
+  persist_model: true
+  persist_probabilities: true
+  overwrite: false
+
+verification:
+  reload_encoder: true
+  reload_model: true
+  encoded_test_comparison: exact
+  probability_comparison: exact
+  prediction_comparison: exact
