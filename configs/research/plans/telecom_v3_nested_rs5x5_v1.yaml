@@ -1,0 +1,76 @@
+schema_version: 1
+
+plan:
+  id: telecom_v3_nested_rs5x5_v1
+
+dataset:
+  processed_dir: data/processed
+  version: v3_targeted_missingness
+  files:
+    train_features:
+      name: X_train.parquet
+      sha256: afd6780fd15c67118acb178c69c6045ace3c21d44ab41a415153834036564188
+    target:
+      name: y_train.parquet
+      sha256: 5a69ce6e53be83e7fe88e328808e2eeec549bbc96fc7d96b46dd5fc050143d04
+    metadata:
+      name: metadata.json
+      sha256: 9662f8e95c0f9a2d66dd3d73d0feda92f4266d4c37a10365f7344a3648888636
+  expected_rows: 10000
+  expected_source_features: 217
+  ordered_source_schema_sha256: fa4cd8017a05520ca7f6c0fb81fb2f05b9cabe572e757eb43e424befebb9c62e
+  ordered_dtype_schema_sha256: 508d69bb02a1573c5945e9035cea654698d541ded8434ecf03a5c3bbd0058320
+  target:
+    name: y
+    dtype: int64
+    negative_label: 0
+    positive_label: 1
+    expected_negative_rows: 8695
+    expected_positive_rows: 1305
+    values_sha256: e583aadf66d2a2236811d1e171492899dd596e7fc40a7cee7138e90c16b50966
+
+outer_evaluation:
+  splitter: stratified_kfold
+  n_splits: 5
+  shuffle: true
+  repeat_seeds: [0, 17, 42, 73, 101]
+
+threshold_selection:
+  splitter: stratified_kfold
+  n_splits: 5
+  shuffle: true
+  random_state: 314159
+
+threshold_policy:
+  id: grid_balanced_accuracy_v1
+  metric: balanced_accuracy
+  minimum: 0.010
+  maximum: 0.990
+  step: 0.001
+  comparison: greater_than_or_equal
+  maximizer_absolute_tolerance: 1.0e-12
+  tie_break: median_maximizer_lower_on_even
+  constant_probability_fallback: 0.500
+
+metrics:
+  primary: balanced_accuracy
+  secondary:
+    - sensitivity
+    - specificity
+    - roc_auc
+    - average_precision
+    - brier_score
+  diagnostic:
+    - tn
+    - fp
+    - fn
+    - tp
+    - predicted_positive_rate
+    - selected_threshold
+
+aggregation:
+  repeat_method: pooled_predictions
+  aggregate_unit: repeat
+  standard_deviation: sample
+  fold_standard_deviation: descriptive_only
+  confidence_interval: none

@@ -1,0 +1,18 @@
+schema_version: 1
+
+experiment:
+  id: manual_lightgbmprep_r31_v3_nested_rs5x5
+
+evaluation_plan_path: configs/research/plans/telecom_v3_nested_rs5x5_v1.yaml
+
+candidate:
+  id: manual_lightgbmprep_r31_v3
+  implementation: manual_lightgbm_r31
+  historical_config_path: configs/experiments/manual_lightgbmprep_r31.yaml
+  manifest_path: docs/reproducibility/baseline_manifest.yaml
+  manifest_key: manual_lightgbm_contract
+
+artifacts:
+  root: artifacts/research_evaluations
+  save_threshold_curves: true
+  save_models: false
