@@ -92,6 +92,10 @@ def test_supervisor_success_and_success_marker_written_last(
     assert status["status"] == "completed"
     assert status["worker_completion_valid"] is True
     assert status["log_pump_failures"] == []
+    inspection = load_json(result.run_dir / "inspection" / "summary.json")
+    assert inspection["effective_seed_status"] == "verified"
+    assert inspection["effective_seed"] == 42
+    assert inspection["auxiliary_effective_seeds_observed"] == [0]
     inventory = load_json(result.run_dir / "artifact_inventory.json")
     inventory_paths = {entry["path"] for entry in inventory["entries"]}
     assert not {"_SUCCESS", "_FAILED", "artifact_inventory.json"} & inventory_paths

@@ -101,9 +101,27 @@ def main() -> int:
         "best_model": "FakeModel",
         "decision_threshold": 0.25,
         "requested_seed": metadata["requested_seed"],
+        "effective_seed_scope": "configured_core_base_models_only",
+        "configured_families": ["REALTABPFN-V2"],
         "effective_seed": metadata["requested_seed"],
         "effective_seeds_observed": [metadata["requested_seed"]],
-        "effective_seed_status": "matched",
+        "effective_seed_status": "verified",
+        "base_seed_metadata": [
+            {
+                "model_name": "FakeModel",
+                "model_types": ["RealTabPFNv2Model"],
+                "model_random_seeds": [metadata["requested_seed"]],
+            }
+        ],
+        "auxiliary_effective_seeds_observed": [0],
+        "auxiliary_seed_metadata": [
+            {
+                "model_name": "WeightedEnsemble_L2",
+                "model_types": ["WeightedEnsembleModel"],
+                "model_random_seeds": [0],
+            }
+        ],
+        "unclassified_seed_metadata": [],
     }
     if args.mode == "mismatch-inspection":
         inspection["best_model"] = "DifferentModel"
@@ -125,9 +143,9 @@ def main() -> int:
             "profile_identity": metadata["profile"],
             "dataset_version": metadata["dataset_version"],
             "requested_seed": metadata["requested_seed"],
-            "resolved_families": ["FAKE"],
-            "family_resources": {"FAKE": {"num_gpus": [0]}},
-            "resolved_hyperparameters": {"FAKE": [{}]},
+            "resolved_families": ["REALTABPFN-V2"],
+            "family_resources": {"REALTABPFN-V2": {"num_gpus": [1]}},
+            "resolved_hyperparameters": {"REALTABPFN-V2": [{}]},
             "top_level_num_gpus_passed_to_fit": False,
         },
     )
@@ -143,7 +161,7 @@ def main() -> int:
         "profile_sha256": metadata["profile_sha256"],
         "dataset_version": metadata["dataset_version"],
         "predictor_relative_path": "predictor",
-        "resolved_families": ["FAKE"],
+        "resolved_families": ["REALTABPFN-V2"],
         "model_names": ["FakeModel"],
         "best_model": "FakeModel",
         "decision_threshold": 0.25,

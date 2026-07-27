@@ -12,6 +12,8 @@ from src.churn_ml.autogluon_completion import (
     load_and_validate_completion,
     validate_completion_payload,
 )
+from src.churn_ml.autogluon_inspection import predictor_report
+from tests.test_autogluon_inspection import FakePredictor, realistic_autogluon_info
 
 
 def expectations() -> CompletionExpectations:
@@ -55,6 +57,8 @@ def inspection_summary() -> dict[str, Any]:
         "models": ["FakeModel"],
         "best_model": "FakeModel",
         "decision_threshold": 0.25,
+        "requested_seed": 42,
+        "effective_seed": 42,
     }
 
 
@@ -157,6 +161,27 @@ def test_completion_must_match_inspection() -> None:
         "worker_result_best_model_mismatch",
         "worker_result_threshold_mismatch",
     }.issubset(result.reason_codes)
+
+
+def test_weighted_ensemble_scoped_seed_report_agrees_with_completion() -> None:
+    inspection = predictor_report(
+        FakePredictor(realistic_autogluon_info([42], auxiliary_seed=0)),
+        requested_seed=42,
+        configured_families=["REALTABPFN-V2"],
+    )
+    payload = valid_payload()
+    payload["model_names"] = inspection["models"]
+    payload["best_model"] = inspection["best_model"]
+    payload["decision_threshold"] = inspection["decision_threshold"]
+    payload["effective_seed"] = inspection["effective_seed"]
+    result = validate_completion_payload(
+        payload,
+        expectations(),
+        inspection_summary=inspection,
+    )
+    assert result.valid
+    assert inspection["effective_seed_status"] == "verified"
+    assert inspection["auxiliary_effective_seeds_observed"] == [0]
 
 
 def test_missing_and_invalid_json_completion_files(tmp_path: Path) -> None:

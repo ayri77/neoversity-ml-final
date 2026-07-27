@@ -4,11 +4,18 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pytest
 import yaml
 
 from src.churn_ml.autogluon_config import load_config
-from src.churn_ml.autogluon_worker import build_fit_kwargs, load_training_data
+from src.churn_ml.autogluon_inspection import predictor_report
+from src.churn_ml.autogluon_worker import (
+    build_fit_kwargs,
+    load_training_data,
+    validate_effective_seed_report,
+)
 from tests.test_autogluon_config import valid_payload
+from tests.test_autogluon_inspection import FakePredictor, realistic_autogluon_info
 
 
 def config_without_data(tmp_path: Path) -> Any:
@@ -58,3 +65,36 @@ def test_fit_kwargs_preserve_seeded_family_config_without_global_gpu(
         kwargs["hyperparameters"]["GBM"][0]["ag_args_ensemble"]["model_random_seed"]
         == 42
     )
+
+
+def test_worker_accepts_verified_base_seed_with_independent_auxiliary_seed() -> None:
+    report = predictor_report(
+        FakePredictor(realistic_autogluon_info([42], auxiliary_seed=0)),
+        requested_seed=42,
+        configured_families=["REALTABPFN-V2"],
+    )
+    validate_effective_seed_report(report, requested_seed=42)
+    assert report["effective_seed_status"] == "verified"
+    assert report["effective_seed"] == 42
+    assert report["auxiliary_effective_seeds_observed"] == [0]
+
+
+def test_worker_rejects_true_configured_base_seed_mismatch() -> None:
+    report = predictor_report(
+        FakePredictor(realistic_autogluon_info([41], auxiliary_seed=0)),
+        requested_seed=42,
+        configured_families=["REALTABPFN-V2"],
+    )
+    with pytest.raises(RuntimeError, match="configured base-model seed"):
+        validate_effective_seed_report(report, requested_seed=42)
+
+
+def test_worker_accepts_unavailable_base_seed_evidence() -> None:
+    report = predictor_report(
+        FakePredictor(realistic_autogluon_info([None], auxiliary_seed=0)),
+        requested_seed=42,
+        configured_families=["REALTABPFN-V2"],
+    )
+    validate_effective_seed_report(report, requested_seed=42)
+    assert report["effective_seed_status"] == "unavailable"
+    assert report["effective_seed"] is None

@@ -181,6 +181,10 @@ def completion_inspection_mismatches(
         mismatches.append("worker_result_model_names_mismatch")
     if inspection_summary.get("best_model") != payload.get("best_model"):
         mismatches.append("worker_result_best_model_mismatch")
+    if inspection_summary.get("requested_seed") != payload.get("requested_seed"):
+        mismatches.append("worker_result_requested_seed_inspection_mismatch")
+    if inspection_summary.get("effective_seed") != payload.get("effective_seed"):
+        mismatches.append("worker_result_effective_seed_inspection_mismatch")
     observed_threshold = inspection_summary.get("decision_threshold")
     declared_threshold = payload.get("decision_threshold")
     if (

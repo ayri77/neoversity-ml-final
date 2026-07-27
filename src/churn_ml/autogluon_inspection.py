@@ -67,7 +67,14 @@ def inspect_run(
         loader = predictor_loader or _load_predictor
         predictor = loader(predictor_dir)
         requested_seed = completion.get("requested_seed") if completion else None
-        loaded_report = predictor_report(predictor, requested_seed=requested_seed)
+        configured_families = (
+            completion.get("resolved_families") if completion else None
+        )
+        loaded_report = predictor_report(
+            predictor,
+            requested_seed=requested_seed,
+            configured_families=configured_families,
+        )
         report["predictor"] = loaded_report
         report["predictor_loading_succeeded"] = True
         if completion is not None:
@@ -92,13 +99,18 @@ def export_worker_inspection(
     predictor: Any,
     *,
     requested_seed: int,
+    configured_families: list[str],
 ) -> dict[str, Any]:
     """Export sanitized inspection artifacts after fit, before worker completion."""
     inspection_dir = run_dir / "inspection"
     inspection_dir.mkdir(parents=True, exist_ok=True)
     leaderboard = predictor.leaderboard(silent=True)
     leaderboard.to_csv(inspection_dir / "leaderboard.csv", index=False)
-    summary = predictor_report(predictor, requested_seed=requested_seed)
+    summary = predictor_report(
+        predictor,
+        requested_seed=requested_seed,
+        configured_families=configured_families,
+    )
     write_json(inspection_dir / "summary.json", summary)
     return summary
 
@@ -107,6 +119,7 @@ def predictor_report(
     predictor: Any,
     *,
     requested_seed: int | None = None,
+    configured_families: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Gather portable metadata through public APIs and isolate local paths."""
     models = list(predictor.model_names())
@@ -125,14 +138,11 @@ def predictor_report(
         info_error = f"{type(error).__name__}: {error}"
     portable_info, nonportable = _sanitize_paths(raw_info)
     weights = _find_ensemble_weights(portable_info, best_model)
-    effective_seeds = sorted(set(_find_effective_seeds(portable_info)))
-    effective_seed = effective_seeds[0] if len(effective_seeds) == 1 else None
-    if requested_seed is None or not effective_seeds:
-        seed_status = "unavailable"
-    elif effective_seeds == [requested_seed]:
-        seed_status = "matched"
-    else:
-        seed_status = "mismatch"
+    seed_report = _classify_model_seed_metadata(
+        portable_info,
+        configured_families=configured_families,
+        requested_seed=requested_seed,
+    )
     threshold = getattr(predictor, "decision_threshold", None)
     if (
         isinstance(threshold, bool)
@@ -155,9 +165,7 @@ def predictor_report(
         "predictor_info": _json_safe(portable_info),
         "predictor_info_error": info_error,
         "requested_seed": requested_seed,
-        "effective_seed": effective_seed,
-        "effective_seeds_observed": effective_seeds,
-        "effective_seed_status": seed_status,
+        **seed_report,
     }
     if nonportable:
         result["local_operational_nonportable"] = nonportable
@@ -466,6 +474,119 @@ def _is_absolute_string(value: Any) -> bool:
         or bool(windows.root)
         or value.startswith(("/", "\\"))
     )
+
+
+_CONFIGURED_FAMILY_MODEL_TYPES = {
+    "CAT": frozenset({"CatBoostModel"}),
+    "GBM": frozenset({"LGBModel"}),
+    "GBM_PREP": frozenset({"PrepLGBModel"}),
+    "REALTABPFN-V2": frozenset({"RealTabPFNv2Model"}),
+    "TABM": frozenset({"TabMModel"}),
+}
+_AUXILIARY_MODEL_TYPES = frozenset(
+    {
+        "WeightedEnsembleModel",
+        "GreedyWeightedEnsembleModel",
+        "SimpleWeightedEnsembleModel",
+    }
+)
+
+
+def _classify_model_seed_metadata(
+    info: Any,
+    *,
+    configured_families: list[str] | tuple[str, ...] | None,
+    requested_seed: int | None,
+) -> dict[str, Any]:
+    """Scope effective-seed evidence to configured family models."""
+    configured = tuple(dict.fromkeys(configured_families or ()))
+    configured_types = {
+        model_type: family
+        for family in configured
+        for model_type in _CONFIGURED_FAMILY_MODEL_TYPES.get(family, ())
+    }
+    model_info = info.get("model_info") if isinstance(info, dict) else None
+    base_metadata: list[dict[str, Any]] = []
+    auxiliary_metadata: list[dict[str, Any]] = []
+    unclassified_metadata: list[dict[str, Any]] = []
+    if isinstance(model_info, dict):
+        for model_name, metadata in model_info.items():
+            if not isinstance(metadata, dict):
+                continue
+            model_types = sorted(set(_find_model_type_signals(metadata)))
+            seeds = sorted(set(_find_effective_seeds(metadata)))
+            auxiliary_types = sorted(set(model_types) & _AUXILIARY_MODEL_TYPES)
+            matched_families = sorted(
+                {
+                    configured_types[item]
+                    for item in model_types
+                    if item in configured_types
+                }
+            )
+            record: dict[str, Any] = {
+                "model_name": str(model_name),
+                "model_types": model_types,
+                "model_random_seeds": seeds,
+            }
+            if auxiliary_types:
+                record["classification_source"] = "public_model_type"
+                record["auxiliary_model_types"] = auxiliary_types
+                auxiliary_metadata.append(record)
+            elif matched_families:
+                record["classification_source"] = "public_model_type"
+                record["configured_families"] = matched_families
+                base_metadata.append(record)
+            elif not model_types and _weighted_ensemble_name_fallback(str(model_name)):
+                record["classification_source"] = (
+                    "autogluon_1_5_weighted_ensemble_name_fallback"
+                )
+                auxiliary_metadata.append(record)
+            else:
+                record["classification_source"] = "unclassified"
+                unclassified_metadata.append(record)
+
+    base_seeds = sorted(
+        {seed for record in base_metadata for seed in record["model_random_seeds"]}
+    )
+    auxiliary_seeds = sorted(
+        {seed for record in auxiliary_metadata for seed in record["model_random_seeds"]}
+    )
+    effective_seed = base_seeds[0] if len(base_seeds) == 1 else None
+    if requested_seed is None or not base_seeds:
+        status = "unavailable"
+    elif base_seeds == [requested_seed]:
+        status = "verified"
+    else:
+        status = "mismatch"
+    return {
+        "effective_seed_scope": "configured_core_base_models_only",
+        "configured_families": list(configured),
+        "effective_seed": effective_seed,
+        "effective_seeds_observed": base_seeds,
+        "effective_seed_status": status,
+        "base_seed_metadata": base_metadata,
+        "auxiliary_effective_seeds_observed": auxiliary_seeds,
+        "auxiliary_seed_metadata": auxiliary_metadata,
+        "unclassified_seed_metadata": unclassified_metadata,
+    }
+
+
+def _find_model_type_signals(value: Any) -> list[str]:
+    model_types: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"model_type", "child_model_type"} and type(child) is str:
+                model_types.append(child)
+            model_types.extend(_find_model_type_signals(child))
+    elif isinstance(value, list):
+        for child in value:
+            model_types.extend(_find_model_type_signals(child))
+    return model_types
+
+
+def _weighted_ensemble_name_fallback(model_name: str) -> bool:
+    """Isolated fallback for AutoGluon 1.5 metadata lacking model type fields."""
+    return model_name.startswith("WeightedEnsemble")
 
 
 def _find_effective_seeds(value: Any) -> list[int]:

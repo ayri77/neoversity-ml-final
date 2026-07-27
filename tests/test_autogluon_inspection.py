@@ -43,6 +43,41 @@ class FakePredictor:
         return FakeLeaderboard()
 
 
+def realistic_autogluon_info(
+    base_seeds: list[int | None],
+    *,
+    auxiliary_seed: int = 0,
+    local_path: str | None = None,
+) -> dict[str, object]:
+    model_info: dict[str, object] = {}
+    base_model_types = ("RealTabPFNv2Model", "TabMModel")
+    for index, seed in enumerate(base_seeds):
+        hyperparameters: dict[str, object] = {}
+        if seed is not None:
+            hyperparameters["model_random_seed"] = seed
+        metadata: dict[str, object] = {
+            "model_type": "StackerEnsembleModel",
+            "hyperparameters": hyperparameters,
+            "bagged_info": {
+                "child_model_type": base_model_types[index % len(base_model_types)],
+                "child_hyperparameters": hyperparameters.copy(),
+            },
+        }
+        if local_path is not None:
+            metadata["path"] = local_path
+        model_info[f"BaseModel_{index + 1}_BAG_L1"] = metadata
+    model_info["WeightedEnsemble_L2"] = {
+        "model_type": "WeightedEnsembleModel",
+        "hyperparameters": {"model_random_seed": auxiliary_seed},
+        "bagged_info": {
+            "child_model_type": "GreedyWeightedEnsembleModel",
+            "child_hyperparameters": {"model_random_seed": auxiliary_seed},
+        },
+        "model_weights": {"BaseModel_1_BAG_L1": 1.0},
+    }
+    return {"model_info": model_info}
+
+
 def make_valid_completed_run(run_dir: Path) -> None:
     run_dir.mkdir()
     config = valid_payload()
@@ -301,16 +336,9 @@ def test_incomplete_run_requires_explicit_attempt_load(tmp_path: Path) -> None:
 def test_predictor_info_paths_are_confined_to_nonportable_section() -> None:
     fake_user_path = r"C:\\Users\\review-user\\runs\\predictor"
     report = predictor_report(
-        FakePredictor(
-            {
-                "path": fake_user_path,
-                "nested": {
-                    "artifact": fake_user_path + r"\\models\\model.pkl",
-                    "model_random_seed": 42,
-                },
-            }
-        ),
+        FakePredictor(realistic_autogluon_info([42], local_path=fake_user_path)),
         requested_seed=42,
+        configured_families=["REALTABPFN-V2"],
     )
     portable = copy.deepcopy(report)
     nonportable = portable.pop("local_operational_nonportable")
@@ -319,16 +347,63 @@ def test_predictor_info_paths_are_confined_to_nonportable_section() -> None:
     assert fake_user_path not in portable_text
     assert "review-user" in json.dumps(nonportable)
     assert report["effective_seed"] == 42
-    assert report["effective_seed_status"] == "matched"
+    assert report["effective_seed_status"] == "verified"
 
 
-def test_effective_seed_mismatch_is_reported() -> None:
+def test_weighted_ensemble_seed_is_reported_but_excluded_from_base_agreement() -> None:
     report = predictor_report(
-        FakePredictor({"model_info": {"model_random_seed": 43}}),
+        FakePredictor(realistic_autogluon_info([42], auxiliary_seed=0)),
         requested_seed=42,
+        configured_families=["REALTABPFN-V2"],
     )
-    assert report["effective_seed"] == 43
+    assert report["effective_seed_scope"] == "configured_core_base_models_only"
+    assert report["effective_seed"] == 42
+    assert report["effective_seeds_observed"] == [42]
+    assert report["effective_seed_status"] == "verified"
+    assert report["auxiliary_effective_seeds_observed"] == [0]
+    assert report["auxiliary_seed_metadata"][0]["model_name"] == ("WeightedEnsemble_L2")
+    assert report["auxiliary_seed_metadata"][0]["classification_source"] == (
+        "public_model_type"
+    )
+
+
+def test_true_configured_base_model_seed_mismatch_is_reported() -> None:
+    report = predictor_report(
+        FakePredictor(realistic_autogluon_info([41], auxiliary_seed=0)),
+        requested_seed=42,
+        configured_families=["REALTABPFN-V2"],
+    )
+    assert report["effective_seed"] == 41
+    assert report["effective_seeds_observed"] == [41]
     assert report["effective_seed_status"] == "mismatch"
+    assert report["auxiliary_effective_seeds_observed"] == [0]
+
+
+def test_multiple_configured_base_models_verify_independently_of_auxiliary_seed() -> (
+    None
+):
+    report = predictor_report(
+        FakePredictor(realistic_autogluon_info([42, 42], auxiliary_seed=0)),
+        requested_seed=42,
+        configured_families=["REALTABPFN-V2", "TABM"],
+    )
+    assert report["effective_seed"] == 42
+    assert report["effective_seeds_observed"] == [42]
+    assert report["effective_seed_status"] == "verified"
+    assert len(report["base_seed_metadata"]) == 2
+    assert report["auxiliary_effective_seeds_observed"] == [0]
+
+
+def test_configured_base_seed_evidence_unavailable_does_not_mismatch() -> None:
+    report = predictor_report(
+        FakePredictor(realistic_autogluon_info([None], auxiliary_seed=0)),
+        requested_seed=42,
+        configured_families=["REALTABPFN-V2"],
+    )
+    assert report["effective_seed"] is None
+    assert report["effective_seeds_observed"] == []
+    assert report["effective_seed_status"] == "unavailable"
+    assert report["auxiliary_effective_seeds_observed"] == [0]
 
 
 def test_importing_public_runner_does_not_import_autogluon() -> None:

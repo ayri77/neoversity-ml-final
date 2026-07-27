@@ -81,6 +81,35 @@ def build_fit_kwargs(
     }
 
 
+def validate_effective_seed_report(
+    inspection: dict[str, Any],
+    *,
+    requested_seed: int,
+) -> None:
+    """Fail only on configured base-model seed mismatch or invalid evidence."""
+    status = inspection.get("effective_seed_status")
+    effective_seed = inspection.get("effective_seed")
+    if status == "mismatch":
+        raise RuntimeError(
+            "AutoGluon public metadata exposed a configured base-model seed that "
+            f"differs from requested seed {requested_seed}: "
+            f"{inspection.get('effective_seeds_observed')}"
+        )
+    if status == "verified":
+        if effective_seed != requested_seed:
+            raise RuntimeError(
+                "Effective seed report is internally inconsistent: verified seed "
+                f"{effective_seed!r} does not equal requested seed {requested_seed}."
+            )
+        return
+    if status == "unavailable" and effective_seed is None:
+        return
+    raise RuntimeError(
+        "Effective seed report has an invalid status/value combination: "
+        f"status={status!r}, effective_seed={effective_seed!r}."
+    )
+
+
 def run_worker(run_dir: Path, repository_root: Path) -> dict[str, Any]:
     """Fit one configured predictor using train-only processed inputs."""
     started_at = utc_now()
@@ -178,12 +207,9 @@ def run_worker(run_dir: Path, repository_root: Path) -> dict[str, Any]:
         run_dir,
         predictor,
         requested_seed=config.seed,
+        configured_families=resolved_families,
     )
-    if inspection["effective_seed_status"] == "mismatch":
-        raise RuntimeError(
-            "AutoGluon public metadata exposed an effective seed that differs from "
-            f"requested seed {config.seed}: {inspection['effective_seeds_observed']}"
-        )
+    validate_effective_seed_report(inspection, requested_seed=config.seed)
     _stage("inspection_exported")
 
     completed_at = utc_now()

@@ -72,10 +72,18 @@ The registered profiles are:
   diagnostic profile, not a recommended default.
 
 The supervisor persists `requested_seed` and the seed-bearing profile identity before
-launch, so they survive an early child crash. After a successful fit, public predictor
-metadata is inspected for the explicit `model_random_seed`. A visible mismatch fails
-the worker; if AutoGluon does not expose it, the inspection records `unavailable`
-rather than claiming verification.
+launch, so they survive an early child crash. The requested seed is applied to every
+configured core/base-family model. After fit, effective verification is scoped to
+those configured families using AutoGluon 1.5.0 public `model_type` and bagged
+`child_model_type` metadata. A true configured base-model mismatch fails the worker.
+If supported public metadata does not expose a base-model seed, inspection records
+`unavailable` and does not claim verification.
+
+Auxiliary/meta models are reported separately. In particular, weighted ensembles may
+expose their own independent internal/default `model_random_seed`; a differing
+auxiliary seed does not invalidate configured base-model agreement. AutoGluon 1.5.0
+normally provides model-type metadata for this classification. A documented
+`WeightedEnsemble*` name fallback is used only when those public type fields are absent.
 
 ## Supervision and completion
 
