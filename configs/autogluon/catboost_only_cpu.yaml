@@ -7,7 +7,7 @@ dataset:
   directory: data/processed/v3_targeted_missingness
   train_features_file: X_train.parquet
   train_target_file: y_train.parquet
-  label: target
+  label: y
 
 predictor:
   problem_type: binary
