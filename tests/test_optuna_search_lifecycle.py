@@ -22,7 +22,8 @@ from src.churn_ml.optuna_search_export import (
     export_best_candidate,
 )
 from src.churn_ml.optuna_search_lifecycle import (
-    build_source_provenance,
+    _authoritative_dataset_identity,
+    _verify_or_initialize_study,
     run_optuna_study,
 )
 from src.churn_ml.optuna_search_objective import build_search_assignments
@@ -299,35 +300,33 @@ def test_running_sqlite_trial_is_recovered_after_interruption() -> None:
             direction="maximize",
             load_if_exists=True,
         )
-        source = build_source_provenance(config)
-        config_relative = config.source_path.relative_to(PROJECT_ROOT).as_posix()
-        study_source_sha256 = canonical_sha256(
-            {
-                "schema_version": 1,
-                "files": [
-                    item for item in source["files"] if item["path"] != config_relative
-                ],
-            }
+        X, y = _synthetic_data()
+        dataset_identity = _authoritative_dataset_identity(
+            X,
+            y,
+            {"schema_version": 1, "synthetic": True},
         )
-        study.set_user_attr("study_identity_sha256", config.study_identity_sha256)
-        study.set_user_attr("study_identity", config.study_identity)
-        study.set_user_attr("schema_version", 1)
-        study.set_user_attr("study_source_sha256", study_source_sha256)
+        assignments = build_search_assignments(
+            y,
+            repeats=1,
+            folds=3,
+            assignment_seed=23,
+        )
+        _verify_or_initialize_study(
+            study,
+            config,
+            dataset_identity_sha256=canonical_sha256(dataset_identity),
+            assignment_identity_sha256=canonical_sha256(assignments.identity),
+        )
         running = study.ask()
         assert running.number == 0
 
-        X, y = _synthetic_data()
         result = run_optuna_study(
             config,
             X=X,
             y=y,
             dataset_identity={"schema_version": 1, "synthetic": True},
-            assignments=build_search_assignments(
-                y,
-                repeats=1,
-                folds=3,
-                assignment_seed=23,
-            ),
+            assignments=assignments,
             adapter=_DeterministicAdapter(),
         )
         trials = pd.read_csv(result.search_dir / "trials.csv")

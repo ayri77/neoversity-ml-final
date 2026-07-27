@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import json
-import platform
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +20,7 @@ from src.churn_ml.optuna_search_objective import (
     TrialEvaluation,
     evaluate_trial,
 )
+from src.churn_ml.optuna_search_resume import build_resume_authentication
 from src.churn_ml.optuna_search_space import (
     build_resolved_adapter_contract,
     stateless_sample,
@@ -31,29 +31,6 @@ from src.churn_ml.research_data import canonical_sha256
 
 class OptunaSearchLifecycleError(RuntimeError):
     """Raised when deterministic study or cache lifecycle guarantees fail."""
-
-
-SOURCE_PATHS = (
-    "scripts/run_optuna_search.py",
-    "src/churn_ml/experiment_v2_adapter.py",
-    "src/churn_ml/experiment_v2_catboost_adapter.py",
-    "src/churn_ml/experiment_v2_contract.py",
-    "src/churn_ml/experiment_v2_model_registry.py",
-    "src/churn_ml/experiment_v2_numeric_adapter.py",
-    "src/churn_ml/experiment_v2_pipeline.py",
-    "src/churn_ml/experiment_v2_xgboost_adapter.py",
-    "src/churn_ml/optuna_search_artifacts.py",
-    "src/churn_ml/optuna_search_cli.py",
-    "src/churn_ml/optuna_search_config.py",
-    "src/churn_ml/optuna_search_export.py",
-    "src/churn_ml/optuna_search_lifecycle.py",
-    "src/churn_ml/optuna_search_objective.py",
-    "src/churn_ml/optuna_search_space.py",
-    "src/churn_ml/research_protocol.py",
-    "src/churn_ml/research_v2_config.py",
-    "src/churn_ml/research_v2_data.py",
-    "src/churn_ml/target_encoding.py",
-)
 
 
 @dataclass(frozen=True)
@@ -78,8 +55,10 @@ def run_optuna_study(
 
     started_at = datetime.now(timezone.utc)
     started = perf_counter()
+    authoritative_dataset_identity = _authoritative_dataset_identity(
+        X, y, dataset_identity
+    )
     source_provenance = build_source_provenance(config)
-    study_source_sha256 = _study_source_sha256(source_provenance, config)
     storage_path = config.storage_path
     storage_path.parent.mkdir(parents=True, exist_ok=True)
     cache_root = (
@@ -104,7 +83,8 @@ def run_optuna_study(
     _verify_or_initialize_study(
         study,
         config,
-        study_source_sha256=study_source_sha256,
+        dataset_identity_sha256=canonical_sha256(authoritative_dataset_identity),
+        assignment_identity_sha256=canonical_sha256(assignments.identity),
     )
     recovered = _recover_interrupted_trials(study, TrialState)
     target = int(config.payload["n_trials"])
@@ -130,6 +110,13 @@ def run_optuna_study(
                 tuned_parameters=tuned,
             )
             adapter.validate_contract(contract)
+            candidate_identity_sha256 = canonical_sha256(
+                {
+                    "schema_version": 1,
+                    "adapter_id": config.adapter_id,
+                    "resolved_parameters": tuned,
+                }
+            )
             result = evaluate_trial(
                 X,
                 y,
@@ -138,6 +125,8 @@ def run_optuna_study(
                 threshold_policy=config.threshold_policy_payload,
                 fit_predict=adapter.fit_predict,
                 trial_number=int(trial.number),
+                adapter_id=config.adapter_id,
+                candidate_identity_sha256=candidate_identity_sha256,
             )
             cache_identity = _write_trial_cache(
                 cache_root,
@@ -145,6 +134,11 @@ def run_optuna_study(
                 evaluation=result,
             )
             trial.set_user_attr("resolved_parameters", tuned)
+            trial.set_user_attr("adapter_id", config.adapter_id)
+            trial.set_user_attr(
+                "candidate_identity_sha256",
+                candidate_identity_sha256,
+            )
             trial.set_user_attr("prediction_key_coverage", result.coverage)
             trial.set_user_attr("cache_identity", cache_identity)
             trial.set_user_attr("failure_reason_code", None)
@@ -206,6 +200,8 @@ def run_optuna_study(
         "direction": "maximize",
         "tie_break": "lowest_trial_number",
         "resolved_parameters": resolved_parameters,
+        "candidate_identity_sha256": best.user_attrs["candidate_identity_sha256"],
+        "candidate_config_sha256": canonical_sha256(best_candidate),
         "prediction_key_coverage": best.user_attrs["prediction_key_coverage"],
         "evidence_scope": "tuning_only_not_unbiased_final_evidence",
     }
@@ -219,6 +215,9 @@ def run_optuna_study(
         "search_id": config.search_id,
         "study_identity_sha256": config.study_identity_sha256,
         "search_identity_sha256": config.search_identity_sha256,
+        "resume_authentication_sha256": config.resume_authentication["identity_sha256"],
+        "dataset_identity_sha256": canonical_sha256(authoritative_dataset_identity),
+        "assignment_identity_sha256": canonical_sha256(assignments.identity),
         "direction": "maximize",
         "metric": "balanced_accuracy",
         "objective_aggregation": "mean_fold_balanced_accuracy_across_repeats",
@@ -233,10 +232,10 @@ def run_optuna_study(
         "optuna_storage_role": "resumable_operational_state_only",
         "final_evaluation_status": "not_run",
     }
-    current_sources = build_source_provenance(config)
-    if current_sources["sha256"] != source_provenance["sha256"]:
+    current_resume_identity = _current_resume_authentication(config)
+    if current_resume_identity != config.resume_authentication:
         raise OptunaSearchLifecycleError(
-            "Source files changed during the search; immutable report refused."
+            "Source/runtime identity changed during the search; report refused."
         )
     runtime = {
         "schema_version": 1,
@@ -251,7 +250,7 @@ def run_optuna_study(
     }
     search_dir = write_completed_search(
         config,
-        dataset_identity=dataset_identity,
+        dataset_identity=authoritative_dataset_identity,
         assignment_identity=assignments.identity,
         search_space_payload={
             "schema_version": 1,
@@ -268,6 +267,7 @@ def run_optuna_study(
         runtime=runtime,
         environment=environment_identity(config.adapter_id),
         source_provenance=source_provenance,
+        resume_authentication=config.resume_authentication,
         fold_assignments=assignments.folds,
         threshold_membership=assignments.threshold_membership,
     )
@@ -279,31 +279,11 @@ def run_optuna_study(
 
 
 def build_source_provenance(config: OptunaSearchConfig) -> dict[str, Any]:
-    relative_paths = {
-        *SOURCE_PATHS,
-        config.source_path.relative_to(config.project_root).as_posix(),
-        config.search_space.source_path.relative_to(config.project_root).as_posix(),
-        config.base_config.source_path.relative_to(config.project_root).as_posix(),
-        config.base_config.plan_path.relative_to(config.project_root).as_posix(),
-    }
-    files = []
-    for relative in sorted(relative_paths):
-        path = (config.project_root / relative).resolve()
-        if config.project_root not in path.parents or not path.is_file():
-            raise OptunaSearchLifecycleError(
-                f"Source provenance path is invalid: {relative}."
-            )
-        files.append(
-            {
-                "path": relative,
-                "size_bytes": path.stat().st_size,
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
-        )
+    source = config.resume_authentication["source_closure"]
     canonical = {
         "schema_version": 1,
-        "hashing_method": "sha256_file_bytes_repository_relative_paths",
-        "files": files,
+        "hashing_method": source["hashing_method"],
+        "files": deepcopy(source["files"]),
     }
     return {**canonical, "sha256": canonical_sha256(canonical)}
 
@@ -329,21 +309,57 @@ def portable_dataset_identity(
     return result
 
 
+def _authoritative_dataset_identity(
+    X: pd.DataFrame,
+    y: pd.Series,
+    provided_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    if len(X) != len(y) or not X.index.equals(y.index):
+        raise OptunaSearchLifecycleError("Training data identity rows are not aligned.")
+    if not y.index.equals(pd.RangeIndex(len(y))):
+        raise OptunaSearchLifecycleError("Training row identity must be a RangeIndex.")
+    provided = json.loads(json.dumps(provided_identity))
+    training_data = {
+        "row_count": len(y),
+        "row_position_identity_sha256": canonical_sha256(list(range(len(y)))),
+        "feature_schema": {
+            "ordered_names": [str(name) for name in X.columns],
+            "ordered_dtypes": [
+                {"name": str(name), "dtype": str(dtype)}
+                for name, dtype in X.dtypes.items()
+            ],
+        },
+        "target": {
+            "name": None if y.name is None else str(y.name),
+            "dtype": str(y.dtype),
+            "negative_count": int((y == 0).sum()),
+            "positive_count": int((y == 1).sum()),
+            "values_sha256": canonical_sha256(
+                {
+                    "name": None if y.name is None else str(y.name),
+                    "dtype": str(y.dtype),
+                    "values": [int(value) for value in y.tolist()],
+                }
+            ),
+        },
+    }
+    canonical = {
+        "schema_version": 1,
+        "provided_identity": provided,
+        "provided_identity_sha256": canonical_sha256(provided),
+        "training_data": training_data,
+    }
+    return {**canonical, "identity_sha256": canonical_sha256(canonical)}
+
+
 def environment_identity(adapter_id: str) -> dict[str, Any]:
-    distributions = [
-        "optuna",
-        "numpy",
-        "pandas",
-        "scikit-learn",
-        "pyarrow",
-        "xgboost" if adapter_id == "xgboost_numeric_v1" else "catboost",
-    ]
+    runtime = build_resume_authentication(
+        project_root=Path(__file__).resolve().parents[2],
+        adapter_id=adapter_id,
+    )["runtime_dependencies"]
     return {
         "schema_version": 1,
-        "python": platform.python_version(),
-        "packages": {
-            name: importlib.metadata.version(name) for name in sorted(distributions)
-        },
+        "runtime_dependencies": runtime,
         "adapter_id": adapter_id,
         "device_policy": "cpu_only",
         "thread_count": 1,
@@ -397,27 +413,48 @@ def _verify_or_initialize_study(
     study: Any,
     config: OptunaSearchConfig,
     *,
-    study_source_sha256: str,
+    dataset_identity_sha256: str,
+    assignment_identity_sha256: str,
 ) -> None:
     existing = study.user_attrs.get("study_identity_sha256")
+    expected_attrs = {
+        "study_identity_sha256": config.study_identity_sha256,
+        "study_identity": config.study_identity,
+        "schema_version": 1,
+        "resume_authentication": config.resume_authentication,
+        "resume_authentication_sha256": config.resume_authentication["identity_sha256"],
+        "source_closure": config.resume_authentication["source_closure"],
+        "runtime_dependencies": config.resume_authentication["runtime_dependencies"],
+        "dataset_identity_sha256": dataset_identity_sha256,
+        "assignment_identity_sha256": assignment_identity_sha256,
+    }
     if existing is None:
-        study.set_user_attr(
-            "study_identity_sha256",
-            config.study_identity_sha256,
-        )
-        study.set_user_attr("study_identity", config.study_identity)
-        study.set_user_attr("schema_version", 1)
-        study.set_user_attr("study_source_sha256", study_source_sha256)
+        if study.get_trials(deepcopy=False):
+            raise OptunaSearchLifecycleError(
+                "Existing study lacks resume authentication and is unsupported."
+            )
+        for name, value in expected_attrs.items():
+            study.set_user_attr(name, value)
         return
-    if (
-        existing != config.study_identity_sha256
-        or study.user_attrs.get("study_identity") != config.study_identity
-        or study.user_attrs.get("schema_version") != 1
-        or study.user_attrs.get("study_source_sha256") != study_source_sha256
+    if any(
+        study.user_attrs.get(name) != value for name, value in expected_attrs.items()
     ):
         raise OptunaSearchLifecycleError(
-            "Existing study identity differs from the requested search."
+            "Existing study source/runtime/data identity differs from the request."
         )
+
+
+def _current_resume_authentication(config: OptunaSearchConfig) -> dict[str, Any]:
+    root = config.project_root
+    return build_resume_authentication(
+        project_root=root,
+        adapter_id=config.adapter_id,
+        contract_paths=(
+            config.base_config.source_path.relative_to(root).as_posix(),
+            config.base_config.plan_path.relative_to(root).as_posix(),
+            config.search_space.source_path.relative_to(root).as_posix(),
+        ),
+    )
 
 
 def _recover_interrupted_trials(study: Any, trial_state: Any) -> int:
@@ -502,11 +539,24 @@ def _load_completed_trial_caches(
             loaded[name] = pd.read_csv(path)
         fold = loaded["fold_metrics"]
         repeat = loaded["repeat_metrics"].copy()
-        repeat.insert(5, "record_type", "repeat")
-        fold.insert(len(fold.columns), "record_type", "fold")
+        repeat["record_type"] = "repeat"
+        fold["record_type"] = "fold"
         metric_frames.extend([fold, repeat])
         prediction_frames.append(loaded["predictions"])
     metrics = pd.concat(metric_frames, ignore_index=True, sort=False)
+    nullable_integer_columns = (
+        "fold",
+        "training_rows",
+        "validation_rows",
+        "threshold_selection_rows",
+        "true_negative",
+        "false_positive",
+        "false_negative",
+        "true_positive",
+        "fold_count",
+    )
+    for name in nullable_integer_columns:
+        metrics[name] = metrics[name].astype("Int64")
     predictions = pd.concat(prediction_frames, ignore_index=True)
     return metrics, predictions
 
@@ -523,6 +573,10 @@ def _build_trial_table(trials: list[Any]) -> pd.DataFrame:
             {
                 "trial_number": int(trial.number),
                 "state": trial.state.name,
+                "adapter_id": trial.user_attrs.get("adapter_id"),
+                "candidate_identity_sha256": trial.user_attrs.get(
+                    "candidate_identity_sha256"
+                ),
                 "objective": None if trial.value is None else float(trial.value),
                 "started_at": (
                     None
@@ -575,22 +629,3 @@ def _required_trial_value(trial: Any) -> float:
             f"Completed trial {trial.number} has no objective value."
         )
     return float(value)
-
-
-def _study_source_sha256(
-    provenance: Mapping[str, Any],
-    config: OptunaSearchConfig,
-) -> str:
-    config_path = config.source_path.relative_to(config.project_root).as_posix()
-    files = provenance.get("files")
-    if not isinstance(files, list):
-        raise OptunaSearchLifecycleError("Source provenance files are invalid.")
-    canonical = {
-        "schema_version": 1,
-        "files": [
-            item
-            for item in files
-            if isinstance(item, dict) and item.get("path") != config_path
-        ],
-    }
-    return canonical_sha256(canonical)

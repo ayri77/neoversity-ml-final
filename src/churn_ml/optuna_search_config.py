@@ -10,6 +10,7 @@ from typing import Any, Mapping
 import yaml
 
 from src.churn_ml.experiment_v2 import get_candidate_adapter
+from src.churn_ml.optuna_search_resume import build_resume_authentication
 from src.churn_ml.research_data import canonical_sha256
 from src.churn_ml.research_v2_config import (
     ResearchV2Config,
@@ -129,6 +130,7 @@ class OptunaSearchConfig:
     project_root: Path
     base_config: ResearchV2Config
     search_space: SearchSpace
+    resume_authentication: dict[str, Any]
     study_identity: dict[str, Any]
     study_identity_sha256: str
     search_identity: dict[str, Any]
@@ -177,6 +179,7 @@ class OptunaSearchConfig:
             "id": self.search_space.search_space_id,
             "sha256": self.search_space.sha256,
         }
+        payload["resume_authentication"] = deepcopy(self.resume_authentication)
         payload["study_identity_sha256"] = self.study_identity_sha256
         payload["search_identity_sha256"] = self.search_identity_sha256
         payload["search_id"] = self.search_id
@@ -299,6 +302,15 @@ def load_optuna_search_config(
         "artifacts_root",
         allow_equal=True,
     )
+    resume_authentication = build_resume_authentication(
+        project_root=root,
+        adapter_id=adapter_id,
+        contract_paths=(
+            base.source_path.relative_to(root).as_posix(),
+            base.plan_path.relative_to(root).as_posix(),
+            space.source_path.relative_to(root).as_posix(),
+        ),
+    )
     study_identity = {
         "schema_version": 1,
         "search_plan_id": payload["search_plan_id"],
@@ -323,6 +335,7 @@ def load_optuna_search_config(
         "positive_class_label": 1,
         "probability_semantics": "binary_positive_class_label_1",
         "label_comparison": "greater_than_or_equal",
+        "resume_authentication": deepcopy(resume_authentication),
     }
     study_sha = canonical_sha256(study_identity)
     search_identity = {
@@ -338,6 +351,7 @@ def load_optuna_search_config(
         project_root=root,
         base_config=base,
         search_space=space,
+        resume_authentication=resume_authentication,
         study_identity=study_identity,
         study_identity_sha256=study_sha,
         search_identity=search_identity,

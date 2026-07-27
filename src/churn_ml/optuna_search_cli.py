@@ -6,7 +6,7 @@ import socket
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Never
 
 from src.churn_ml.experiment_v2 import get_candidate_adapter
 from src.churn_ml.optuna_search_artifacts import (
@@ -40,8 +40,17 @@ EXIT_STUDY = 4
 EXIT_EXPORT = 5
 
 
+class CliUsageError(ValueError):
+    """Raised instead of argparse prose for deterministic JSON failures."""
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> Never:
+        raise CliUsageError(message)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = JsonArgumentParser(
         description="Run deterministic train-only Optuna Search v1."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -249,5 +258,10 @@ def network_disabled() -> Iterator[None]:
         socket.create_connection = original_connection
 
 
-def main() -> int:
-    return execute(parse_args())
+def main(argv: list[str] | None = None) -> int:
+    try:
+        args = parse_args(argv)
+    except CliUsageError as error:
+        _emit_error("usage_error", error, EXIT_CONFIG)
+        return EXIT_CONFIG
+    return execute(args)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import tempfile
 from copy import deepcopy
 from dataclasses import dataclass
@@ -36,6 +38,7 @@ PAYLOAD_FILES = {
     "runtime.json",
     "environment.json",
     "source_provenance.json",
+    "resume_authentication.json",
     "fold_assignments.csv",
     "threshold_selection_membership.csv",
 }
@@ -70,6 +73,7 @@ def write_completed_search(
     runtime: Mapping[str, Any],
     environment: Mapping[str, Any],
     source_provenance: Mapping[str, Any],
+    resume_authentication: Mapping[str, Any],
     fold_assignments: pd.DataFrame,
     threshold_membership: pd.DataFrame,
 ) -> Path:
@@ -95,6 +99,11 @@ def write_completed_search(
                 "sha256": config.search_identity_sha256,
                 "canonical": deepcopy(config.search_identity),
                 "study_identity_sha256": config.study_identity_sha256,
+                "dataset_identity_sha256": canonical_sha256(dataset_identity),
+                "assignment_identity_sha256": canonical_sha256(assignment_identity),
+                "resume_authentication_sha256": resume_authentication[
+                    "identity_sha256"
+                ],
             },
         )
         _write_json(staging / "dataset_identity.json", dict(dataset_identity))
@@ -114,6 +123,10 @@ def write_completed_search(
         _write_json(
             staging / "source_provenance.json",
             dict(source_provenance),
+        )
+        _write_json(
+            staging / "resume_authentication.json",
+            dict(resume_authentication),
         )
         _write_csv(staging / "fold_assignments.csv", fold_assignments)
         _write_csv(
@@ -198,12 +211,13 @@ def load_optuna_search_result(
 ) -> CompletedSearchResult:
     root = project_root.resolve()
     unresolved = path if path.is_absolute() else root / path
-    search_dir = unresolved.resolve()
-    if search_dir == root or root not in search_dir.parents:
-        raise OptunaSearchArtifactError(
-            "Search directory must be repository-contained."
-        )
+    search_dir = _contained_real_directory(unresolved, root)
     _validate_tree(search_dir, require_success=True)
+    loaded_identity = _load_json(search_dir / "search_identity.json")
+    if loaded_identity.get("search_id") != search_dir.name:
+        raise OptunaSearchArtifactError(
+            "Search directory name differs from authenticated search identity."
+        )
     return CompletedSearchResult(
         search_dir=search_dir,
         search_identity=_load_json(search_dir / "search_identity.json"),
@@ -214,17 +228,25 @@ def load_optuna_search_result(
 
 
 def _validate_tree(root: Path, *, require_success: bool) -> None:
-    if not root.is_dir() or root.is_symlink():
+    root_metadata = root.lstat()
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or stat.S_ISLNK(root_metadata.st_mode)
+        or _is_reparse_stat(root_metadata)
+    ):
         raise OptunaSearchArtifactError("Search report must be a real directory.")
     actual_files: set[str] = set()
     for item in root.iterdir():
-        if item.is_symlink():
-            raise OptunaSearchArtifactError("Linked search artifacts are forbidden.")
-        if item.is_dir():
+        metadata = item.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_stat(metadata):
+            raise OptunaSearchArtifactError(
+                "Linked/reparse search artifacts are forbidden."
+            )
+        if stat.S_ISDIR(metadata.st_mode):
             raise OptunaSearchArtifactError("Unexpected artifact directory.")
-        if not item.is_file():
+        if not stat.S_ISREG(metadata.st_mode):
             raise OptunaSearchArtifactError("Unexpected non-file artifact.")
-        if getattr(item.stat(), "st_nlink", 1) > 1:
+        if getattr(metadata, "st_nlink", 1) > 1:
             raise OptunaSearchArtifactError(
                 "Multiply linked search artifacts are forbidden."
             )
@@ -355,7 +377,7 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Cannot serialize {type(value).__name__}.")
 
 
-def _validate_semantics(root: Path) -> None:
+def _validate_semantics_legacy_unused(root: Path) -> None:
     resolved = _load_yaml(root / "resolved_search_config.yaml")
     expected_resolved_keys = PLAN_KEYS | {
         "base_candidate_config_sha256",
@@ -496,6 +518,57 @@ def _validate_semantics(root: Path) -> None:
         root / "best_candidate_config.yaml",
         project_root=_project_root_for_artifact(root),
     )
+
+
+def _validate_semantics(root: Path) -> None:
+    """Run exact-schema validation and full independent semantic reconstruction."""
+    from src.churn_ml.optuna_search_semantics import (
+        validate_completed_search_semantics,
+    )
+
+    try:
+        validate_completed_search_semantics(
+            root,
+            project_root=_project_root_for_artifact(root),
+        )
+    except Exception as error:
+        raise OptunaSearchArtifactError(
+            f"Semantic validation failed: {error}"
+        ) from error
+
+
+def _contained_real_directory(path: Path, root: Path) -> Path:
+    lexical = Path(os.path.abspath(path))
+    if lexical == root or root not in lexical.parents:
+        raise OptunaSearchArtifactError(
+            "Search directory must be repository-contained."
+        )
+    relative = lexical.relative_to(root)
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise OptunaSearchArtifactError(
+                "Search directory path is unavailable."
+            ) from error
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_stat(metadata):
+            raise OptunaSearchArtifactError(
+                "Search directory path must not contain links/reparse points."
+            )
+    if not stat.S_ISDIR(current.lstat().st_mode):
+        raise OptunaSearchArtifactError("Search report must be a directory.")
+    resolved = current.resolve()
+    if resolved != lexical or root not in resolved.parents:
+        raise OptunaSearchArtifactError(
+            "Search directory path changed during non-following validation."
+        )
+    return resolved
+
+
+def _is_reparse_stat(metadata: os.stat_result) -> bool:
+    return bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
 
 
 def _project_root_for_artifact(path: Path) -> Path:

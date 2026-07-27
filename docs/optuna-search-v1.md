@@ -89,6 +89,98 @@ The base production adapter remains authoritative for all fixed values:
 GPU, evaluation-set, early-stopping, filesystem-writing, and unsupported model
 parameters cannot enter a v1 search space.
 
+### Exact XGBoost search space
+
+The following machine-readable table is normative and must match
+`configs/optuna/search_spaces/xgboost_numeric_v1.yaml` exactly.
+
+<!-- OPTUNA_SEARCH_SPACE:xgboost_numeric_v1 -->
+```yaml
+n_estimators: {distribution: int, low: 100, high: 600, step: 50, log: false}
+learning_rate: {distribution: float, low: 0.01, high: 0.2, log: true}
+max_depth: {distribution: int, low: 3, high: 10, step: 1, log: false}
+min_child_weight: {distribution: float, low: 0.1, high: 20.0, log: true}
+subsample: {distribution: float, low: 0.6, high: 1.0, log: false}
+colsample_bytree: {distribution: float, low: 0.6, high: 1.0, log: false}
+gamma: {distribution: float, low: 0.0, high: 5.0, log: false}
+reg_alpha:
+  distribution: zero_or_log_float
+  zero_probability: 0.2
+  low_positive: 1.0e-8
+  high: 10.0
+reg_lambda: {distribution: float, low: 1.0e-4, high: 100.0, log: true}
+max_bin: {distribution: int, low: 128, high: 512, step: 64, log: false}
+```
+<!-- /OPTUNA_SEARCH_SPACE:xgboost_numeric_v1 -->
+
+Integer fields use inclusive stepped ranges. Float fields marked `log: true`
+use log-uniform sampling; the other float fields are linear. `reg_alpha` first
+draws an explicit zero with probability `0.2`; its nonzero branch is log-uniform
+on `[1e-8, 10.0]`.
+
+### Exact CatBoost search space
+
+The following machine-readable table is normative and must match
+`configs/optuna/search_spaces/catboost_numeric_v1.yaml` exactly.
+
+<!-- OPTUNA_SEARCH_SPACE:catboost_numeric_v1 -->
+```yaml
+iterations: {distribution: int, low: 100, high: 600, step: 50, log: false}
+learning_rate: {distribution: float, low: 0.01, high: 0.2, log: true}
+depth: {distribution: int, low: 4, high: 10, step: 1, log: false}
+l2_leaf_reg: {distribution: float, low: 0.1, high: 50.0, log: true}
+random_strength: {distribution: float, low: 0.0, high: 5.0, log: false}
+bagging_temperature: {distribution: float, low: 0.0, high: 5.0, log: false}
+border_count: {distribution: int, low: 64, high: 256, step: 32, log: false}
+```
+<!-- /OPTUNA_SEARCH_SPACE:catboost_numeric_v1 -->
+
+Integer fields use inclusive stepped ranges. `learning_rate` and `l2_leaf_reg`
+are log-uniform. `random_strength` and `bagging_temperature` are linear and may
+be exactly zero.
+
+### Fixed adapter-controlled fields
+
+These fields are deliberately outside the search-space YAML. They preserve the
+approved production adapters' probability, reproducibility, resource, and
+side-effect contracts.
+
+| Adapter | Fixed fields | Reason |
+|---|---|---|
+| XGBoost | `objective=binary:logistic`, `booster=gbtree`, `missing=IEEE_NaN`, `tree_method=hist`, `device=cpu`, `random_state=42`, `n_jobs=1`, `eval_metric=logloss`, `verbosity=0` | Preserve binary class-1 probabilities, native missing values, deterministic CPU execution, one thread, and silent fitting without an evaluation set. |
+| CatBoost | `random_seed=42`, `thread_count=1`, `bootstrap_type=Bayesian`, `grow_policy=SymmetricTree`, `loss_function=Logloss`, `eval_metric=Logloss`, `nan_mode=Min`, `task_type=CPU`, `allow_writing_files=false`, `verbose=false` | Preserve deterministic CPU execution, one thread, native missing handling, the approved tree/bootstrap policy, and a no-filesystem-write fit. |
+| Both | numeric fold-local target-encoding contract; positive-class label `1`; no `eval_set`; no early stopping | These are Experiment Core v2 leakage and probability contracts, not model-selection dimensions. |
+
+## Resume authentication identity
+
+Before any trial is allocated, v1 builds a versioned resume-authentication
+identity. Its source closure contains every `optuna_search_*.py` module, the CLI
+entry point, Experiment Core v2 config/resolved-config/schema/data modules,
+numeric adapters and registry, threshold/metrics code, assignment logic, and
+artifact/export code. Every entry uses a canonical repository-relative POSIX
+path plus the size and SHA-256 of the same bytes. Symlinks, junctions, reparse
+points, missing files, and non-regular files are rejected.
+
+The runtime component records exact versions for Python, Optuna, NumPy, pandas,
+scikit-learn, PyArrow, PyYAML, and the selected adapter package (XGBoost or
+CatBoost). The complete identity is included in the deterministic study
+identity, persisted in study attributes and the immutable report, and recomputed
+before every resume. Missing legacy identity or any source/runtime mismatch is
+rejected before another trial can be allocated.
+
+## Completed-report semantic reconstruction
+
+Completed loading does not trust a coherent inventory/manifest alone. After
+non-following tree safety and byte authentication, it validates exact schemas
+and independently reconstructs the authorized target row universe, repeated
+stratified assignments, cross-fitted threshold membership, every completed
+trial's Cartesian prediction keys, thresholds, labels, confusion counts, fold
+Balanced Accuracy, repeat aggregates, final objective, lifecycle counts,
+deterministic lowest-trial tie break, winning parameters, and exported candidate
+linkage. `_SUCCESS` is validated last and must remain the newest file. `inspect`
+and `export-best` use this complete loader and reject semantically invalid
+reports even when inventory, manifest, and `_SUCCESS` were coherently rebuilt.
+
 ## Study and artifact lifecycle
 
 Optuna `4.9.0` is already declared in `pyproject.toml` and locked in `uv.lock`.

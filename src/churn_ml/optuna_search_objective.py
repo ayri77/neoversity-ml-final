@@ -174,6 +174,8 @@ def evaluate_trial(
     threshold_policy: dict[str, Any],
     fit_predict: FitPredict,
     trial_number: int,
+    adapter_id: str,
+    candidate_identity_sha256: str,
     fit_audit_callback: Any = None,
 ) -> TrialEvaluation:
     if len(X) != len(y) or not X.index.equals(y.index):
@@ -219,6 +221,8 @@ def evaluate_trial(
                 pd.DataFrame(
                     {
                         "trial_number": trial_number,
+                        "adapter_id": adapter_id,
+                        "candidate_identity_sha256": candidate_identity_sha256,
                         "repeat": int(repeat),
                         "repeat_seed": repeat_seed,
                         "fold": int(fold),
@@ -265,10 +269,17 @@ def evaluate_trial(
             labels = (scoring["probability"].to_numpy() >= threshold.threshold).astype(
                 "int8"
             )
-            score = float(balanced_accuracy_score(scoring["target"], labels))
+            targets = scoring["target"].to_numpy(dtype="int8")
+            score = float(balanced_accuracy_score(targets, labels))
+            true_negative = int(((targets == 0) & (labels == 0)).sum())
+            false_positive = int(((targets == 0) & (labels == 1)).sum())
+            false_negative = int(((targets == 1) & (labels == 0)).sum())
+            true_positive = int(((targets == 1) & (labels == 1)).sum())
             fold_records.append(
                 {
                     "trial_number": trial_number,
+                    "adapter_id": adapter_id,
+                    "candidate_identity_sha256": candidate_identity_sha256,
                     "repeat": int(repeat),
                     "repeat_seed": int(scoring["repeat_seed"].iloc[0]),
                     "fold": int(fold),
@@ -285,6 +296,10 @@ def evaluate_trial(
                     "threshold_status": threshold.status,
                     "threshold_degenerate": threshold.degenerate,
                     "balanced_accuracy": score,
+                    "true_negative": true_negative,
+                    "false_positive": false_positive,
+                    "false_negative": false_negative,
+                    "true_positive": true_positive,
                     "comparison": "greater_than_or_equal",
                 }
             )
@@ -302,11 +317,17 @@ def evaluate_trial(
             fold_count=("fold", "count"),
             balanced_accuracy=("balanced_accuracy", "mean"),
         )
-        .assign(trial_number=trial_number)
+        .assign(
+            trial_number=trial_number,
+            adapter_id=adapter_id,
+            candidate_identity_sha256=candidate_identity_sha256,
+        )
     )
     repeat_metrics = repeat_metrics[
         [
             "trial_number",
+            "adapter_id",
+            "candidate_identity_sha256",
             "repeat",
             "repeat_seed",
             "fold_count",

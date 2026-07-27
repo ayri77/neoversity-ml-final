@@ -269,6 +269,8 @@ def test_cross_fitted_objective_matches_independent_recomputation() -> None:
         threshold_policy=policy,
         fit_predict=fit_predict,
         trial_number=4,
+        adapter_id="xgboost_numeric_v1",
+        candidate_identity_sha256="0" * 64,
     )
     assert len(fit_calls) == 6
     for training, prediction, keyword_names in fit_calls:
