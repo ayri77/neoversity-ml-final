@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import stat
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -103,6 +103,11 @@ _RESEARCH_IDENTITY_NAMES = {
     "source": "source",
     "loaded_modules": "loaded_modules",
 }
+_RESEARCH_SOURCE_AUTHENTICATION_NAME = "mlflow_source_authentication"
+_RESEARCH_SOURCE_AUTHENTICATION_SCHEMA = 4
+_RESEARCH_SOURCE_AUTHENTICATION_METHOD = (
+    "sha256_file_bytes_size_sorted_repository_relative_paths"
+)
 _RESEARCH_HASH_KEYS = set(_RESEARCH_IDENTITY_NAMES.values())
 _AUTO_STATUS_KEYS = {
     "status",
@@ -337,12 +342,17 @@ def validate_failed_research_run(
                 "Research expected fold count disagrees with plan"
             )
 
-    identity_hashes, identity_paths = _validate_research_identity_artifacts(
+    (
+        identity_hashes,
+        identity_paths,
+        source_authentication_sha256,
+    ) = _validate_research_identity_artifacts(
         run_dir,
         repository_root=repository_root,
         resolved_config=validated_config,
         metadata_hashes=hashes,
         require_all=full and completed > 0,
+        require_source_authentication=early,
     )
     context_hashes, context_paths = _validate_optional_research_context_artifacts(
         run_dir,
@@ -350,6 +360,8 @@ def validate_failed_research_run(
         status_started=started,
         status_finished=finished,
     )
+    if source_authentication_sha256 is not None:
+        context_hashes["source_authentication"] = source_authentication_sha256
     if early:
         _reject_unsupported_early_research_artifacts(run_dir)
     artifact_paths = [
@@ -509,13 +521,17 @@ def _validate_research_identity_artifacts(
     resolved_config: Mapping[str, Any] | None,
     metadata_hashes: Mapping[str, str] | None,
     require_all: bool,
-) -> tuple[dict[str, str], list[str]]:
+    require_source_authentication: bool,
+) -> tuple[dict[str, str], list[str], str | None]:
     identities = run_dir / "identities"
     if require_all and not identities.is_dir():
         raise FailedLifecycleError("Research progressed failure lacks identities")
     if identities.exists() and not identities.is_dir():
         raise FailedLifecycleError("Research identities path is not a directory")
-    allowed = {f"{name}.json" for name in _RESEARCH_IDENTITY_NAMES}
+    allowed = {
+        *(f"{name}.json" for name in _RESEARCH_IDENTITY_NAMES),
+        f"{_RESEARCH_SOURCE_AUTHENTICATION_NAME}.json",
+    }
     if identities.is_dir():
         unexpected = [
             path.relative_to(identities).as_posix()
@@ -583,7 +599,47 @@ def _validate_research_identity_artifacts(
                 raise FailedLifecycleError(
                     f"Research candidate/{component} identity differs"
                 )
-    return hashes, paths
+    authentication_path = identities / f"{_RESEARCH_SOURCE_AUTHENTICATION_NAME}.json"
+    source_canonical = canonicals.get("source")
+    authentication_sha256: str | None = None
+    if authentication_path.exists():
+        if source_canonical is None:
+            raise FailedLifecycleError(
+                "Research source authentication lacks a source identity"
+            )
+        if not authentication_path.is_file():
+            raise FailedLifecycleError(
+                "Research source authentication artifact is not a file"
+            )
+        authentication = _strict_json(
+            authentication_path, "research source authentication"
+        )
+        _exact_keys(
+            authentication,
+            {"sha256", "canonical"},
+            "research source authentication",
+        )
+        authentication_sha256 = _sha(
+            authentication["sha256"], "research source authentication hash"
+        )
+        authentication_canonical = _mapping(
+            authentication["canonical"],
+            "research source authentication canonical",
+        )
+        if canonical_sha256(authentication_canonical) != authentication_sha256:
+            raise FailedLifecycleError("Research source authentication hash differs")
+        _validate_source_authentication_manifest(
+            authentication_canonical,
+            source_identity=source_canonical,
+            repository_root=repository_root,
+        )
+        paths.append(f"identities/{_RESEARCH_SOURCE_AUTHENTICATION_NAME}.json")
+    elif require_source_authentication and source_canonical is not None:
+        raise FailedLifecycleError(
+            "Research early source identity lacks the MLflow schema-v4 "
+            "source authentication artifact"
+        )
+    return hashes, paths, authentication_sha256
 
 
 def _validate_research_identity_semantics(
@@ -736,6 +792,168 @@ def _validate_research_identity_semantics(
                 record["loaded_source_sha256"],
                 "loaded module",
             )
+
+
+def build_repository_authentication_manifest(
+    repository_root: Path,
+    relative_paths: Iterable[object],
+) -> dict[str, Any]:
+    """Build the MLflow schema-v4 repository byte authentication manifest."""
+    if isinstance(relative_paths, (str, bytes)):
+        raise FailedLifecycleError(
+            "Repository authentication paths must be an iterable of paths"
+        )
+    seen: set[str] = set()
+    paths: list[str] = []
+    for value in relative_paths:
+        relative = _nonempty_string(value, "repository authentication path")
+        if relative in seen:
+            raise FailedLifecycleError(
+                "Repository authentication manifest contains duplicate paths"
+            )
+        seen.add(relative)
+        paths.append(relative)
+    if not paths:
+        raise FailedLifecycleError(
+            "Repository authentication manifest requires at least one path"
+        )
+    root = repository_root.resolve()
+    records = [
+        _repository_file_authentication_record(root, relative)
+        for relative in sorted(paths)
+    ]
+    return {
+        "schema_version": _RESEARCH_SOURCE_AUTHENTICATION_SCHEMA,
+        "hashing_method": _RESEARCH_SOURCE_AUTHENTICATION_METHOD,
+        "files": records,
+    }
+
+
+def _validate_source_authentication_manifest(
+    canonical: Mapping[str, Any],
+    *,
+    source_identity: Mapping[str, Any],
+    repository_root: Path,
+) -> None:
+    label = "research source authentication"
+    _exact_keys(canonical, {"schema_version", "hashing_method", "files"}, label)
+    if (
+        _exact_int(canonical["schema_version"], f"{label} schema")
+        != _RESEARCH_SOURCE_AUTHENTICATION_SCHEMA
+    ):
+        raise FailedLifecycleError(f"{label} schema differs")
+    if type(canonical["hashing_method"]) is not str:
+        raise FailedLifecycleError(f"{label} hashing method type differs")
+    if canonical["hashing_method"] != _RESEARCH_SOURCE_AUTHENTICATION_METHOD:
+        raise FailedLifecycleError(f"{label} hashing method differs")
+    files = canonical["files"]
+    if type(files) is not list or not files:
+        raise FailedLifecycleError(f"{label} files must be a nonempty list")
+    seen: set[str] = set()
+    ordered_paths: list[str] = []
+    for item in files:
+        record = _mapping(item, f"{label} file")
+        _exact_keys(record, {"path", "size_bytes", "sha256"}, f"{label} file")
+        relative = _nonempty_string(record["path"], f"{label} file path")
+        if relative in seen:
+            raise FailedLifecycleError(f"{label} contains duplicate paths")
+        seen.add(relative)
+        ordered_paths.append(relative)
+        size_bytes = _exact_int(record["size_bytes"], f"{label} size_bytes")
+        if size_bytes < 0:
+            raise FailedLifecycleError(f"{label} size_bytes must be nonnegative")
+        expected_sha256 = _sha(record["sha256"], f"{label} sha256")
+        actual = _repository_file_authentication_record(
+            repository_root.resolve(), relative
+        )
+        if actual["size_bytes"] != size_bytes:
+            raise FailedLifecycleError(f"{label} repository byte size differs")
+        if actual["sha256"] != expected_sha256:
+            raise FailedLifecycleError(f"{label} repository byte hash differs")
+    if ordered_paths != sorted(ordered_paths):
+        raise FailedLifecycleError(f"{label} file order differs")
+    rebuilt = build_repository_authentication_manifest(
+        repository_root,
+        ordered_paths,
+    )
+    difference = first_exact_difference(
+        canonical,
+        rebuilt,
+        "identities.mlflow_source_authentication.canonical",
+    )
+    if difference is not None:
+        raise FailedLifecycleError(
+            f"Research source authentication differs from repository bytes: {difference}"
+        )
+    legacy_files = _list(source_identity.get("files"))
+    legacy_projection = [
+        {
+            "path": _mapping(item, "source identity file")["path"],
+            "sha256": _mapping(item, "source identity file")["sha256"],
+        }
+        for item in legacy_files
+    ]
+    authentication_projection = [
+        {"path": item["path"], "sha256": item["sha256"]} for item in rebuilt["files"]
+    ]
+    difference = first_exact_difference(
+        legacy_projection,
+        authentication_projection,
+        "identities.source_authentication.files",
+    )
+    if difference is not None:
+        raise FailedLifecycleError(
+            "Research source authentication disagrees with the legacy source "
+            f"identity: {difference}"
+        )
+
+
+def _repository_file_authentication_record(
+    repository_root: Path,
+    relative: str,
+) -> dict[str, Any]:
+    label = "repository authentication"
+    path = _repository_path(relative, repository_root, f"{label} path")
+    _validate_repository_regular_file(
+        path,
+        repository_root=repository_root,
+        label=label,
+    )
+    try:
+        before = path.stat(follow_symlinks=False)
+        raw = path.read_bytes()
+        after = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise FailedLifecycleError(
+            "Cannot read repository authentication file"
+        ) from error
+    fingerprint_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    fingerprint_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if (
+        fingerprint_before != fingerprint_after
+        or len(raw) != after.st_size
+        or _repository_path(relative, repository_root, f"{label} path") != path
+    ):
+        raise FailedLifecycleError(
+            "Repository authentication file changed while it was read"
+        )
+    return {
+        "path": relative,
+        "size_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
 
 
 def _validate_source_file_manifest(
@@ -942,6 +1160,7 @@ def _reject_unsupported_early_research_artifacts(run_dir: Path) -> None:
         "runtime.json",
         "git.json",
         *(f"identities/{name}.json" for name in _RESEARCH_IDENTITY_NAMES),
+        f"identities/{_RESEARCH_SOURCE_AUTHENTICATION_NAME}.json",
     }
     actual_files = {
         path.relative_to(run_dir).as_posix()

@@ -217,6 +217,13 @@ class ResearchV2SourceAdapter:
             trusted_metadata = dict(metadata)
             if validated.identity_hashes:
                 trusted_metadata["hashes"] = dict(validated.identity_hashes)
+            source_authentication_sha256 = validated.context_hashes.get(
+                "source_authentication"
+            )
+            if source_authentication_sha256 is not None:
+                trusted_metadata["source_authentication_sha256"] = (
+                    source_authentication_sha256
+                )
             if validated.resolved_config is not None:
                 plan = cast(
                     Mapping[str, Any],

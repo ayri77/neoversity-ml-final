@@ -129,6 +129,7 @@ def build_research_mapping(
         "adapter_sha256": hashes.get("candidate_adapter"),
         "candidate_sha256": hashes.get("candidate"),
         "source_provenance_sha256": hashes.get("source"),
+        "source_authentication_sha256": metadata.get("source_authentication_sha256"),
         "loaded_modules_sha256": hashes.get("loaded_modules"),
         "plan_schema_version": plan.get("schema_version"),
         "repeat_count": len(outer.get("repeat_seeds", []))

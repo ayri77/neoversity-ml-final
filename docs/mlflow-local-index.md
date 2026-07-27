@@ -103,15 +103,39 @@ semantics.
 
 Present identity, environment, runtime, and Git artifacts must satisfy their exact
 schemas, lifecycle timestamps, and every identity field available from status,
-metadata, and config. Source/provenance manifests additionally require the exact
-canonical SHA-256 method and file set. Each canonical POSIX repository-relative path is
-checked for containment, traversal and reparse escapes, and regular-file type; every
-stored digest is then recomputed from the file's exact current bytes. The referenced
-repository config is loaded through the production v2 loader and compared with the
-persisted resolved config. Unsupported inventory/manifest-like or other partial
-artifacts make an early source corrupt. Native early failures with no optional config
-remain valid; consistent optional artifacts remain valid. Reparse paths and forbidden
-competition, submission, model, pickle, or AutoGluon content are rejected.
+metadata, and config. The completed-run Experiment Core v2 source identity remains the
+legacy schema-version-2 payload with exact `path` and `sha256` fields; MLflow does not
+mutate that portable identity or its pinned hashes.
+
+An early failure that persists the optional `identities/source.json` artifact must also
+persist `identities/mlflow_source_authentication.json`. Its MLflow-owned schema-version-4
+canonical manifest has exact top-level keys `schema_version`, `hashing_method`, and
+`files`. Every file entry has exactly:
+
+- `path`: a canonical repository-relative POSIX path;
+- `size_bytes`: the exact nonnegative integer byte length (booleans, strings, and
+  negative values are invalid);
+- `sha256`: the exact lowercase SHA-256 of those same bytes.
+
+The validator checks containment, traversal and reparse escapes, and regular-file type,
+then reads current repository bytes and recomputes both exact size and digest. Both must
+match. It independently rebuilds the complete sorted schema-v4 manifest and rejects
+missing, extra, duplicate, or reordered entries and unknown recursive fields. The
+schema-v4 path/digest projection must also exactly match the legacy source identity.
+A missing or incorrect size makes the optional artifact corrupt before mapping,
+artifact selection or copying, source-key/receipt construction, or MLflow client/run
+allocation.
+
+Schema v4 is an intentional migration boundary for optional early-failure repository
+authentication: an earlier early-failure source identity without the companion
+size-bearing manifest is no longer indexable and must be regenerated. Native early
+failures with no optional source identity remain valid. Completed Experiment Core v2
+runs continue through their existing production validator and are not invalidated by
+this MLflow-only early-failure schema. The referenced repository config is loaded
+through the production v2 loader and compared with the persisted resolved config.
+Unsupported inventory/manifest-like or other partial artifacts make an early source
+corrupt. Reparse paths and forbidden competition, submission, model, pickle, or
+AutoGluon content are rejected.
 
 Only the validated result returned by that lifecycle check can supply mapping fields,
 immutable source identity, or additions to the failed-run artifact-copy allowlist. A
