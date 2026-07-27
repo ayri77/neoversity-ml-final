@@ -4,7 +4,10 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
+
+
+PathKind = Literal["file", "directory", "either"]
 
 
 class DeploymentPathError(ValueError):
@@ -12,10 +15,151 @@ class DeploymentPathError(ValueError):
 
 
 @dataclass(frozen=True)
+class SafePath:
+    requested: Path
+    normalized: Path
+    containment_root: Path
+    validated_chain: tuple[Path, ...]
+    terminal_kind: Literal["file", "directory", "missing"]
+    canonical: Path
+
+
+@dataclass(frozen=True)
 class SafeTree:
-    root: Path
+    path: SafePath
     files: tuple[Path, ...]
     directories: tuple[Path, ...]
+
+    @property
+    def root(self) -> Path:
+        return self.path.canonical
+
+
+def validate_path_chain(
+    *,
+    containment_root: Path,
+    requested_path: Path,
+    require_exists: bool,
+    expected_kind: PathKind,
+    reject_hardlinks: bool = False,
+) -> SafePath:
+    """Validate every ancestor without following it, then resolve once."""
+    requested = requested_path
+    containment = containment_root.absolute()
+    normalized = (
+        requested_path.absolute()
+        if requested_path.is_absolute()
+        else (containment / requested_path).absolute()
+    )
+    try:
+        normalized.relative_to(containment)
+    except ValueError as error:
+        raise DeploymentPathError(
+            "Requested path is outside its permitted root."
+        ) from error
+
+    # Validate the containment root's own ancestors so a linked ancestor above the
+    # requested subtree cannot disappear through a later resolve().
+    anchor = Path(containment.anchor)
+    chain: list[Path] = []
+    current = anchor
+    containment_parts = containment.parts[1:]
+    for part in containment_parts:
+        current = current / part
+        _inspect_existing_component(
+            current,
+            expected_directory=True,
+            reject_hardlinks=False,
+            allow_mount=False,
+        )
+        chain.append(current)
+
+    relative = normalized.relative_to(containment)
+    current = containment
+    missing_seen = False
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        terminal = index == len(relative.parts) - 1
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            missing_seen = True
+            if require_exists:
+                raise DeploymentPathError(
+                    f"Path component does not exist: {relative.as_posix()}"
+                )
+            break
+        except OSError as error:
+            raise DeploymentPathError(
+                f"Cannot inspect path component: {current}"
+            ) from error
+        _reject_special(current, containment, metadata=info, allow_mount=False)
+        if terminal:
+            _require_kind(current, info, expected_kind)
+            if (
+                reject_hardlinks
+                and stat.S_ISREG(info.st_mode)
+                and int(info.st_nlink) > 1
+            ):
+                raise DeploymentPathError("Multiply linked file is prohibited.")
+        elif not stat.S_ISDIR(info.st_mode):
+            raise DeploymentPathError("A path ancestor is not a directory.")
+        chain.append(current)
+
+    if require_exists and missing_seen:
+        raise DeploymentPathError("Requested path does not exist.")
+    if require_exists:
+        canonical = normalized.resolve(strict=True)
+        terminal_kind: Literal["file", "directory", "missing"] = (
+            "file" if canonical.is_file() else "directory"
+        )
+    else:
+        nearest = containment
+        remaining: tuple[str, ...] = relative.parts
+        for index, part in enumerate(relative.parts):
+            candidate = nearest / part
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                remaining = relative.parts[index:]
+                break
+            nearest = candidate
+        else:
+            remaining = ()
+        canonical_nearest = nearest.resolve(strict=True)
+        canonical = canonical_nearest.joinpath(*remaining)
+        terminal_kind = (
+            "file"
+            if normalized.is_file()
+            else "directory"
+            if normalized.is_dir()
+            else "missing"
+        )
+    canonical_containment = containment.resolve(strict=True)
+    if (
+        canonical != canonical_containment
+        and canonical_containment not in canonical.parents
+    ):
+        raise DeploymentPathError("Validated path escapes its permitted root.")
+    return SafePath(
+        requested=requested,
+        normalized=normalized,
+        containment_root=containment,
+        validated_chain=tuple(chain),
+        terminal_kind=terminal_kind,
+        canonical=canonical,
+    )
+
+
+def validate_existing_root(root: Path) -> Path:
+    """Authenticate an existing directory from its filesystem anchor."""
+    absolute = root.absolute()
+    return validate_path_chain(
+        containment_root=Path(absolute.anchor),
+        requested_path=absolute,
+        require_exists=True,
+        expected_kind="directory",
+    ).canonical
 
 
 def prewalk_regular_tree(
@@ -24,19 +168,28 @@ def prewalk_regular_tree(
     containment_roots: Iterable[Path] = (),
     reject_hardlinks: bool,
 ) -> SafeTree:
-    """Enumerate without following links, junctions, or reparse points."""
-    unresolved = root.absolute()
-    _reject_special(unresolved, unresolved)
-    try:
-        canonical_root = unresolved.resolve(strict=True)
-    except OSError as error:
-        raise DeploymentPathError(f"Tree root does not exist: {root}") from error
-    if not canonical_root.is_dir():
-        raise DeploymentPathError(f"Tree root is not a directory: {root}")
-    canonical_containment = tuple(
-        item.resolve(strict=True) for item in containment_roots
+    """Enumerate a validated tree without following links or reparse points."""
+    roots = tuple(containment_roots)
+    containment = roots[0] if roots else Path(root.absolute().anchor)
+    safe_root = validate_path_chain(
+        containment_root=containment,
+        requested_path=root,
+        require_exists=True,
+        expected_kind="directory",
     )
-    _require_containment(canonical_root, canonical_containment, "tree root")
+    for extra in roots[1:]:
+        absolute_extra = extra.absolute()
+        canonical_extra = validate_path_chain(
+            containment_root=Path(absolute_extra.anchor),
+            requested_path=absolute_extra,
+            require_exists=True,
+            expected_kind="directory",
+        ).canonical
+        if (
+            safe_root.canonical != canonical_extra
+            and canonical_extra not in safe_root.canonical.parents
+        ):
+            raise DeploymentPathError("Tree root escapes required containment root.")
     files: list[Path] = []
     directories: list[Path] = []
 
@@ -49,29 +202,21 @@ def prewalk_regular_tree(
             ) from error
         with entries:
             for entry in entries:
-                path = Path(entry.path)
-                relative = path.relative_to(canonical_root)
-                metadata = path.stat(follow_symlinks=False)
-                _reject_special(path, canonical_root, metadata=metadata)
+                child = Path(entry.path)
+                relative = child.relative_to(safe_root.canonical)
                 try:
-                    resolved = path.resolve(strict=True)
+                    metadata = child.lstat()
                 except OSError as error:
                     raise DeploymentPathError(
-                        f"Tree descendant cannot be resolved: {relative.as_posix()}"
+                        f"Cannot inspect tree descendant: {relative.as_posix()}"
                     ) from error
-                if canonical_root not in resolved.parents:
-                    raise DeploymentPathError(
-                        f"Tree descendant escapes root: {relative.as_posix()}"
-                    )
-                _require_containment(
-                    resolved,
-                    canonical_containment,
-                    relative.as_posix(),
+                _reject_special(
+                    child, safe_root.canonical, metadata=metadata, allow_mount=False
                 )
-                if entry.is_dir(follow_symlinks=False):
+                if stat.S_ISDIR(metadata.st_mode):
                     directories.append(relative)
-                    visit(path)
-                elif entry.is_file(follow_symlinks=False):
+                    visit(child)
+                elif stat.S_ISREG(metadata.st_mode):
                     if reject_hardlinks and int(metadata.st_nlink) > 1:
                         raise DeploymentPathError(
                             f"Multiply linked file is prohibited: {relative.as_posix()}"
@@ -81,10 +226,15 @@ def prewalk_regular_tree(
                     raise DeploymentPathError(
                         f"Only regular files/directories are allowed: {relative.as_posix()}"
                     )
+                resolved = child.resolve(strict=True)
+                if safe_root.canonical not in resolved.parents:
+                    raise DeploymentPathError(
+                        f"Tree descendant escapes root: {relative.as_posix()}"
+                    )
 
-    visit(canonical_root)
+    visit(safe_root.canonical)
     return SafeTree(
-        root=canonical_root,
+        path=safe_root,
         files=tuple(sorted(files, key=lambda item: item.as_posix())),
         directories=tuple(sorted(directories, key=lambda item: item.as_posix())),
     )
@@ -96,74 +246,83 @@ def validate_regular_file(
     containment_root: Path | None = None,
     reject_hardlinks: bool,
 ) -> Path:
-    """Validate every existing component and the leaf without following links."""
-    unresolved = path.absolute()
-    root = (
-        containment_root.resolve(strict=True)
-        if containment_root is not None
-        else unresolved.parent.resolve(strict=True)
-    )
-    absolute = unresolved.absolute()
+    root = containment_root or Path(path.absolute().anchor)
+    return validate_path_chain(
+        containment_root=root,
+        requested_path=path,
+        require_exists=True,
+        expected_kind="file",
+        reject_hardlinks=reject_hardlinks,
+    ).canonical
+
+
+def validate_new_path(path: Path, *, containment_root: Path | None = None) -> Path:
+    root = containment_root or Path(path.absolute().anchor)
+    return validate_path_chain(
+        containment_root=root,
+        requested_path=path,
+        require_exists=False,
+        expected_kind="either",
+    ).canonical
+
+
+def _inspect_existing_component(
+    path: Path,
+    *,
+    expected_directory: bool,
+    reject_hardlinks: bool,
+    allow_mount: bool,
+) -> None:
     try:
-        relative = absolute.relative_to(root)
-    except ValueError as error:
-        raise DeploymentPathError("File path is outside its permitted root.") from error
-    current = root
-    for part in relative.parts:
-        current = current / part
-        if not current.exists() and not current.is_symlink():
-            raise DeploymentPathError(
-                f"File path does not exist: {relative.as_posix()}"
-            )
-        _reject_special(current, root)
-    resolved = absolute.resolve(strict=True)
-    if root not in resolved.parents or not resolved.is_file():
-        raise DeploymentPathError("File is not a contained regular file.")
-    metadata = resolved.stat(follow_symlinks=False)
-    if reject_hardlinks and int(metadata.st_nlink) > 1:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise DeploymentPathError(
+            f"Containment ancestor does not exist: {path}"
+        ) from error
+    except OSError as error:
+        raise DeploymentPathError(f"Cannot inspect path component: {path}") from error
+    _reject_special(path, path, metadata=metadata, allow_mount=allow_mount)
+    if expected_directory and not stat.S_ISDIR(metadata.st_mode):
+        raise DeploymentPathError("Containment ancestor is not a directory.")
+    if (
+        reject_hardlinks
+        and stat.S_ISREG(metadata.st_mode)
+        and int(metadata.st_nlink) > 1
+    ):
         raise DeploymentPathError("Multiply linked file is prohibited.")
-    return resolved
 
 
-def validate_new_path(path: Path) -> Path:
-    """Reject links/reparse points in every existing output-path component."""
-    absolute = path.absolute()
-    anchor = Path(absolute.anchor)
-    current = anchor
-    for part in absolute.parts[1:]:
-        current = current / part
-        if not current.exists() and not current.is_symlink():
-            break
-        _reject_special(current, anchor)
-    return absolute
+def _require_kind(path: Path, metadata: os.stat_result, expected: PathKind) -> None:
+    if expected == "file" and not stat.S_ISREG(metadata.st_mode):
+        raise DeploymentPathError(f"Expected a regular file: {path}")
+    if expected == "directory" and not stat.S_ISDIR(metadata.st_mode):
+        raise DeploymentPathError(f"Expected a directory: {path}")
+    if expected == "either" and not (
+        stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)
+    ):
+        raise DeploymentPathError(f"Expected a regular file or directory: {path}")
 
 
 def _reject_special(
     path: Path,
     root: Path,
     *,
-    metadata: os.stat_result | None = None,
+    metadata: os.stat_result,
+    allow_mount: bool,
 ) -> None:
-    try:
-        info = metadata if metadata is not None else path.lstat()
-    except OSError as error:
-        raise DeploymentPathError(f"Cannot inspect path: {path}") from error
     is_junction = bool(getattr(path, "is_junction", lambda: False)())
-    attributes = int(getattr(info, "st_file_attributes", 0))
-    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
-    is_reparse = bool(reparse_flag and attributes & reparse_flag)
-    if path.is_symlink() or is_junction or is_reparse:
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    is_reparse = bool(attributes & reparse_flag)
+    is_link = stat.S_ISLNK(metadata.st_mode) or path.is_symlink()
+    is_mount = False
+    if not allow_mount:
+        try:
+            is_mount = path.is_mount()
+        except OSError:
+            is_mount = False
+    if is_link or is_junction or is_reparse or is_mount:
         label = "." if path == root else path.name
         raise DeploymentPathError(
-            f"Links, junctions, and reparse points are prohibited: {label}"
+            f"Links, junctions, reparse points, and mounts are prohibited: {label}"
         )
-
-
-def _require_containment(
-    path: Path,
-    roots: tuple[Path, ...],
-    label: str,
-) -> None:
-    for root in roots:
-        if path != root and root not in path.parents:
-            raise DeploymentPathError(f"{label} escapes required containment root.")

@@ -3,23 +3,24 @@ from __future__ import annotations
 import hashlib
 import socket
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from time import perf_counter
 from typing import Any, Iterator
 
 import numpy as np
 import pandas as pd
 
 from src.churn_ml.deployment_v1_auth import (
+    AuthenticatedSource,
+    authenticate_source,
+    reauthenticate_source,
     SyntheticFixture,
     load_synthetic_fixture,
 )
+from src.churn_ml.deployment_v1_physical import format_utc_timestamp
 from src.churn_ml.deployment_v1_paths import (
-    prewalk_regular_tree,
     validate_new_path,
-    validate_regular_file,
 )
 from src.churn_ml.deployment_v1_artifacts import (
     DeploymentArtifactError,
@@ -30,6 +31,7 @@ from src.churn_ml.deployment_v1_artifacts import (
 )
 from src.churn_ml.deployment_v1_contracts import (
     ValidatedDeployment,
+    resolve_repository_path,
     validate_deployment,
 )
 from src.churn_ml.deployment_v1_features import (
@@ -82,12 +84,20 @@ def execute_deployment(
     _assert_inputs_outputs_disjoint(
         validated, root, fixture.root if fixture is not None else None
     )
-    before = _input_authentication(validated, fixture)
+    before = _input_authentication(validated, fixture, mode=mode)
     store: DeploymentArtifactStore | None = None
-    started = perf_counter()
     started_at = datetime.now(timezone.utc)
     try:
         store = DeploymentArtifactStore(root)
+        store.write_json(
+            "input_authentication.json",
+            {
+                "schema_version": 1,
+                "sources": [asdict(item) for item in before],
+            },
+        )
+        _lifecycle_checkpoint("after_initial_authentication")
+        _reauthenticate_inputs(before, validated.config.project_root)
         # Test/sample loading remains behind complete approval validation.
         data = load_deployment_data(validated, fixture=fixture)
         encodings: dict[str, EncodingResult] = {}
@@ -244,15 +254,23 @@ def execute_deployment(
         }
         store.write_json("prediction_summary.json", prediction_summary)
         finished_at = datetime.now(timezone.utc)
+        duration_seconds = (finished_at - started_at).total_seconds()
         store.write_json(
             "runtime.json",
             {
                 "schema_version": 1,
                 "status": "completed",
+                "deployment_id": validated.config.deployment_id,
                 "mode": mode,
-                "started_at_utc": started_at.isoformat(),
-                "finished_at_utc": finished_at.isoformat(),
-                "duration_seconds": perf_counter() - started,
+                "started_at_utc": format_utc_timestamp(started_at),
+                "finished_at_utc": format_utc_timestamp(finished_at),
+                "duration_seconds": duration_seconds,
+                "component_count": len(validated.approvals),
+                "bag_count": sum(
+                    len(item["bag_seeds"])
+                    for item in validated.config.payload["components"]
+                ),
+                "model_persistence": False,
                 "competition_test_access_authorized": mode == "run",
                 "network_access": False,
                 "tracking_enabled": False,
@@ -263,10 +281,8 @@ def execute_deployment(
             "source_provenance.json",
             source_provenance(validated.config.project_root),
         )
-        if _input_authentication(validated, fixture) != before:
-            raise DeploymentArtifactError(
-                "Approval or research inputs changed during deployment."
-            )
+        _lifecycle_checkpoint("before_success_authentication")
+        _reauthenticate_inputs(before, validated.config.project_root)
         store.complete(validated, data=data)
         return DeploymentExecution(
             root=root,
@@ -318,14 +334,16 @@ def _assert_dry_run_paths(
         forbidden_hashes=forbidden_hashes,
     )
     configured = {
-        (
-            validated.config.project_root
-            / validated.config.payload["test_data"]["path"]
-        ).resolve(strict=False),
-        (
-            validated.config.project_root
-            / validated.config.payload["sample_submission"]["path"]
-        ).resolve(strict=False),
+        resolve_repository_path(
+            validated.config.payload["test_data"]["path"],
+            validated.config.project_root,
+            "test_data.path",
+        ),
+        resolve_repository_path(
+            validated.config.payload["sample_submission"]["path"],
+            validated.config.project_root,
+            "sample_submission.path",
+        ),
     }
     if any(path == fixture.root or fixture.root in path.parents for path in configured):
         raise ValueError("Dry-run fixtures overlap configured competition paths.")
@@ -344,24 +362,21 @@ def _assert_inputs_outputs_disjoint(
         validated.config.source_path,
         *[item.source_path for item in validated.approvals],
         *[item.research_run.root for item in validated.approvals],
-        (
-            validated.config.project_root
-            / validated.config.payload["test_data"]["path"]
-        ).resolve(),
-        (
-            validated.config.project_root
-            / validated.config.payload["sample_submission"]["path"]
-        ).resolve(),
+        resolve_repository_path(
+            validated.config.payload["test_data"]["path"],
+            validated.config.project_root,
+            "test_data.path",
+        ),
+        resolve_repository_path(
+            validated.config.payload["sample_submission"]["path"],
+            validated.config.project_root,
+            "sample_submission.path",
+        ),
     ]
     if fixture_dir is not None:
-        inputs.append(fixture_dir.resolve())
+        inputs.append(fixture_dir)
     for item in inputs:
-        resolved = item.resolve()
-        if (
-            output == resolved
-            or output in resolved.parents
-            or resolved in output.parents
-        ):
+        if output == item or output in item.parents or item in output.parents:
             raise ValueError("Deployment output overlaps an immutable input.")
     if output.exists():
         raise FileExistsError("Deployment output already exists.")
@@ -370,36 +385,57 @@ def _assert_inputs_outputs_disjoint(
 def _input_authentication(
     validated: ValidatedDeployment,
     fixture: SyntheticFixture | None,
-) -> dict[str, str]:
-    records: dict[str, str] = {
-        validated.config.source_path.relative_to(
-            validated.config.project_root
-        ).as_posix(): _tree_sha256(validated.config.source_path)
-    }
-    for approval in validated.approvals:
-        records[
-            approval.source_path.relative_to(validated.config.project_root).as_posix()
-        ] = _tree_sha256(approval.source_path)
-        records[
-            approval.research_run.root.relative_to(
-                validated.config.project_root
-            ).as_posix()
-        ] = _tree_sha256(approval.research_run.root)
-    if fixture is not None:
-        records[fixture.root.relative_to(validated.config.project_root).as_posix()] = (
-            _tree_sha256(fixture.root)
+    *,
+    mode: str,
+) -> tuple[AuthenticatedSource, ...]:
+    root = validated.config.project_root
+    sources: list[AuthenticatedSource] = [
+        authenticate_source(
+            validated.config.source_path,
+            project_root=root,
+            source_type="deployment_config",
+            semantic_identity=validated.identity_sha256,
+            expected_kind="file",
         )
-    return records
+    ]
+    for approval in validated.approvals:
+        required = (
+            approval.approval_source,
+            approval.research_run_source,
+            approval.threshold_evidence_source,
+        )
+        if any(item is None for item in required):
+            raise DeploymentArtifactError(
+                "Validated approval lacks authenticated source closure."
+            )
+        sources.extend(item for item in required if item is not None)
+        if approval.paired_comparison_source is not None:
+            sources.append(approval.paired_comparison_source)
+    if fixture is not None:
+        sources.append(fixture.source)
+    if mode == "run":
+        for source_type, section in (
+            ("competition_test", "test_data"),
+            ("sample_submission", "sample_submission"),
+        ):
+            sources.append(
+                authenticate_source(
+                    root / validated.config.payload[section]["path"],
+                    project_root=root,
+                    source_type=source_type,
+                    semantic_identity=str(validated.config.payload[section]["sha256"]),
+                    expected_kind="file",
+                )
+            )
+    return tuple(sources)
 
 
-def _tree_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    if path.is_file():
-        safe = validate_regular_file(path, reject_hardlinks=True)
-        digest.update(safe.read_bytes())
-        return digest.hexdigest()
-    tree = prewalk_regular_tree(path, reject_hardlinks=True)
-    for relative in sorted(tree.files, key=lambda item: item.as_posix()):
-        digest.update(relative.as_posix().encode("utf-8"))
-        digest.update((tree.root / relative).read_bytes())
-    return digest.hexdigest()
+def _reauthenticate_inputs(
+    sources: tuple[AuthenticatedSource, ...], project_root: Path
+) -> None:
+    for source in sources:
+        reauthenticate_source(source, project_root=project_root)
+
+
+def _lifecycle_checkpoint(name: str) -> None:
+    del name

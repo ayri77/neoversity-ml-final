@@ -19,6 +19,10 @@ def test_validate_cli_emits_machine_json_without_execution(
         approvals=(object(),),
     )
     monkeypatch.setattr(
+        "src.churn_ml.deployment_v1_cli._resolve_project_path",
+        lambda path: path.absolute(),
+    )
+    monkeypatch.setattr(
         "src.churn_ml.deployment_v1_cli.validate_only",
         lambda *args, **kwargs: validated,
     )
@@ -42,6 +46,10 @@ def test_run_cli_requires_explicit_competition_confirmation(
     capsys,
 ) -> None:
     monkeypatch.setattr(
+        "src.churn_ml.deployment_v1_cli._resolve_project_path",
+        lambda path: path.absolute(),
+    )
+    monkeypatch.setattr(
         "src.churn_ml.deployment_v1_cli.validate_only",
         lambda *args, **kwargs: SimpleNamespace(),
     )
@@ -62,8 +70,16 @@ def test_dry_run_cli_uses_only_explicit_fixture_and_output(
 ) -> None:
     validated = SimpleNamespace()
     monkeypatch.setattr(
+        "src.churn_ml.deployment_v1_cli._resolve_project_path",
+        lambda path: path.absolute(),
+    )
+    monkeypatch.setattr(
         "src.churn_ml.deployment_v1_cli.validate_only",
         lambda *args, **kwargs: validated,
+    )
+    monkeypatch.setattr(
+        "src.churn_ml.deployment_v1_cli._resolve_path",
+        lambda path, **kwargs: path.absolute(),
     )
     observed = {}
 

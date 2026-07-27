@@ -73,6 +73,13 @@ def fit_component_bags(
     row_index = pd.Index(row_keys)
     if row_index.has_duplicates or row_index.isna().any():
         raise DeploymentModelError("Test row keys must be unique and non-null.")
+    if all(type(value) is int for value in row_keys):
+        pass
+    elif all(type(value) is str for value in row_keys):
+        if any(not value or value.isspace() for value in row_keys):
+            raise DeploymentModelError("Test row keys cannot be empty/whitespace.")
+    else:
+        raise DeploymentModelError("Test row keys have unsupported mixed types.")
     row_identity = canonical_sha256(list(row_keys))
     bag_probabilities: list[np.ndarray] = []
     bags: list[BagPrediction] = []

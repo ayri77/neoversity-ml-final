@@ -17,9 +17,13 @@ from src.churn_ml.deployment_v1_artifacts import (
     load_failed_deployment,
 )
 from src.churn_ml.deployment_v1_contracts import DeploymentContractError
+from src.churn_ml.deployment_v1_paths import (
+    DeploymentPathError,
+    validate_path_chain,
+)
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).absolute().parents[2]
 EXIT_SUCCESS = 0
 EXIT_VALIDATION = 2
 EXIT_SAFETY = 3
@@ -50,7 +54,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def execute(args: argparse.Namespace) -> int:
     try:
         if args.command == "inspect":
-            root = _resolve_path(args.deployment_dir)
+            root = _resolve_path(
+                args.deployment_dir, require_exists=True, expected_kind="directory"
+            )
             if (root / "_SUCCESS").is_file():
                 loaded = load_completed_deployment(root, project_root=PROJECT_ROOT)
                 _emit(
@@ -105,8 +111,16 @@ def execute(args: argparse.Namespace) -> int:
                 result = execute_deployment(
                     validated,
                     mode="dry-run",
-                    fixture_dir=_resolve_path(args.fixture_dir),
-                    output_dir=_resolve_path(args.output_dir),
+                    fixture_dir=_resolve_path(
+                        args.fixture_dir,
+                        require_exists=True,
+                        expected_kind="directory",
+                    ),
+                    output_dir=_resolve_path(
+                        args.output_dir,
+                        require_exists=False,
+                        expected_kind="either",
+                    ),
                 )
             else:
                 result = execute_deployment(validated, mode="run")
@@ -125,7 +139,7 @@ def execute(args: argparse.Namespace) -> int:
     except (DeploymentContractError, DeploymentArtifactError) as error:
         _emit_error("validation_failed", str(error))
         return EXIT_VALIDATION
-    except (FileExistsError, PermissionError) as error:
+    except (FileExistsError, PermissionError, DeploymentPathError) as error:
         _emit_error("safety_refusal", str(error))
         return EXIT_SAFETY
     except BaseException as error:
@@ -138,11 +152,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _resolve_project_path(path: Path) -> Path:
-    return path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+    return validate_path_chain(
+        containment_root=PROJECT_ROOT,
+        requested_path=path,
+        require_exists=True,
+        expected_kind="file",
+        reject_hardlinks=True,
+    ).canonical
 
 
-def _resolve_path(path: Path) -> Path:
-    return path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+def _resolve_path(path: Path, *, require_exists: bool, expected_kind: str) -> Path:
+    absolute = path if path.is_absolute() else PROJECT_ROOT / path
+    return validate_path_chain(
+        containment_root=Path(absolute.absolute().anchor),
+        requested_path=absolute,
+        require_exists=require_exists,
+        expected_kind=expected_kind,  # type: ignore[arg-type]
+        reject_hardlinks=require_exists and expected_kind == "file",
+    ).canonical
 
 
 def _emit(payload: dict[str, Any]) -> None:

@@ -14,7 +14,9 @@ import yaml
 from src.churn_ml.deployment_v1_paths import (
     DeploymentPathError,
     prewalk_regular_tree,
+    validate_existing_root,
     validate_regular_file,
+    validate_path_chain,
 )
 from src.churn_ml.research_data import canonical_sha256
 
@@ -63,12 +65,153 @@ class DeploymentAuthenticationError(ValueError):
 
 
 @dataclass(frozen=True)
+class AuthenticatedSource:
+    source_type: str
+    repository_relative_path: str
+    kind: str
+    size_bytes: int
+    sha256: str
+    semantic_identity: str
+    path_chain_sha256: str
+
+
+@dataclass(frozen=True)
+class ThresholdEvidence:
+    identity: dict[str, Any]
+    source: AuthenticatedSource
+
+
+def authenticate_source(
+    path: Path,
+    *,
+    project_root: Path,
+    source_type: str,
+    semantic_identity: str,
+    expected_kind: str,
+) -> AuthenticatedSource:
+    try:
+        root = validate_existing_root(project_root)
+        if expected_kind == "file":
+            safe = validate_path_chain(
+                containment_root=root,
+                requested_path=path,
+                require_exists=True,
+                expected_kind="file",
+                reject_hardlinks=True,
+            )
+            before_chain = _path_chain_sha256(safe.validated_chain)
+            raw = safe.canonical.read_bytes()
+            after = validate_path_chain(
+                containment_root=root,
+                requested_path=path,
+                require_exists=True,
+                expected_kind="file",
+                reject_hardlinks=True,
+            )
+            if before_chain != _path_chain_sha256(after.validated_chain):
+                raise DeploymentAuthenticationError(
+                    "Authenticated file path changed while it was read."
+                )
+            safe = after
+            size = len(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+        elif expected_kind == "directory":
+            tree = prewalk_regular_tree(
+                path, containment_roots=(root,), reject_hardlinks=True
+            )
+            safe = tree.path
+            before_chain = _path_chain_sha256(safe.validated_chain)
+            digest, size = _tree_content_identity(tree)
+            after_tree = prewalk_regular_tree(
+                path, containment_roots=(root,), reject_hardlinks=True
+            )
+            after_digest, after_size = _tree_content_identity(after_tree)
+            if (
+                tree.files != after_tree.files
+                or tree.directories != after_tree.directories
+                or digest != after_digest
+                or size != after_size
+                or before_chain != _path_chain_sha256(after_tree.path.validated_chain)
+            ):
+                raise DeploymentAuthenticationError(
+                    "Authenticated directory changed while it was read."
+                )
+            safe = after_tree.path
+        else:
+            raise DeploymentAuthenticationError("Authenticated source kind differs.")
+    except DeploymentPathError as error:
+        raise DeploymentAuthenticationError(str(error)) from error
+    relative_path = safe.canonical.relative_to(root).as_posix()
+    chain_identity = _path_chain_sha256(safe.validated_chain)
+    return AuthenticatedSource(
+        source_type=source_type,
+        repository_relative_path=relative_path,
+        kind=expected_kind,
+        size_bytes=size,
+        sha256=digest,
+        semantic_identity=semantic_identity,
+        path_chain_sha256=chain_identity,
+    )
+
+
+def _tree_content_identity(tree: Any) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    for relative in tree.directories:
+        digest.update(b"D\0")
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+    for relative in tree.files:
+        raw = (tree.root / relative).read_bytes()
+        size += len(raw)
+        digest.update(b"F\0")
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest(), size
+
+
+def _path_chain_sha256(chain: tuple[Path, ...]) -> str:
+    records = []
+    for item in chain:
+        metadata = item.lstat()
+        records.append(
+            {
+                "path": str(item.absolute()),
+                "device": int(metadata.st_dev),
+                "inode": int(metadata.st_ino),
+                "mode": int(metadata.st_mode),
+                "attributes": int(getattr(metadata, "st_file_attributes", 0)),
+            }
+        )
+    return canonical_sha256(records)
+
+
+def reauthenticate_source(
+    expected: AuthenticatedSource, *, project_root: Path
+) -> AuthenticatedSource:
+    actual = authenticate_source(
+        project_root / Path(*PurePosixPath(expected.repository_relative_path).parts),
+        project_root=project_root,
+        source_type=expected.source_type,
+        semantic_identity=expected.semantic_identity,
+        expected_kind=expected.kind,
+    )
+    if actual != expected:
+        raise DeploymentAuthenticationError(
+            f"Authenticated source changed: {expected.repository_relative_path}"
+        )
+    return actual
+
+
+@dataclass(frozen=True)
 class SyntheticFixture:
     root: Path
     manifest_path: Path
     payload: dict[str, Any]
     paths: dict[str, Path]
     identity: dict[str, Any]
+    source: AuthenticatedSource
 
 
 def load_threshold_evidence(
@@ -76,7 +219,7 @@ def load_threshold_evidence(
     *,
     project_root: Path,
     research_run: Any,
-) -> dict[str, Any]:
+) -> ThresholdEvidence:
     reference = _mapping(reference_value, "threshold_evidence")
     _exact_keys(reference, THRESHOLD_REFERENCE_KEYS, "threshold_evidence")
     _schema_one(reference["schema_version"], "threshold_evidence.schema_version")
@@ -135,11 +278,22 @@ def load_threshold_evidence(
                 f"Threshold evidence {key} differs from completed research run."
             )
     canonical = deepcopy(reference)
-    return {
+    identity = {
         "schema_version": 1,
         "sha256": canonical_sha256(canonical),
         "canonical": canonical,
     }
+    source_identity = canonical_sha256(identity)
+    return ThresholdEvidence(
+        identity=identity,
+        source=authenticate_source(
+            source,
+            project_root=project_root,
+            source_type="threshold_evidence",
+            semantic_identity=source_identity,
+            expected_kind="file",
+        ),
+    )
 
 
 def derive_approval_id(payload: Mapping[str, Any]) -> str:
@@ -191,7 +345,10 @@ def load_synthetic_fixture(
     project_root: Path,
     forbidden_hashes: set[str],
 ) -> SyntheticFixture:
-    root = project_root.resolve(strict=True)
+    try:
+        root = validate_existing_root(project_root)
+    except DeploymentPathError as error:
+        raise DeploymentAuthenticationError(str(error)) from error
     unresolved = fixture_dir if fixture_dir.is_absolute() else root / fixture_dir
     try:
         tree = prewalk_regular_tree(
@@ -279,6 +436,13 @@ def load_synthetic_fixture(
             "sha256": canonical_sha256(canonical),
             "canonical": canonical,
         },
+        source=authenticate_source(
+            tree.root,
+            project_root=root,
+            source_type="synthetic_fixture",
+            semantic_identity=canonical_sha256(canonical),
+            expected_kind="directory",
+        ),
     )
 
 
@@ -311,7 +475,15 @@ def _portable_path(value: Any, root: Path, label: str) -> Path:
         or "." in posix.parts
     ):
         raise DeploymentAuthenticationError(f"{label} must be repository-relative.")
-    return (root.resolve() / Path(*posix.parts)).absolute()
+    try:
+        return validate_path_chain(
+            containment_root=root,
+            requested_path=root / Path(*posix.parts),
+            require_exists=False,
+            expected_kind="either",
+        ).canonical
+    except DeploymentPathError as error:
+        raise DeploymentAuthenticationError(str(error)) from error
 
 
 def _plain_basename(value: Any, label: str) -> str:

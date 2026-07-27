@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def main() -> int:
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).absolute().parents[1]
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
     module = importlib.import_module("src.churn_ml.deployment_v1_cli")

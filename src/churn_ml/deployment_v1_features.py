@@ -332,10 +332,7 @@ def _validate_sample_and_alignment(
     test_ids = test[test_id].reset_index(drop=True)
     sample_ids = sample[sample_config["id_column"]].reset_index(drop=True)
     for values, label in ((test_ids, "Test"), (sample_ids, "Sample submission")):
-        if values.isna().any():
-            raise DeploymentDataError(f"{label} IDs contain null values.")
-        if values.duplicated().any():
-            raise DeploymentDataError(f"{label} IDs contain duplicates.")
+        _validate_id_series(values, label)
     if str(test_ids.dtype) != str(sample_ids.dtype):
         raise DeploymentDataError("Test and sample ID dtypes differ.")
     if not test_ids.equals(sample_ids):
@@ -343,6 +340,27 @@ def _validate_sample_and_alignment(
     keys = tuple(test_ids.tolist())
     identity = canonical_sha256(list(keys))
     return keys, identity
+
+
+def _validate_id_series(values: pd.Series, label: str) -> None:
+    if values.isna().any():
+        raise DeploymentDataError(f"{label} IDs contain null values.")
+    if values.duplicated().any():
+        raise DeploymentDataError(f"{label} IDs contain duplicates.")
+    dtype = str(values.dtype)
+    if dtype in {"int64", "Int64"}:
+        if pd.api.types.is_bool_dtype(values.dtype):
+            raise DeploymentDataError(f"{label} IDs cannot be booleans.")
+        return
+    if dtype in {"object", "string"} and all(
+        type(value) is str for value in values.tolist()
+    ):
+        if any(not value or value.isspace() for value in values.tolist()):
+            raise DeploymentDataError(f"{label} IDs contain empty/whitespace values.")
+        return
+    raise DeploymentDataError(
+        f"{label} IDs must use exact int64 or homogeneous string values."
+    )
 
 
 def schema_record(source: pd.DataFrame, model: pd.DataFrame) -> dict[str, Any]:

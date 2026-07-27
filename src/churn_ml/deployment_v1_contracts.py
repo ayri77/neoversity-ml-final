@@ -13,6 +13,8 @@ from typing import Any, Callable, Mapping
 import yaml
 
 from src.churn_ml.deployment_v1_auth import (
+    AuthenticatedSource,
+    authenticate_source,
     THRESHOLD_REFERENCE_KEYS,
     approval_identity,
     derive_approval_id,
@@ -21,6 +23,8 @@ from src.churn_ml.deployment_v1_auth import (
 from src.churn_ml.deployment_v1_paths import (
     DeploymentPathError,
     prewalk_regular_tree,
+    validate_existing_root,
+    validate_path_chain,
     validate_regular_file,
 )
 from src.churn_ml.experiment_v2_model_registry import get_candidate_adapter
@@ -121,6 +125,10 @@ class CandidateApproval:
     research_run: CompletedResearchV2Run
     threshold_identity: dict[str, Any] = field(default_factory=dict)
     identity: dict[str, Any] = field(default_factory=dict)
+    approval_source: AuthenticatedSource | None = None
+    research_run_source: AuthenticatedSource | None = None
+    threshold_evidence_source: AuthenticatedSource | None = None
+    paired_comparison_source: AuthenticatedSource | None = None
 
     @property
     def approval_id(self) -> str:
@@ -174,7 +182,10 @@ def load_candidate_approval(
     project_root: Path,
     research_loader: ResearchLoader = load_completed_research_v2_run,
 ) -> CandidateApproval:
-    root = project_root.resolve()
+    try:
+        root = validate_existing_root(project_root)
+    except DeploymentPathError as error:
+        raise DeploymentContractError(str(error)) from error
     source = _contained_file(path, root, "approval artifact")
     payload = _load_yaml(source, "approval artifact")
     _exact_keys(payload, APPROVAL_KEYS, "approval")
@@ -231,6 +242,7 @@ def load_candidate_approval(
     granted = _boolean(
         exception["granted"], "approval.paired_comparison.exception.granted"
     )
+    comparison_source: AuthenticatedSource | None = None
     if paired["reference"] is None:
         if paired["manifest_sha256"] is not None:
             raise DeploymentContractError(
@@ -271,6 +283,13 @@ def load_candidate_approval(
             verify_manifest=True,
         )
         comparison_manifest = _read_json(comparison_path / "manifest.json")
+        comparison_source = authenticate_source(
+            comparison_path,
+            project_root=root,
+            source_type="paired_comparison",
+            semantic_identity=str(comparison_manifest.get("manifest_sha256")),
+            expected_kind="directory",
+        )
         if comparison_manifest.get("manifest_sha256") != paired["manifest_sha256"]:
             raise DeploymentContractError(
                 "Paired-comparison manifest authentication failed."
@@ -304,7 +323,7 @@ def load_candidate_approval(
     )
     _authenticate_research_reference(reference, parameters, run)
     try:
-        threshold_identity = load_threshold_evidence(
+        threshold_evidence = load_threshold_evidence(
             payload["threshold_evidence"], project_root=root, research_run=run
         )
     except ValueError as error:
@@ -320,8 +339,24 @@ def load_candidate_approval(
         source_path=source,
         source_sha256=hashlib.sha256(raw).hexdigest(),
         research_run=run,
-        threshold_identity=threshold_identity,
+        threshold_identity=threshold_evidence.identity,
         identity=identity,
+        approval_source=authenticate_source(
+            source,
+            project_root=root,
+            source_type="candidate_approval",
+            semantic_identity=str(payload["approval_id"]),
+            expected_kind="file",
+        ),
+        research_run_source=authenticate_source(
+            run_path,
+            project_root=root,
+            source_type="completed_research_run",
+            semantic_identity=str(reference["manifest_sha256"]),
+            expected_kind="directory",
+        ),
+        threshold_evidence_source=threshold_evidence.source,
+        paired_comparison_source=comparison_source,
     )
 
 
@@ -331,11 +366,19 @@ def load_deployment_config(
     project_root: Path,
     allow_external_source: bool = False,
 ) -> DeploymentConfig:
-    root = project_root.resolve()
+    try:
+        root = validate_existing_root(project_root)
+    except DeploymentPathError as error:
+        raise DeploymentContractError(str(error)) from error
     if allow_external_source:
-        source = path.resolve()
-        if not source.is_file():
-            raise DeploymentContractError("Deployment config does not exist.")
+        try:
+            source = validate_regular_file(
+                path,
+                containment_root=Path(path.absolute().anchor),
+                reject_hardlinks=True,
+            )
+        except DeploymentPathError as error:
+            raise DeploymentContractError(str(error)) from error
     else:
         source = _contained_file(path, root, "deployment config")
     payload = _load_yaml(source, "deployment config")
@@ -458,7 +501,9 @@ def load_deployment_config(
     output = _mapping(payload["output"], "output")
     _exact_keys(output, OUTPUT_KEYS, "output")
     output_root = portable_repository_path(output["root"], root, "output.root")
-    expected_root = (root / "artifacts" / "deployments").resolve()
+    expected_root = portable_repository_path(
+        "artifacts/deployments", root, "expected output root"
+    )
     if output_root != expected_root:
         raise DeploymentContractError(
             "output.root must be exactly artifacts/deployments."
@@ -607,10 +652,18 @@ def portable_repository_path(value: Any, root: Path, label: str) -> Path:
         raise DeploymentContractError(
             f"{label} must be a normalized repository-relative portable path."
         )
-    resolved = (root.resolve() / Path(*posix.parts)).resolve()
-    if resolved == root.resolve() or root.resolve() not in resolved.parents:
+    try:
+        safe = validate_path_chain(
+            containment_root=root,
+            requested_path=root / Path(*posix.parts),
+            require_exists=False,
+            expected_kind="either",
+        )
+    except DeploymentPathError as error:
+        raise DeploymentContractError(f"{label} is unsafe: {error}") from error
+    if safe.canonical == root:
         raise DeploymentContractError(f"{label} escapes the repository.")
-    return resolved
+    return safe.canonical
 
 
 def resolve_repository_path(value: Any, root: Path, label: str) -> Path:

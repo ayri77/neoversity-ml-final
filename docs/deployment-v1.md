@@ -37,8 +37,12 @@ unapproved states are rejected. A missing Paired Comparison is accepted only
 when the artifact explicitly grants an exception and records its reason. When
 a comparison is referenced, its complete lifecycle and manifest are
 revalidated and the approved run must be one of its authenticated inputs.
-Approval snapshots and hashes are persisted; approval and research trees are
-authenticated before and after execution and are never modified.
+Approval snapshots and hashes are persisted. The deployment config, approval,
+completed research tree, threshold evidence, referenced Paired Comparison tree,
+synthetic fixture (or confirmed competition test/sample files), and path-chain
+identities are authenticated before data/model execution, immediately before
+data loading, and immediately before `_SUCCESS`. Any byte, size, recursive tree,
+manifest, file identity, or path-chain change prevents success.
 
 See [the approval template](templates/deployment_candidate_approval_v1.example.yaml).
 
@@ -90,11 +94,17 @@ vectors. It is recomputed during semantic validation before success.
 
 ## Submission and lifecycle
 
-Before success, P4 verifies exact test/sample row counts, exact ID order, exact
-two-column submission schema, raw CSV label tokens restricted to exact `0` or `1`, absence of a CSV index
-column, and deterministic positive count/rate. The
-runner writes but never uploads `submission.csv`; any subsequent Kaggle upload
-is a separate manual action.
+Before success, P4 verifies exact test/sample row counts, exact ID order, and
+independent ID validity. Integer IDs use the accepted exact integer input dtype;
+string IDs must be homogeneous, nonmissing, unique, nonempty, and not whitespace
+only. Values are never trimmed or normalized. The expected submission is rebuilt
+only from authenticated ordered IDs and recomputed exact int8 labels. Creation
+and validation share one canonical UTF-8 CSV writer (comma separator, minimal
+quoting, LF terminator, no BOM, no index, exact column order). Raw bytes must
+match exactly; parsed-equivalent quoting, spaces, CRLF, BOM, blank lines, float
+label text, or an extra/reordered column is rejected. The runner writes but never
+uploads `submission.csv`; any subsequent Kaggle upload is a separate manual
+action.
 
 Ordinary files use atomic replacement. A deployment has one exact recursive
 artifact set, approval snapshots, SHA-256 inventory and manifest, and one
@@ -138,6 +148,50 @@ parameter/probability identities, component averages, the blend, threshold
 labels, raw submission tokens, environment, provenance, runtime state, and
 terminal lifecycle from authoritative inputs. Rebuilding the inventory and
 manifest cannot legitimize semantically altered content.
+
+### Non-following path-chain validation
+
+One `validate_path_chain` primitive owns canonicalization. It first joins portable
+repository-relative components syntactically, then applies `lstat`, Windows
+reparse attributes, `Path.is_junction()` where available, symlink, mount-like,
+kind, and policy-specific hardlink checks to every existing component from the
+filesystem anchor through the containment root and requested leaf. Only that
+validated object may call `resolve()` for the final canonical containment check.
+A not-yet-existing output authenticates every existing parent and resolves only
+the nearest already-validated parent. Recursive inspection uses non-following
+`os.scandir` plus per-entry `lstat` and rejects before descending. Raw paths are
+never resolved again downstream. This applies equally to config, approval,
+research, comparison, threshold, fixture, test/sample, CLI, output, completed
+artifact, inventory/manifest, and terminal-marker paths, including a junction
+two or more ancestors above a normal leaf.
+
+### Exact physical artifacts and terminal time
+
+Authoritative Parquet and CSV tables have versioned physical schemas: exact
+column set/order, primitive signed dtype, nonnullable status, finite/range or
+enum constraints, and exact row identity. Validation occurs before any cast,
+`int()`, narrowing, or NumPy dtype conversion. Row positions, folds, bag indices,
+seeds, counts, and predictions cannot be floats, booleans, strings, nullable
+integers, or unsigned alternatives; persisted predictions are exact int8
+`{0,1}` and probabilities are nonnullable finite float64 in `[0,1]`. Threshold
+labels are recomputed directly from those float64 values using exact `>=`.
+
+Runtime authority is limited to the exact schema/version, deployment ID, status,
+mode, canonical UTC timestamps, wall-clock duration derived from those
+timestamps, component/bag counts, model-persistence flag, and configured
+competition/network/tracking isolation flags. Timestamps serialize only as
+`YYYY-MM-DDTHH:MM:SS.ffffffZ`, must round-trip, and satisfy start <= finish;
+`duration_seconds` must exactly equal their difference. `_SUCCESS` has an exact
+schema, matches deployment ID/status/manifest and the runtime completion string,
+is mutually exclusive with `_FAILED`, and is the newest file. `_FAILED` also has
+an exact schema and canonical UTC timestamp.
+
+The read-only production loader reconstructs config, approvals, Experiment Core
+v2 run, threshold/comparison evidence, fixture/data, manifests, and semantics
+from disk. Coherently rebuilding inventory, manifest, and `_SUCCESS` cannot make
+physical-type, runtime, timestamp, terminal, canonical-CSV, identity, or model
+semantic corruption valid. The adversarial suite exercises this public loader
+without injecting prevalidated deployment objects or data.
 
 All repository inputs and artifact trees are inspected without following links.
 Symlinks, Windows junctions/reparse points, mount-style escapes, multiply linked
