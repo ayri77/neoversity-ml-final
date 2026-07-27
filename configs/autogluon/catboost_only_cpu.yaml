@@ -1,5 +1,6 @@
 schema_version: 1
 profile_id: catboost_only_cpu_v1
+seed: 42
 
 dataset:
   version: v3_targeted_missingness

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import yaml
@@ -67,6 +68,7 @@ class ResolvedPaths:
 class AutoGluonConfig:
     schema_version: int
     profile_id: str
+    seed: int
     dataset: DatasetConfig
     predictor: PredictorConfig
     resources: ResourcesConfig
@@ -80,6 +82,7 @@ class AutoGluonConfig:
 _SCHEMA: dict[str, Any] = {
     "schema_version": int,
     "profile_id": str,
+    "seed": int,
     "dataset": {
         "version": str,
         "directory": str,
@@ -128,9 +131,17 @@ def load_config(
     get_profile(payload["profile_id"])
     _validate_values(payload)
 
-    dataset_directory = _resolve_contained(
+    processed_root = _resolve_contained(
         repository_root,
-        payload["dataset"]["directory"],
+        "data/processed",
+        "data.processed.root",
+        must_exist=require_data_files,
+    )
+    if processed_root != repository_root / "data" / "processed":
+        raise ConfigError("data/processed must not be a symlink or junction redirect")
+    dataset_directory = _resolve_contained(
+        processed_root,
+        payload["dataset"]["version"],
         "config.dataset.directory",
         must_exist=require_data_files,
     )
@@ -163,12 +174,11 @@ def load_config(
                 raise ConfigError(f"config.dataset.{name} must be a file")
 
     portable = json.loads(json.dumps(payload))
-    identity = hashlib.sha256(
-        json.dumps(portable, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    identity = config_identity_sha256(portable)
     return AutoGluonConfig(
         schema_version=payload["schema_version"],
         profile_id=payload["profile_id"],
+        seed=payload["seed"],
         dataset=DatasetConfig(**payload["dataset"]),
         predictor=PredictorConfig(**payload["predictor"]),
         resources=ResourcesConfig(**payload["resources"]),
@@ -186,6 +196,13 @@ def load_config(
     )
 
 
+def config_identity_sha256(portable: dict[str, Any]) -> str:
+    """Hash a portable resolved config without local absolute paths."""
+    return hashlib.sha256(
+        json.dumps(portable, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def validation_summary(config: AutoGluonConfig) -> dict[str, Any]:
     """Return a portable validation result with no local absolute paths."""
     return {
@@ -193,7 +210,10 @@ def validation_summary(config: AutoGluonConfig) -> dict[str, Any]:
         "schema_version": config.schema_version,
         "config_identity_sha256": config.identity_sha256,
         "dataset_version": config.dataset.version,
-        "profile": profile_summary(get_profile(config.profile_id)),
+        "seed": config.seed,
+        "profile": profile_summary(
+            get_profile(config.profile_id), config.seed, config.resources.num_gpus
+        ),
         "train_only_inputs": [
             f"{config.dataset.directory}/{config.dataset.train_features_file}",
             f"{config.dataset.directory}/{config.dataset.train_target_file}",
@@ -230,6 +250,7 @@ def _validate_values(payload: dict[str, Any]) -> None:
     resources = payload["resources"]
     fit = payload["fit"]
     artifacts = payload["artifacts"]
+    seed = payload["seed"]
 
     for path, value in (
         ("config.profile_id", payload["profile_id"]),
@@ -239,10 +260,24 @@ def _validate_values(payload: dict[str, Any]) -> None:
     ):
         if not value.strip():
             raise ConfigError(f"{path} must not be blank")
-    for file_key in ("train_features_file", "train_target_file"):
-        file_name = dataset[file_key]
-        if Path(file_name).name != file_name or not file_name.endswith(".parquet"):
-            raise ConfigError(f"config.dataset.{file_key} must be a Parquet filename")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", dataset["version"]):
+        raise ConfigError("config.dataset.version must be a lowercase safe slug")
+    expected_directory = f"data/processed/{dataset['version']}"
+    if dataset["directory"] != expected_directory:
+        raise ConfigError(
+            "config.dataset.directory must equal exactly "
+            f"{expected_directory!r} for the configured dataset version"
+        )
+    if dataset["train_features_file"] != "X_train.parquet":
+        raise ConfigError(
+            "config.dataset.train_features_file must equal exactly 'X_train.parquet'"
+        )
+    if dataset["train_target_file"] != "y_train.parquet":
+        raise ConfigError(
+            "config.dataset.train_target_file must equal exactly 'y_train.parquet'"
+        )
+    if seed < 0:
+        raise ConfigError("config.seed must not be negative")
     if predictor["problem_type"] != "binary":
         raise ConfigError("config.predictor.problem_type must equal 'binary'")
     if predictor["eval_metric"] != "balanced_accuracy":
@@ -268,17 +303,15 @@ def _validate_values(payload: dict[str, Any]) -> None:
         raise ConfigError(
             "config.resources.fold_fitting_strategy must equal 'sequential_local'"
         )
-    if Path(artifacts["root"]).is_absolute():
-        raise ConfigError("config.artifacts.root must be repository-relative")
+    if fit["presets"] not in {"extreme_quality"}:
+        raise ConfigError("config.fit.presets must be one of: 'extreme_quality'")
+    _reject_windows_or_absolute_path(artifacts["root"], "config.artifacts.root")
 
     profile = get_profile(payload["profile_id"])
-    if (
-        profile.force_num_gpus is not None
-        and resources["num_gpus"] != profile.force_num_gpus
-    ):
+    if resources["num_gpus"] < profile.minimum_gpu_budget:
         raise ConfigError(
-            f"profile {profile.profile_id} requires resources.num_gpus="
-            f"{profile.force_num_gpus}"
+            f"profile {profile.profile_id} requires resources.num_gpus >= "
+            f"{profile.minimum_gpu_budget}"
         )
 
 
@@ -289,9 +322,8 @@ def _resolve_contained(
     *,
     must_exist: bool,
 ) -> Path:
+    _reject_windows_or_absolute_path(configured_path, field)
     candidate = Path(configured_path)
-    if candidate.is_absolute():
-        raise ConfigError(f"{field} must be relative")
     if not configured_path.strip() or any(part == ".." for part in candidate.parts):
         raise ConfigError(f"{field} must not contain traversal")
     try:
@@ -303,3 +335,16 @@ def _resolve_contained(
             f"{field} escapes its allowed directory or is invalid"
         ) from error
     return resolved
+
+
+def _reject_windows_or_absolute_path(configured_path: str, field: str) -> None:
+    windows_path = PureWindowsPath(configured_path)
+    if (
+        Path(configured_path).is_absolute()
+        or bool(windows_path.drive)
+        or bool(windows_path.root)
+        or configured_path.startswith(("/", "\\"))
+    ):
+        raise ConfigError(
+            f"{field} must be repository-relative and must not be drive-qualified or rooted"
+        )

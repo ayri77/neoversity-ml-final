@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import os
+import shutil
 from pathlib import Path
+from typing import Any, Callable
 
 import pytest
 import yaml
@@ -17,10 +19,11 @@ from src.churn_ml.autogluon_supervisor import (
 )
 
 
-def valid_payload() -> dict[str, object]:
+def valid_payload() -> dict[str, Any]:
     return {
         "schema_version": 1,
         "profile_id": "realtabpfn_only_v1",
+        "seed": 42,
         "dataset": {
             "version": "v3_targeted_missingness",
             "directory": "data/processed/v3_targeted_missingness",
@@ -61,6 +64,10 @@ def repository(tmp_path: Path) -> tuple[Path, Path]:
     return root, config_path
 
 
+def write_payload(config_path: Path, payload: dict[str, Any]) -> None:
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -82,18 +89,108 @@ def repository(tmp_path: Path) -> tuple[Path, Path]:
             lambda value: value["resources"].update({"num_cpus": "32"}),
             "must equal 'auto'",
         ),
+        (lambda value: value.update({"seed": True}), "exact type"),
+        (lambda value: value.update({"seed": 42.0}), "exact type"),
+        (lambda value: value.update({"seed": "42"}), "exact type"),
     ],
 )
 def test_strict_recursive_schema(
     repository: tuple[Path, Path],
-    mutate: object,
+    mutate: Callable[[dict[str, Any]], None],
     message: str,
 ) -> None:
     root, config_path = repository
     payload = copy.deepcopy(valid_payload())
-    mutate(payload)  # type: ignore[operator]
-    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    mutate(payload)
+    write_payload(config_path, payload)
     with pytest.raises(ConfigError, match=message):
+        load_config(config_path, root)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda payload: payload["dataset"].update(
+                {"train_features_file": "X_test.parquet"}
+            ),
+            "X_train.parquet",
+        ),
+        (
+            lambda payload: payload["dataset"].update(
+                {"directory": "data/raw/v3_targeted_missingness"}
+            ),
+            "must equal exactly",
+        ),
+        (
+            lambda payload: payload["dataset"].update(
+                {"directory": "artifacts/reference/v3_targeted_missingness"}
+            ),
+            "must equal exactly",
+        ),
+        (
+            lambda payload: payload["dataset"].update(
+                {"directory": "artifacts/predictions/v3_targeted_missingness"}
+            ),
+            "must equal exactly",
+        ),
+        (
+            lambda payload: payload["dataset"].update(
+                {"directory": "submissions/v3_targeted_missingness"}
+            ),
+            "must equal exactly",
+        ),
+        (
+            lambda payload: payload["dataset"].update(
+                {"train_target_file": "submission.parquet"}
+            ),
+            "y_train.parquet",
+        ),
+        (
+            lambda payload: payload["dataset"].update(
+                {
+                    "version": "v2_missingness_indicators",
+                    "directory": "data/processed/v3_targeted_missingness",
+                }
+            ),
+            "configured dataset version",
+        ),
+    ],
+)
+def test_production_dataset_isolation_rejects_forbidden_configuration(
+    repository: tuple[Path, Path],
+    mutation: Callable[[dict[str, Any]], None],
+    message: str,
+) -> None:
+    root, config_path = repository
+    payload = valid_payload()
+    mutation(payload)
+    write_payload(config_path, payload)
+    with pytest.raises(ConfigError, match=message):
+        load_config(config_path, root)
+
+
+@pytest.mark.parametrize(
+    "configured_path",
+    (
+        r"C:\absolute",
+        "C:/absolute",
+        "C:",
+        "C:relative",
+        r"\\server\share",
+        r"\path",
+        "/platform/absolute",
+    ),
+)
+def test_windows_and_platform_rooted_artifact_paths_are_rejected(
+    repository: tuple[Path, Path],
+    configured_path: str,
+) -> None:
+    root, config_path = repository
+    payload = valid_payload()
+    payload["artifacts"]["root"] = configured_path
+    write_payload(config_path, payload)
+    with pytest.raises(ConfigError, match="drive-qualified or rooted"):
         load_config(config_path, root)
 
 
@@ -107,31 +204,62 @@ def test_rejects_path_traversal(
 ) -> None:
     root, config_path = repository
     payload = valid_payload()
-    payload["dataset"]["directory"] = directory  # type: ignore[index]
-    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
-    with pytest.raises(ConfigError, match="traversal"):
+    payload["dataset"]["directory"] = directory
+    write_payload(config_path, payload)
+    with pytest.raises(ConfigError, match="must equal exactly"):
         load_config(config_path, root)
 
 
-def test_rejects_symlink_escape_where_supported(
+def test_rejects_exact_version_symlink_escape_where_supported(
     repository: tuple[Path, Path],
     tmp_path: Path,
 ) -> None:
     root, config_path = repository
+    version_dir = root / "data" / "processed" / "v3_targeted_missingness"
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "X_train.parquet").write_bytes(b"x")
     (outside / "y_train.parquet").write_bytes(b"y")
-    link = root / "linked-data"
+    shutil.rmtree(version_dir)
     try:
-        os.symlink(outside, link, target_is_directory=True)
-    except OSError:
-        pytest.skip("directory symlinks are not available")
-    payload = valid_payload()
-    payload["dataset"]["directory"] = "linked-data"  # type: ignore[index]
-    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+        os.symlink(outside, version_dir, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(
+            f"isolated directory symlink/junction privilege unavailable: {error}"
+        )
     with pytest.raises(ConfigError, match="escapes"):
         load_config(config_path, root)
+
+
+def test_preset_allowlist_rejects_garbage(repository: tuple[Path, Path]) -> None:
+    root, config_path = repository
+    payload = valid_payload()
+    payload["fit"]["presets"] = "garbage"
+    write_payload(config_path, payload)
+    with pytest.raises(ConfigError, match="must be one of"):
+        load_config(config_path, root)
+
+
+def test_seed_is_identity_bearing(repository: tuple[Path, Path]) -> None:
+    root, config_path = repository
+    first = load_config(config_path, root)
+    payload = valid_payload()
+    payload["seed"] = 43
+    write_payload(config_path, payload)
+    second = load_config(config_path, root)
+    assert first.seed == 42
+    assert second.seed == 43
+    assert first.identity_sha256 != second.identity_sha256
+
+
+def test_config_only_validation_without_ignored_data(tmp_path: Path) -> None:
+    root = tmp_path / "empty-repository"
+    root.mkdir()
+    config_path = root / "config.yaml"
+    write_payload(config_path, valid_payload())
+    config = load_config(config_path, root, require_data_files=False)
+    assert config.dataset.version == "v3_targeted_missingness"
+    assert not (root / "artifacts").exists()
 
 
 def test_profile_registry_and_unknown_profile() -> None:
@@ -170,9 +298,7 @@ def test_generated_run_id_is_safe_and_distinct() -> None:
     assert first != second
 
 
-def test_validate_only_does_not_allocate(
-    repository: tuple[Path, Path],
-) -> None:
+def test_validate_only_does_not_allocate(repository: tuple[Path, Path]) -> None:
     root, config_path = repository
     artifacts_root = root / "artifacts"
     assert (
