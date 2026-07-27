@@ -15,6 +15,7 @@ from src.churn_ml.experiment_v2_contract import first_exact_difference
 from src.churn_ml.experiment_v2_numeric_adapter import (
     EXPECTED_NUMERIC_FEATURE_CONTRACT,
     build_numeric_matrices,
+    load_adapter_class,
     numeric_identity_inputs,
     positive_class_probabilities,
     validate_adapter_inputs,
@@ -25,6 +26,7 @@ XGBOOST_NUMERIC_V1 = "xgboost_numeric_v1"
 XGBOOST_NUMERIC_V1_DEFAULT_PARAMETERS = {
     "objective": "binary:logistic",
     "booster": "gbtree",
+    "missing": "IEEE_NaN",
     "n_estimators": 300,
     "learning_rate": 0.05,
     "max_depth": 6,
@@ -54,9 +56,8 @@ EstimatorFactory = Callable[[dict[str, Any]], Any]
 
 
 def _default_estimator_factory(parameters: dict[str, Any]) -> Any:
-    from xgboost import XGBClassifier
-
-    return XGBClassifier(**parameters)
+    estimator_class = load_adapter_class(XGBOOST_NUMERIC_V1, "XGBClassifier")
+    return estimator_class(**parameters)
 
 
 class XgboostNumericV1Adapter:
@@ -135,6 +136,11 @@ class XgboostNumericV1Adapter:
             contract["numeric_features"],
         )
         parameters = deepcopy(dict(contract["xgboost"]["parameters"]))
+        if parameters.pop("missing") != "IEEE_NaN":
+            raise ExperimentV2AdapterContractError(
+                "candidate_adapter.contract.xgboost.parameters.missing "
+                "must be exactly 'IEEE_NaN'."
+            )
         parameters["missing"] = np.nan
         estimator = self._estimator_factory(parameters)
         estimator.fit(encoded_train, train_labels.reset_index(drop=True))
@@ -150,7 +156,9 @@ class XgboostNumericV1Adapter:
             adapter_id=self.id,
             contract=contract,
             estimator="xgboost.XGBClassifier",
-            native_missing_configuration={"missing": "IEEE_NaN"},
+            native_missing_configuration={
+                "missing": str(contract["xgboost"]["parameters"]["missing"])
+            },
         )
 
 
@@ -171,6 +179,7 @@ def _validate_parameters(parameters: Mapping[str, Any]) -> None:
     for key, expected in {
         "objective": "binary:logistic",
         "booster": "gbtree",
+        "missing": "IEEE_NaN",
         "tree_method": "hist",
         "device": "cpu",
         "eval_metric": "logloss",

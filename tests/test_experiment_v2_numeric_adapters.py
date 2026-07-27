@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import importlib.metadata
 import inspect
 import json
+import sys
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from src.churn_ml import experiment_v2_numeric_adapter, research_v2_cli
 from src.churn_ml.experiment_v2 import (
+    ExperimentV2AdapterDependencyError,
     candidate_adapter_registry,
     get_candidate_adapter,
 )
@@ -18,11 +22,13 @@ from src.churn_ml.experiment_v2_adapter import ExperimentV2AdapterContractError
 from src.churn_ml.experiment_v2_catboost_adapter import (
     EXPECTED_CATBOOST_NUMERIC_V1_CONTRACT,
     CatboostNumericV1Adapter,
+    _default_estimator_factory as catboost_estimator_factory,
 )
 from src.churn_ml.experiment_v2_numeric_adapter import validate_numeric_matrix
 from src.churn_ml.experiment_v2_xgboost_adapter import (
     EXPECTED_XGBOOST_NUMERIC_V1_CONTRACT,
     XgboostNumericV1Adapter,
+    _default_estimator_factory as xgboost_estimator_factory,
 )
 from src.churn_ml.research_v2_artifact_validation import (
     validate_portable_payload_paths,
@@ -40,6 +46,24 @@ from src.churn_ml.research_v2_provenance import environment_identity
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TRAIN_PATH = PROJECT_ROOT / "data/processed/v3_targeted_missingness/X_train.parquet"
+MANUAL_CONFIG = (
+    PROJECT_ROOT / "configs/research_v2/manual_lightgbm_te_v1_compat_smoke.yaml"
+)
+XGBOOST_SMOKE_CONFIG = (
+    PROJECT_ROOT / "configs/research_v2/xgboost_numeric_v1_smoke.yaml"
+)
+
+
+def _contract(use_xgboost: bool) -> dict[str, Any]:
+    source = (
+        EXPECTED_XGBOOST_NUMERIC_V1_CONTRACT
+        if use_xgboost
+        else EXPECTED_CATBOOST_NUMERIC_V1_CONTRACT
+    )
+    return deepcopy(cast(dict[str, Any], source))
+
+
 CONFIGS = (
     "xgboost_numeric_v1_smoke.yaml",
     "catboost_numeric_v1_smoke.yaml",
@@ -108,11 +132,7 @@ def test_adapters_follow_protocol_and_pass_only_training_data(
     expected_cpu: dict[str, Any],
 ) -> None:
     train, labels, prediction = _data()
-    contract = deepcopy(
-        EXPECTED_XGBOOST_NUMERIC_V1_CONTRACT
-        if model_key == "xgboost"
-        else EXPECTED_CATBOOST_NUMERIC_V1_CONTRACT
-    )
+    contract = _contract(model_key == "xgboost")
     created: list[RecordingEstimator] = []
 
     def factory(parameters: dict[str, Any]) -> RecordingEstimator:
@@ -156,9 +176,12 @@ def test_adapters_follow_protocol_and_pass_only_training_data(
     assert created[0].fit_features["all_nan"].isna().all()
     if model_key == "xgboost":
         assert np.isnan(created[0].parameters["missing"])
-        without_runtime_missing = dict(created[0].parameters)
-        del without_runtime_missing["missing"]
-        assert without_runtime_missing == contract[model_key]["parameters"]
+        expected_parameters = deepcopy(contract[model_key]["parameters"])
+        expected_parameters["missing"] = np.nan
+        assert created[0].parameters.keys() == expected_parameters.keys()
+        for key, value in created[0].parameters.items():
+            if key != "missing":
+                assert value == expected_parameters[key]
     else:
         assert created[0].parameters == contract[model_key]["parameters"]
     for key, expected in expected_cpu.items():
@@ -185,11 +208,7 @@ def test_adapters_reject_non_exact_binary_targets(
 ) -> None:
     train, _, prediction = _data()
     adapter = get_candidate_adapter(adapter_id)
-    contract = deepcopy(
-        EXPECTED_XGBOOST_NUMERIC_V1_CONTRACT
-        if adapter_id.startswith("xgboost")
-        else EXPECTED_CATBOOST_NUMERIC_V1_CONTRACT
-    )
+    contract = _contract(adapter_id.startswith("xgboost"))
     with pytest.raises(ExperimentV2AdapterContractError, match="binary labels"):
         adapter.fit_predict(
             train,
@@ -209,11 +228,7 @@ def test_adapters_reject_infinite_numeric_features(
 ) -> None:
     train, labels, prediction = _data()
     train.loc[1, "numeric"] = bad_value
-    contract = deepcopy(
-        EXPECTED_XGBOOST_NUMERIC_V1_CONTRACT
-        if adapter_id.startswith("xgboost")
-        else EXPECTED_CATBOOST_NUMERIC_V1_CONTRACT
-    )
+    contract = _contract(adapter_id.startswith("xgboost"))
     with pytest.raises(ExperimentV2AdapterContractError, match="infinity_count"):
         get_candidate_adapter(adapter_id).fit_predict(
             train,
@@ -278,11 +293,7 @@ def test_missing_value_policy_is_exact_and_strict(
     adapter_id: str,
     bad_policy: Any,
 ) -> None:
-    contract = deepcopy(
-        EXPECTED_XGBOOST_NUMERIC_V1_CONTRACT
-        if adapter_id.startswith("xgboost")
-        else EXPECTED_CATBOOST_NUMERIC_V1_CONTRACT
-    )
+    contract = _contract(adapter_id.startswith("xgboost"))
     contract["numeric_features"]["missing_value_policy"] = bad_policy
     with pytest.raises(
         ExperimentV2AdapterContractError,
@@ -314,11 +325,7 @@ def test_parameter_contract_rejects_wrong_types_ranges_and_unsafe_modes(
     parameter: str,
     bad_value: Any,
 ) -> None:
-    contract = deepcopy(
-        EXPECTED_XGBOOST_NUMERIC_V1_CONTRACT
-        if model_key == "xgboost"
-        else EXPECTED_CATBOOST_NUMERIC_V1_CONTRACT
-    )
+    contract = _contract(model_key == "xgboost")
     contract[model_key]["parameters"][parameter] = bad_value
     with pytest.raises(ExperimentV2AdapterContractError, match=parameter):
         get_candidate_adapter(adapter_id).validate_contract(contract)
@@ -332,11 +339,7 @@ def test_parameter_contract_allows_valid_override_and_rejects_unknown_key(
     adapter_id: str,
     model_key: str,
 ) -> None:
-    contract = deepcopy(
-        EXPECTED_XGBOOST_NUMERIC_V1_CONTRACT
-        if model_key == "xgboost"
-        else EXPECTED_CATBOOST_NUMERIC_V1_CONTRACT
-    )
+    contract = _contract(model_key == "xgboost")
     count_key = "n_estimators" if model_key == "xgboost" else "iterations"
     contract[model_key]["parameters"][count_key] = 7
     adapter = get_candidate_adapter(adapter_id)
@@ -368,6 +371,29 @@ def test_parameter_contract_allows_valid_override_and_rejects_unknown_key(
         adapter.validate_contract(contract)
 
 
+@pytest.mark.parametrize("bad_value", ["NaN", True, 1, None])
+def test_xgboost_portable_missing_parameter_is_exact_and_strict(
+    bad_value: Any,
+) -> None:
+    contract = _contract(True)
+    contract["xgboost"]["parameters"]["missing"] = bad_value
+    with pytest.raises(
+        ExperimentV2AdapterContractError,
+        match=r"xgboost\.parameters\.missing",
+    ):
+        get_candidate_adapter("xgboost_numeric_v1").validate_contract(contract)
+
+
+def test_xgboost_portable_missing_parameter_is_required() -> None:
+    contract = _contract(True)
+    del contract["xgboost"]["parameters"]["missing"]
+    with pytest.raises(
+        ExperimentV2AdapterContractError,
+        match=r"xgboost\.parameters keys differ; missing=\['missing'\]",
+    ):
+        get_candidate_adapter("xgboost_numeric_v1").validate_contract(contract)
+
+
 def test_all_new_configs_and_legacy_config_validate_without_data_access() -> None:
     for name in CONFIGS:
         config = load_research_v2_config(
@@ -378,6 +404,12 @@ def test_all_new_configs_and_legacy_config_validate_without_data_access() -> Non
         assert config.adapter_contract["numeric_features"]["missing_value_policy"] == (
             "native_nan"
         )
+        if config.adapter_id == "xgboost_numeric_v1":
+            assert (
+                config.adapter_contract["xgboost"]["parameters"]["missing"]
+                == "IEEE_NaN"
+            )
+        json.dumps(config.resolved_payload(), allow_nan=False)
     legacy = load_research_v2_config(
         PROJECT_ROOT / "configs/research_v2/manual_lightgbm_te_v1_compat_smoke.yaml",
         project_root=PROJECT_ROOT,
@@ -392,9 +424,7 @@ def test_missing_policy_changes_adapter_and_candidate_but_not_pipeline_identity(
     paths.update(XGBOOST_ADAPTER_IMPLEMENTATION_SOURCES)
     sources = {path: f"{index:064x}" for index, path in enumerate(sorted(paths), 1)}
     adapter = get_candidate_adapter("xgboost_numeric_v1")
-    adapter_inputs = adapter.identity_inputs(
-        deepcopy(EXPECTED_XGBOOST_NUMERIC_V1_CONTRACT)
-    )
+    adapter_inputs = adapter.identity_inputs(_contract(True))
 
     def build(inputs: dict[str, Any]) -> dict[str, str]:
         _, hashes = build_component_identities(
@@ -417,6 +447,49 @@ def test_missing_policy_changes_adapter_and_candidate_but_not_pipeline_identity(
     assert after["feature_pipeline"] == before["feature_pipeline"]
     assert after["candidate_adapter"] != before["candidate_adapter"]
     assert after["candidate"] != before["candidate"]
+
+
+def test_xgboost_missing_parameter_changes_only_xgboost_identities() -> None:
+    paths = set(PIPELINE_IMPLEMENTATION_SOURCES)
+    paths.update(ADAPTER_IMPLEMENTATION_SOURCES)
+    paths.update(XGBOOST_ADAPTER_IMPLEMENTATION_SOURCES)
+    paths.update(CATBOOST_ADAPTER_IMPLEMENTATION_SOURCES)
+    sources = {path: f"{index:064x}" for index, path in enumerate(sorted(paths), 1)}
+
+    def hashes(adapter_id: str, contract: dict[str, Any]) -> dict[str, str]:
+        adapter = get_candidate_adapter(adapter_id)
+        _, result = build_component_identities(
+            pipeline_inputs={"id": "pipeline", "contract": {"version": 1}},
+            adapter_inputs=adapter.identity_inputs(contract),
+            resolved_feature_schema={"ordered": ["a"]},
+            runtime_dependencies={"python": "3.12", adapter_id.split("_")[0]: "1.0"},
+            dataset_version="unit",
+            source_records=sources,
+        )
+        return result
+
+    xgboost_contract = _contract(True)
+    catboost_contract = _contract(False)
+    xgboost_before = hashes("xgboost_numeric_v1", xgboost_contract)
+    catboost_before = hashes("catboost_numeric_v1", catboost_contract)
+    xgboost_inputs = get_candidate_adapter("xgboost_numeric_v1").identity_inputs(
+        xgboost_contract
+    )
+    changed_inputs = deepcopy(xgboost_inputs)
+    changed_inputs["contract"]["xgboost"]["parameters"]["missing"] = "future_marker"
+    changed_inputs["native_missing_configuration"]["missing"] = "future_marker"
+    _, changed_hashes = build_component_identities(
+        pipeline_inputs={"id": "pipeline", "contract": {"version": 1}},
+        adapter_inputs=changed_inputs,
+        resolved_feature_schema={"ordered": ["a"]},
+        runtime_dependencies={"python": "3.12", "xgboost": "1.0"},
+        dataset_version="unit",
+        source_records=sources,
+    )
+    assert changed_hashes["feature_pipeline"] == xgboost_before["feature_pipeline"]
+    assert changed_hashes["candidate_adapter"] != xgboost_before["candidate_adapter"]
+    assert changed_hashes["candidate"] != xgboost_before["candidate"]
+    assert hashes("catboost_numeric_v1", catboost_contract) == catboost_before
 
 
 def test_adapter_source_identity_mutations_are_model_scoped() -> None:
@@ -482,6 +555,145 @@ def test_runtime_provenance_is_selected_library_specific() -> None:
     assert "catboost" in catboost and "xgboost" not in catboost
 
 
+@pytest.mark.parametrize(
+    "adapter_id,package,factory",
+    [
+        ("xgboost_numeric_v1", "xgboost", xgboost_estimator_factory),
+        ("catboost_numeric_v1", "catboost", catboost_estimator_factory),
+    ],
+)
+def test_missing_top_level_adapter_import_has_precise_dependency_error(
+    adapter_id: str,
+    package: str,
+    factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = ModuleNotFoundError(f"No module named '{package}'", name=package)
+
+    def missing_import(name: str) -> Any:
+        assert name == package
+        raise original
+
+    monkeypatch.setattr(
+        experiment_v2_numeric_adapter.importlib,
+        "import_module",
+        missing_import,
+    )
+    with pytest.raises(ExperimentV2AdapterDependencyError) as raised:
+        factory({})
+    expected_version = "3.3.0" if package == "xgboost" else "1.2.10"
+    message = str(raised.value)
+    assert adapter_id in message
+    assert package in message
+    assert expected_version in message
+    assert "restore the locked project environment" in message
+    assert raised.value.__cause__ is original
+
+
+@pytest.mark.parametrize(
+    "adapter_id,package",
+    [
+        ("xgboost_numeric_v1", "xgboost"),
+        ("catboost_numeric_v1", "catboost"),
+    ],
+)
+def test_missing_adapter_distribution_has_precise_dependency_error(
+    adapter_id: str,
+    package: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = importlib.metadata.PackageNotFoundError(package)
+
+    def missing_version(name: str) -> str:
+        assert name == package
+        raise original
+
+    monkeypatch.setattr(
+        experiment_v2_numeric_adapter.importlib.metadata,
+        "version",
+        missing_version,
+    )
+    with pytest.raises(ExperimentV2AdapterDependencyError) as raised:
+        experiment_v2_numeric_adapter.adapter_dependency_version(adapter_id)
+    expected_version = "3.3.0" if package == "xgboost" else "1.2.10"
+    message = str(raised.value)
+    assert adapter_id in message
+    assert package in message
+    assert expected_version in message
+    assert "restore the locked project environment" in message
+    assert raised.value.__cause__ is original
+
+
+@pytest.mark.parametrize(
+    "factory,package",
+    [
+        (xgboost_estimator_factory, "xgboost"),
+        (catboost_estimator_factory, "catboost"),
+    ],
+)
+def test_nested_module_import_failure_is_preserved(
+    factory: Any,
+    package: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = ModuleNotFoundError(
+        "No module named 'package_internal_dependency'",
+        name="package_internal_dependency",
+    )
+
+    def nested_failure(name: str) -> Any:
+        assert name == package
+        raise original
+
+    monkeypatch.setattr(
+        experiment_v2_numeric_adapter.importlib,
+        "import_module",
+        nested_failure,
+    )
+    with pytest.raises(ModuleNotFoundError) as raised:
+        factory({})
+    assert raised.value is original
+
+
+def test_adapter_modules_do_not_eagerly_import_model_libraries() -> None:
+    assert "xgboost" not in sys.modules
+    assert "catboost" not in sys.modules
+
+
+@pytest.mark.skipif(not TRAIN_PATH.exists(), reason="train-only dataset unavailable")
+def test_preflight_uses_precise_adapter_dependency_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_version = importlib.metadata.version
+    original = importlib.metadata.PackageNotFoundError("xgboost")
+
+    def selected_missing_version(name: str) -> str:
+        if name == "xgboost":
+            raise original
+        return original_version(name)
+
+    monkeypatch.setattr(
+        experiment_v2_numeric_adapter.importlib.metadata,
+        "version",
+        selected_missing_version,
+    )
+    with pytest.raises(ExperimentV2AdapterDependencyError) as raised:
+        research_v2_cli.preflight(XGBOOST_SMOKE_CONFIG)
+    assert "xgboost_numeric_v1" in str(raised.value)
+    assert raised.value.__cause__ is original
+
+
+@pytest.mark.skipif(not TRAIN_PATH.exists(), reason="train-only dataset unavailable")
+def test_manual_lightgbm_identity_hashes_are_pinned() -> None:
+    prepared = research_v2_cli.preflight(MANUAL_CONFIG)
+    assert prepared.hashes["candidate_adapter"] == (
+        "9b01221fa236dd4e589ea6156642e57e7eeb4a0d95cbf07e1d23280c2e26f3e8"
+    ), "manual LightGBM adapter identity drift"
+    assert prepared.hashes["candidate"] == (
+        "5b3daa881c73f8901eed705a2bd68da81d79a8806570597d183d0b67100c286f"
+    ), "manual LightGBM candidate identity drift"
+
+
 @pytest.mark.parametrize("adapter_id", ["xgboost_numeric_v1", "catboost_numeric_v1"])
 def test_tiny_real_cpu_fit_is_deterministic_and_writes_no_files(
     adapter_id: str,
@@ -490,11 +702,7 @@ def test_tiny_real_cpu_fit_is_deterministic_and_writes_no_files(
 ) -> None:
     pytest.importorskip("xgboost" if adapter_id.startswith("xgboost") else "catboost")
     train, labels, prediction = _data()
-    contract = deepcopy(
-        EXPECTED_XGBOOST_NUMERIC_V1_CONTRACT
-        if adapter_id.startswith("xgboost")
-        else EXPECTED_CATBOOST_NUMERIC_V1_CONTRACT
-    )
+    contract = _contract(adapter_id.startswith("xgboost"))
     model_key = "xgboost" if adapter_id.startswith("xgboost") else "catboost"
     count_key = "n_estimators" if model_key == "xgboost" else "iterations"
     contract[model_key]["parameters"][count_key] = 5

@@ -8,6 +8,9 @@ from src.churn_ml.experiment_v2_adapter import (
 )
 from src.churn_ml.experiment_v2_catboost_adapter import CATBOOST_NUMERIC_V1
 from src.churn_ml.experiment_v2_contract import ExperimentV2ContractError
+from src.churn_ml.experiment_v2_numeric_adapter import (
+    ExperimentV2AdapterDependencyError,
+)
 from src.churn_ml.experiment_v2_model_registry import (
     candidate_adapter_registry,
     get_candidate_adapter,
@@ -30,6 +33,7 @@ __all__ = [
     "XGBOOST_NUMERIC_V1",
     "CandidateAdapter",
     "ExperimentV2AdapterContractError",
+    "ExperimentV2AdapterDependencyError",
     "ExperimentV2ContractError",
     "ExperimentV2PipelineContractError",
     "FeaturePipeline",

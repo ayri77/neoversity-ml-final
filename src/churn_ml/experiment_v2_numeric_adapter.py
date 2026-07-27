@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib
+import importlib.metadata
+
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
@@ -22,6 +25,53 @@ EXPECTED_NUMERIC_FEATURE_CONTRACT = {
     "output": "numeric_matrix",
     "missing_value_policy": "native_nan",
 }
+
+
+ADAPTER_DEPENDENCIES = {
+    "xgboost_numeric_v1": ("xgboost", "3.3.0"),
+    "catboost_numeric_v1": ("catboost", "1.2.10"),
+}
+
+
+class ExperimentV2AdapterDependencyError(ExperimentV2AdapterContractError):
+    """Raised when a selected adapter's locked package is unavailable."""
+
+
+def adapter_dependency_details(adapter_id: str) -> tuple[str, str]:
+    try:
+        return ADAPTER_DEPENDENCIES[adapter_id]
+    except KeyError as error:
+        raise ValueError(
+            f"Adapter has no external dependency contract: {adapter_id}."
+        ) from error
+
+
+def load_adapter_class(adapter_id: str, class_name: str) -> Any:
+    package, _ = adapter_dependency_details(adapter_id)
+    try:
+        module = importlib.import_module(package)
+    except ModuleNotFoundError as error:
+        if error.name != package:
+            raise
+        raise _dependency_error(adapter_id) from error
+    return getattr(module, class_name)
+
+
+def adapter_dependency_version(adapter_id: str) -> str:
+    package, _ = adapter_dependency_details(adapter_id)
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError as error:
+        raise _dependency_error(adapter_id) from error
+
+
+def _dependency_error(adapter_id: str) -> ExperimentV2AdapterDependencyError:
+    package, expected_version = adapter_dependency_details(adapter_id)
+    return ExperimentV2AdapterDependencyError(
+        f"Adapter '{adapter_id}' requires package '{package}' at locked version "
+        f"'{expected_version}'; restore the locked project environment before "
+        "running this adapter."
+    )
 
 
 @dataclass(frozen=True)

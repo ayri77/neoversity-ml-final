@@ -15,6 +15,7 @@ from src.churn_ml.experiment_v2_contract import first_exact_difference
 from src.churn_ml.experiment_v2_numeric_adapter import (
     EXPECTED_NUMERIC_FEATURE_CONTRACT,
     build_numeric_matrices,
+    load_adapter_class,
     numeric_identity_inputs,
     positive_class_probabilities,
     validate_adapter_inputs,
@@ -53,9 +54,8 @@ EstimatorFactory = Callable[[dict[str, Any]], Any]
 
 
 def _default_estimator_factory(parameters: dict[str, Any]) -> Any:
-    from catboost import CatBoostClassifier
-
-    return CatBoostClassifier(**parameters)
+    estimator_class = load_adapter_class(CATBOOST_NUMERIC_V1, "CatBoostClassifier")
+    return estimator_class(**parameters)
 
 
 class CatboostNumericV1Adapter:
@@ -151,7 +151,9 @@ class CatboostNumericV1Adapter:
             adapter_id=self.id,
             contract=contract,
             estimator="catboost.CatBoostClassifier",
-            native_missing_configuration={"nan_mode": "Min"},
+            native_missing_configuration={
+                "nan_mode": str(contract["catboost"]["parameters"]["nan_mode"])
+            },
         )
 
 

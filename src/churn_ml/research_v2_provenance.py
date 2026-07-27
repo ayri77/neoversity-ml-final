@@ -7,6 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from src.churn_ml.experiment_v2_numeric_adapter import (
+    ADAPTER_DEPENDENCIES,
+    adapter_dependency_details,
+    adapter_dependency_version,
+)
 from src.churn_ml.research_data import canonical_sha256
 
 
@@ -95,16 +100,10 @@ def environment_identity(adapter_id: str | None = None) -> dict[str, str]:
         ("pyarrow", "pyarrow"),
     ):
         result[label] = importlib.metadata.version(distribution)
-    adapter_distributions = {
-        "xgboost_numeric_v1": ("xgboost", "xgboost"),
-        "catboost_numeric_v1": ("catboost", "catboost"),
-    }
-    adapter_distribution = (
-        None if adapter_id is None else adapter_distributions.get(adapter_id)
-    )
-    if adapter_distribution is not None:
-        distribution, label = adapter_distribution
-        result[label] = importlib.metadata.version(distribution)
+    if adapter_id in ADAPTER_DEPENDENCIES:
+        assert adapter_id is not None
+        package, _ = adapter_dependency_details(adapter_id)
+        result[package] = adapter_dependency_version(adapter_id)
     return result
 
 

@@ -19,10 +19,14 @@ without replacement and delegated to each estimator's native numerical missing-v
 mechanism. Positive and negative infinity and nonnumeric matrix values remain invalid.
 No fill, sentinel replacement, or statistical imputation is performed.
 
-XGBoost receives `missing=np.nan` explicitly and uses CPU histogram trees with the
-`gbtree` booster. CatBoost receives `nan_mode="Min"` explicitly, together with
-`task_type="CPU"` and `allow_writing_files=False`. Future imputation-based pipelines
-or adapters must use distinct versioned identities rather than changing v1 behavior.
+XGBoost's portable estimator contract contains the exact primitive field
+`missing: IEEE_NaN`. It is retained in resolved configuration, provenance, and
+identity payloads, then translated to `missing=np.nan` only when constructing
+`XGBClassifier`. CatBoost receives `nan_mode="Min"` explicitly, together with
+`task_type="CPU"` and `allow_writing_files=False`. Portable configuration and
+identity payloads never contain raw non-finite numeric values. Future
+imputation-based pipelines or adapters must use distinct versioned identities rather
+than changing v1 behavior.
 
 The adapters fit only the supplied training partition. They do not receive an
 evaluation set, use early stopping, choose thresholds, create labels, fit final
@@ -71,3 +75,9 @@ included in portable adapter identity/provenance. Shared numeric-adapter sources
 affect both new identities; XGBoost- and CatBoost-specific sources affect only their
 respective identity. The legacy `manual_lightgbm_te_v1_compat` identity inputs and
 source set are unchanged.
+
+The adapters are imported lazily. If the selected package or its distribution
+metadata is absent, Experiment Core v2 raises an adapter-specific diagnostic naming
+the adapter, package, locked version, and the action to restore the locked project
+environment. The expected v1 versions are XGBoost `3.3.0` and CatBoost `1.2.10`;
+unrelated nested import failures are preserved for accurate diagnosis.

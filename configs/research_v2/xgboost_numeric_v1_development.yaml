@@ -30,6 +30,7 @@ candidate_adapter:
       parameters:
         objective: binary:logistic
         booster: gbtree
+        missing: IEEE_NaN
         n_estimators: 300
         learning_rate: 0.05
         max_depth: 6
