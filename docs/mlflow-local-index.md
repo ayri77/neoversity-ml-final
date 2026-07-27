@@ -93,14 +93,25 @@ exact status and full-or-native-early metadata schemas, bounded fold progress,
 nonempty typed failure details, plan/pipeline/adapter/run agreement, hash shapes, and
 resolved-plan fold counts. An early failure is not accepted until every authoritative
 artifact that is present has been classified. A persisted resolved config must satisfy
-the strict Experiment Core v2 key, primitive-type, plan, registered pipeline/adapter,
-persistence, tracking, and repository-contained-path contracts. Present identity,
-environment, runtime, and Git artifacts must satisfy their exact schemas, hashes,
-lifecycle timestamps, and every identity field available from status, metadata, and
-config. Unsupported inventory/manifest-like or other partial artifacts make an early
-source corrupt. Native early failures with no optional config remain valid; consistent
-optional artifacts remain valid. Reparse paths and forbidden competition, submission,
-model, pickle, or AutoGluon content are rejected.
+the strict Experiment Core v2 key, primitive-type, registered pipeline/adapter,
+persistence, tracking, and repository-contained-path contracts. Its referenced
+evaluation-plan file must be a regular non-reparse repository file, must pass the
+production strict plan loader, and must be recursively identical by both primitive type
+and value to the persisted plan. This authenticates all behavior-critical plan fields,
+including dataset, folds, seeds, threshold policy/grid, metrics, aggregation, and label
+semantics.
+
+Present identity, environment, runtime, and Git artifacts must satisfy their exact
+schemas, lifecycle timestamps, and every identity field available from status,
+metadata, and config. Source/provenance manifests additionally require the exact
+canonical SHA-256 method and file set. Each canonical POSIX repository-relative path is
+checked for containment, traversal and reparse escapes, and regular-file type; every
+stored digest is then recomputed from the file's exact current bytes. The referenced
+repository config is loaded through the production v2 loader and compared with the
+persisted resolved config. Unsupported inventory/manifest-like or other partial
+artifacts make an early source corrupt. Native early failures with no optional config
+remain valid; consistent optional artifacts remain valid. Reparse paths and forbidden
+competition, submission, model, pickle, or AutoGluon content are rejected.
 
 Only the validated result returned by that lifecycle check can supply mapping fields,
 immutable source identity, or additions to the failed-run artifact-copy allowlist. A

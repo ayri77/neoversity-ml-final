@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import stat
@@ -24,6 +25,7 @@ from src.churn_ml.autogluon_profiles import (
 )
 from src.churn_ml.autogluon_supervisor import unsigned_windows_exit_code
 from src.churn_ml.experiment_v2 import get_candidate_adapter, get_feature_pipeline
+from src.churn_ml.experiment_v2_contract import first_exact_difference
 from src.churn_ml.mlflow_mapping import canonical_sha256
 from src.churn_ml.research_config import (
     _validate_plan_invariants,
@@ -32,7 +34,22 @@ from src.churn_ml.research_config import (
 from src.churn_ml.research_v2_artifact_validation import (
     validate_portable_payload_paths,
 )
-from src.churn_ml.research_v2_config import ROOT_KEYS, SAFE_SLUG, SECTION_KEYS
+from src.churn_ml.research_v2_config import (
+    ROOT_KEYS,
+    SAFE_SLUG,
+    SECTION_KEYS,
+    _load_mapping as load_research_v2_plan_mapping,
+    _repo_path as resolve_research_v2_repository_path,
+    load_research_v2_config,
+)
+from src.churn_ml.research_v2_identity import (
+    ADAPTER_IMPLEMENTATION_SOURCES,
+    PIPELINE_IMPLEMENTATION_SOURCES,
+)
+from src.churn_ml.research_v2_provenance import (
+    SOURCE_PATHS,
+    file_identity as build_repository_file_identity,
+)
 
 
 class FailedLifecycleError(RuntimeError):
@@ -375,8 +392,28 @@ def _validate_research_resolved_config(
         if SAFE_SLUG.fullmatch(_nonempty_string(value, label)) is None:
             raise FailedLifecycleError(f"Research config {label} is not a safe slug")
     root = repository_root.resolve()
-    _repository_path(
+    try:
+        production_plan_path = resolve_research_v2_repository_path(
+            _nonempty_string(
+                payload["evaluation_plan_path"],
+                "research evaluation_plan_path",
+            ),
+            root,
+            "evaluation_plan_path",
+        )
+    except (TypeError, ValueError) as error:
+        raise FailedLifecycleError(
+            f"Research evaluation plan path differs: {error}"
+        ) from error
+    plan_path = _repository_path(
         payload["evaluation_plan_path"], root, "research evaluation_plan_path"
+    )
+    if plan_path != production_plan_path:
+        raise FailedLifecycleError("Research evaluation plan path resolution differs")
+    _validate_repository_regular_file(
+        plan_path,
+        repository_root=root,
+        label="research evaluation plan",
     )
     _repository_path(
         _mapping(payload["artifacts"], "research artifacts")["root"],
@@ -385,12 +422,24 @@ def _validate_research_resolved_config(
     )
     plan = _mapping(config["evaluation_plan"], "research evaluation plan")
     try:
+        repository_plan = load_research_v2_plan_mapping(plan_path, "evaluation plan")
+        _validate_plan_structure(repository_plan)
+        _validate_plan_invariants(repository_plan)
         _validate_plan_structure(dict(plan))
         _validate_plan_invariants(dict(plan))
-    except (KeyError, TypeError, ValueError) as error:
+    except (KeyError, OSError, TypeError, ValueError) as error:
         raise FailedLifecycleError(
             f"Research evaluation plan contract differs: {error}"
         ) from error
+    difference = first_exact_difference(
+        plan,
+        repository_plan,
+        "resolved_config.evaluation_plan",
+    )
+    if difference is not None:
+        raise FailedLifecycleError(
+            f"Persisted evaluation plan differs from repository plan: {difference}"
+        )
     dataset = _mapping(payload["dataset"], "research dataset")
     plan_dataset = _mapping(plan["dataset"], "research plan dataset")
     if plan_dataset["version"] != dataset["version"]:
@@ -614,6 +663,11 @@ def _validate_research_identity_semantics(
             _mapping(canonical["implementation_sources"], "implementation sources"),
             repository_root,
             f"{name} implementation sources",
+            expected_paths=(
+                PIPELINE_IMPLEMENTATION_SOURCES
+                if name == "feature_pipeline"
+                else ADAPTER_IMPLEMENTATION_SOURCES
+            ),
         )
     elif name == "candidate":
         _exact_keys(
@@ -649,7 +703,13 @@ def _validate_research_identity_semantics(
                 "Research candidate identity disagrees with config"
             )
     elif name == "source":
-        _validate_source_file_manifest(canonical, repository_root, "source identity")
+        _validate_source_file_manifest(
+            canonical,
+            repository_root,
+            "source identity",
+            expected_paths=None,
+            resolved_config=resolved_config,
+        )
     elif name == "loaded_modules":
         _exact_keys(
             canonical,
@@ -682,15 +742,29 @@ def _validate_source_file_manifest(
     canonical: Mapping[str, Any],
     repository_root: Path,
     label: str,
+    *,
+    expected_paths: tuple[str, ...] | None,
+    resolved_config: Mapping[str, Any] | None = None,
 ) -> None:
     _exact_keys(canonical, {"schema_version", "hashing_method", "files"}, label)
-    if _exact_int(canonical["schema_version"]) not in {1, 2}:
+    source_manifest = label == "source identity"
+    expected_schema = 2 if source_manifest else 1
+    expected_method = (
+        "sha256_file_bytes_sorted_repository_relative_paths"
+        if source_manifest
+        else "sha256_file_bytes_repository_relative_paths"
+    )
+    if _exact_int(canonical["schema_version"]) != expected_schema:
         raise FailedLifecycleError(f"{label} schema differs")
-    _nonempty_string(canonical["hashing_method"], f"{label} hashing method")
+    if type(canonical["hashing_method"]) is not str:
+        raise FailedLifecycleError(f"{label} hashing method type differs")
+    if canonical["hashing_method"] != expected_method:
+        raise FailedLifecycleError(f"{label} hashing method differs")
     files = canonical["files"]
     if type(files) is not list or not files:
         raise FailedLifecycleError(f"{label} files must be a nonempty list")
     seen: set[str] = set()
+    ordered_paths: list[str] = []
     for item in files:
         record = _mapping(item, f"{label} file")
         _exact_keys(record, {"path", "sha256"}, f"{label} file")
@@ -698,7 +772,88 @@ def _validate_source_file_manifest(
         if path in seen:
             raise FailedLifecycleError(f"{label} contains duplicate paths")
         seen.add(path)
-        _validate_repository_file_hash(repository_root, path, record["sha256"], label)
+        ordered_paths.append(path)
+        _validate_repository_file_hash(
+            repository_root,
+            path,
+            record["sha256"],
+            label,
+        )
+    if ordered_paths != sorted(ordered_paths):
+        raise FailedLifecycleError(f"{label} file order differs")
+    if source_manifest:
+        try:
+            authenticated, _ = build_repository_file_identity(
+                repository_root,
+                ordered_paths,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise FailedLifecycleError(
+                f"Research source identity byte authentication failed: {error}"
+            ) from error
+        difference = first_exact_difference(
+            canonical,
+            authenticated,
+            "identities.source.canonical",
+        )
+        if difference is not None:
+            raise FailedLifecycleError(
+                f"Research source identity differs from repository bytes: {difference}"
+            )
+    if expected_paths is not None:
+        if seen != set(expected_paths):
+            raise FailedLifecycleError(
+                f"{label} file set differs; "
+                f"missing={sorted(set(expected_paths) - seen)}, "
+                f"unexpected={sorted(seen - set(expected_paths))}"
+            )
+        return
+    if resolved_config is None:
+        raise FailedLifecycleError(
+            "Research source identity cannot be authenticated without resolved config"
+        )
+    plan_path = _nonempty_string(
+        resolved_config.get("evaluation_plan_path"),
+        "research source identity evaluation plan path",
+    )
+    required = {*SOURCE_PATHS, plan_path}
+    config_paths = seen - required
+    if not required.issubset(seen) or len(config_paths) != 1:
+        raise FailedLifecycleError(
+            "Research source identity file set differs from the production contract"
+        )
+    config_path = next(iter(config_paths))
+    config_parts = PurePosixPath(config_path).parts
+    if (
+        len(config_parts) < 3
+        or config_parts[:2] != ("configs", "research_v2")
+        or PurePosixPath(config_path).suffix not in {".yaml", ".yml"}
+    ):
+        raise FailedLifecycleError(
+            "Research source identity config path differs from the production contract"
+        )
+    try:
+        loaded = load_research_v2_config(
+            _repository_path(
+                config_path,
+                repository_root.resolve(),
+                "research source config path",
+            ),
+            project_root=repository_root,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        raise FailedLifecycleError(
+            f"Research source config authentication failed: {error}"
+        ) from error
+    difference = first_exact_difference(
+        resolved_config,
+        loaded.resolved_payload(),
+        "resolved_config",
+    )
+    if difference is not None:
+        raise FailedLifecycleError(
+            f"Research source config differs from repository config: {difference}"
+        )
 
 
 def _validate_repository_file_hash(
@@ -707,8 +862,39 @@ def _validate_repository_file_hash(
     expected_sha256: Any,
     label: str,
 ) -> None:
-    _repository_path(value, repository_root.resolve(), f"{label} path")
-    _sha(expected_sha256, f"{label} sha256")
+    path = _repository_path(value, repository_root.resolve(), f"{label} path")
+    expected = _sha(expected_sha256, f"{label} sha256")
+    _validate_repository_regular_file(
+        path,
+        repository_root=repository_root,
+        label=label,
+    )
+    try:
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise FailedLifecycleError(f"Cannot read {label} repository file") from error
+    if actual != expected:
+        raise FailedLifecycleError(f"{label} repository byte hash differs")
+
+
+def _validate_repository_regular_file(
+    path: Path,
+    *,
+    repository_root: Path,
+    label: str,
+) -> None:
+    root = repository_root.resolve()
+    try:
+        path.resolve(strict=True).relative_to(root)
+        info = path.stat(follow_symlinks=False)
+    except (OSError, ValueError) as error:
+        raise FailedLifecycleError(
+            f"{label} repository file is missing or escapes the repository"
+        ) from error
+    if path.is_symlink() or _is_reparse_point(path) or not stat.S_ISREG(info.st_mode):
+        raise FailedLifecycleError(
+            f"{label} repository path is not a regular non-reparse file"
+        )
 
 
 def _validate_optional_research_context_artifacts(
@@ -778,11 +964,20 @@ def _repository_path(value: Any, root: Path, label: str) -> Path:
         or windows.is_absolute()
         or ".." in posix.parts
         or ".." in windows.parts
+        or "\\" in text
+        or posix.as_posix() != text
+        or (posix.parts and ":" in posix.parts[0])
     ):
         raise FailedLifecycleError(
-            f"{label} must be a repository-relative path without traversal"
+            f"{label} must be a canonical repository-relative POSIX path "
+            "without traversal"
         )
-    resolved = (root / Path(text)).resolve()
+    lexical = root
+    for part in posix.parts:
+        lexical = lexical / part
+        if lexical.exists() and (lexical.is_symlink() or _is_reparse_point(lexical)):
+            raise FailedLifecycleError(f"{label} crosses a repository reparse path")
+    resolved = lexical.resolve()
     if resolved != root and root not in resolved.parents:
         raise FailedLifecycleError(f"{label} escapes the repository")
     return resolved

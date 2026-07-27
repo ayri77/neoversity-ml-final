@@ -818,6 +818,15 @@ def _write_full_failed_research(run: Path) -> None:
     resolved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     plan_path = PROJECT_ROOT / resolved["evaluation_plan_path"]
     resolved["evaluation_plan"] = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    artifacts_root = next(
+        parent for parent in run.parents if parent.name == "artifacts"
+    )
+    repository_plan = artifacts_root.parent / resolved["evaluation_plan_path"]
+    repository_plan.parent.mkdir(parents=True, exist_ok=True)
+    repository_plan.write_text(
+        yaml.safe_dump(resolved["evaluation_plan"], sort_keys=False),
+        encoding="utf-8",
+    )
     metadata = {
         "schema_version": 2,
         "experiment_id": resolved["experiment"]["id"],

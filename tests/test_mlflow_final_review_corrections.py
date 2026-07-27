@@ -85,6 +85,20 @@ def _write_early_failure(
         },
     )
     if resolved_config is not None:
+        artifacts_root = next(
+            parent for parent in run.parents if parent.name == "artifacts"
+        )
+        repository_root = artifacts_root.parent
+        plan_path = repository_root / resolved_config["evaluation_plan_path"]
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        if not plan_path.exists():
+            plan_path.write_text(
+                yaml.safe_dump(
+                    resolved_config["evaluation_plan"],
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
         (run / "resolved_config.yaml").write_text(
             yaml.safe_dump(resolved_config, sort_keys=False), encoding="utf-8"
         )
