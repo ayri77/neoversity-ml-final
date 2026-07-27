@@ -33,10 +33,21 @@ class DeploymentModelError(ValueError):
 
 
 @dataclass(frozen=True)
+class BagPrediction:
+    seed: int
+    column: str
+    probabilities: np.ndarray
+    parameter_identity: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ComponentPrediction:
     component_id: str
     adapter_id: str
     probabilities: np.ndarray
+    row_keys: tuple[Any, ...]
+    row_identity_sha256: str
+    bags: tuple[BagPrediction, ...]
     bag_records: tuple[dict[str, Any], ...]
     summary: dict[str, Any]
 
@@ -47,6 +58,7 @@ def fit_component_bags(
     encoding: EncodingResult,
     y_train: pd.Series,
     *,
+    row_keys: tuple[Any, ...],
     estimator_factory: EstimatorFactory | None = None,
 ) -> ComponentPrediction:
     adapter_id = str(component["adapter_id"])
@@ -56,10 +68,18 @@ def fit_component_bags(
         raise DeploymentModelError("Component parameters differ from approval.")
     _validate_runtime_version(approval)
     factory = estimator_factory or _default_estimator_factory
+    if len(row_keys) != len(encoding.test):
+        raise DeploymentModelError("Test row keys and probabilities differ.")
+    row_index = pd.Index(row_keys)
+    if row_index.has_duplicates or row_index.isna().any():
+        raise DeploymentModelError("Test row keys must be unique and non-null.")
+    row_identity = canonical_sha256(list(row_keys))
     bag_probabilities: list[np.ndarray] = []
+    bags: list[BagPrediction] = []
     records: list[dict[str, Any]] = []
     seed_key = _seed_key(adapter_id)
-    for bag_index, seed in enumerate(component["bag_seeds"], start=1):
+    seeds = sorted(int(value) for value in component["bag_seeds"])
+    for bag_index, seed in enumerate(seeds, start=1):
         parameters = deepcopy(base_parameters)
         parameters[seed_key] = int(seed)
         _assert_seed_only_change(base_parameters, parameters, seed_key)
@@ -93,37 +113,75 @@ def fit_component_bags(
                 "test_rows": len(encoding.test),
                 "parameter_sha256": canonical_sha256(parameter_identity),
                 "probability_sha256": probability_hash,
+                "probability_column": (
+                    f"{component['component_id']}__seed_{int(seed)}"
+                ),
+                "row_identity_sha256": row_identity,
+                "probability_bytes": len(values) * 8,
                 "duration_seconds": perf_counter() - started,
                 "early_stopping": False,
                 "evaluation_set": False,
                 "model_persisted": False,
             }
         )
-        bag_probabilities.append(values)
-    stacked = np.vstack(bag_probabilities)
-    average = np.asarray(np.mean(stacked, axis=0, dtype=np.float64), dtype=np.float64)
+        column = f"{component['component_id']}__seed_{int(seed)}"
+        bags.append(
+            BagPrediction(
+                seed=int(seed),
+                column=column,
+                probabilities=np.asarray(values, dtype=np.float64),
+                parameter_identity=parameter_identity,
+            )
+        )
+        bag_probabilities.append(np.asarray(values, dtype=np.float64))
+    accumulator = np.zeros(len(encoding.test), dtype=np.float64)
+    for values in bag_probabilities:
+        accumulator += values
+    average = np.asarray(accumulator / len(bag_probabilities), dtype=np.float64)
     validate_positive_class_probabilities(average, expected_rows=len(encoding.test))
     summary = {
         "schema_version": 1,
         "component_id": str(component["component_id"]),
         "adapter_id": adapter_id,
-        "bag_seeds": list(component["bag_seeds"]),
+        "bag_seeds": seeds,
         "bag_count": len(bag_probabilities),
         "training_rows_per_bag": len(encoding.train),
         "all_training_rows_used": True,
         "aggregation": "arithmetic_mean",
         "component_probability_sha256": probability_sha256(average),
         "runtime_library_version": _runtime_library_version(adapter_id),
-        "row_order_sha256": canonical_sha256(list(range(len(average)))),
+        "row_identity_sha256": row_identity,
         "model_persistence": False,
     }
     return ComponentPrediction(
         component_id=str(component["component_id"]),
         adapter_id=adapter_id,
         probabilities=average,
+        row_keys=row_keys,
+        row_identity_sha256=row_identity,
+        bags=tuple(bags),
         bag_records=tuple(records),
         summary=summary,
     )
+
+
+def bag_parameter_identity(
+    component: Mapping[str, Any], approval: CandidateApproval, seed: int
+) -> dict[str, Any]:
+    adapter_id = str(component["adapter_id"])
+    parameters = model_parameters(
+        adapter_id, approval.research_run.config.adapter_contract
+    )
+    seed_key = _seed_key(adapter_id)
+    parameters = deepcopy(parameters)
+    parameters[seed_key] = int(seed)
+    return {
+        "schema_version": 1,
+        "adapter_id": adapter_id,
+        "bag_seed": int(seed),
+        "seed_parameter": seed_key,
+        "parameters": parameters,
+    }
 
 
 def build_fixed_blend(
@@ -133,13 +191,19 @@ def build_fixed_blend(
     if not components:
         raise DeploymentModelError("At least one component is required.")
     expected_rows = len(components[0].probabilities)
+    expected_keys = components[0].row_keys
+    expected_identity = components[0].row_identity_sha256
     accumulator = np.zeros(expected_rows, dtype=np.float64)
     seen: set[str] = set()
     for component in components:
         if component.component_id in seen:
             raise DeploymentModelError("Duplicate blend component ID.")
         seen.add(component.component_id)
-        if len(component.probabilities) != expected_rows:
+        if (
+            len(component.probabilities) != expected_rows
+            or component.row_keys != expected_keys
+            or component.row_identity_sha256 != expected_identity
+        ):
             raise DeploymentModelError("Component probability row alignment differs.")
         values = validate_positive_class_probabilities(
             component.probabilities,

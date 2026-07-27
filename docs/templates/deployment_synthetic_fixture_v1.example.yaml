@@ -1,0 +1,24 @@
+# Save as fixture_manifest.yaml beside exactly the four authenticated files.
+schema_version: 1
+fixture_id: 0000000000000000000000000000000000000000000000000000000000000000
+fixture_type: synthetic_noncompetition
+files:
+  train:
+    path: X_train.parquet
+    size_bytes: 1
+    sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  labels:
+    path: y_train.parquet
+    size_bytes: 1
+    sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  test:
+    path: X_test.parquet
+    size_bytes: 1
+    sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  sample_submission:
+    path: sample_submission.csv
+    size_bytes: 1
+    sha256: 0000000000000000000000000000000000000000000000000000000000000000
+generation:
+  generator_id: replace-with-synthetic-generator-id
+  seed: 0

@@ -53,8 +53,9 @@ rejected.
 
 Weights are finite nonnegative floats and must sum to one within the fixed
 absolute tolerance `1e-12`. A single component with weight `1.0` is valid. The
-threshold is a finite float in `[0, 1]`, has a mandatory evidence reference,
-and uses exact `probability >= threshold`. Output is fixed beneath
+threshold is a finite float in `[0, 1]`, is byte-for-byte equal to a typed,
+size- and SHA-256-authenticated threshold-evidence artifact tied to the completed
+run/manifest/plan/candidate, and uses exact `probability >= threshold`. Output is fixed beneath
 `artifacts/deployments/<deployment-id>/`, tracking and network access are
 disabled, model persistence is false, and existing output is never replaced.
 
@@ -90,8 +91,8 @@ vectors. It is recomputed during semantic validation before success.
 ## Submission and lifecycle
 
 Before success, P4 verifies exact test/sample row counts, exact ID order, exact
-two-column submission schema, binary nonmissing labels, absence of a CSV index
-column, deterministic positive count/rate, and an exact CSV round trip. The
+two-column submission schema, raw CSV label tokens restricted to exact `0` or `1`, absence of a CSV index
+column, and deterministic positive count/rate. The
 runner writes but never uploads `submission.csv`; any subsequent Kaggle upload
 is a separate manual action.
 
@@ -117,3 +118,34 @@ noncompetition Parquet/CSV fixtures and a caller-provided new output directory.
 `run` refuses to read competition assets unless the confirmation flag is
 present. Output is one JSON object; exit codes are `0` success, `2` contract or
 artifact validation, `3` safety refusal, and `4` execution failure.
+
+## Review-hardening invariants
+
+`approval_id` is the canonical SHA-256 of immutable approval fields. Component
+name, approver, and approval timestamp are display/audit metadata and are the
+only excluded fields; changing research, parameters, evidence, comparison,
+status, role, or component identity changes the ID. Bag seeds are canonicalized
+in ascending numeric order and float64 probabilities are accumulated in that
+order, so seed-list permutations produce identical resolved identities and
+averages.
+
+Every test row carries its authenticated ID through each per-bag vector,
+component average, fixed blend, prediction, and submission. Duplicate or null
+IDs are rejected independently in test and sample inputs, and equal-length row
+permutations are rejected. Completed validation rebuilds schemas, feature and
+encoding identities, OOF assignments, full-data mapping semantics, per-bag
+parameter/probability identities, component averages, the blend, threshold
+labels, raw submission tokens, environment, provenance, runtime state, and
+terminal lifecycle from authoritative inputs. Rebuilding the inventory and
+manifest cannot legitimize semantically altered content.
+
+All repository inputs and artifact trees are inspected without following links.
+Symlinks, Windows junctions/reparse points, mount-style escapes, multiply linked
+files, containment escapes, and input/output overlap are rejected before reads
+or writes. Dry-run fixtures must be repository-contained, synthetic,
+noncompetition trees containing exactly four files plus
+`fixture_manifest.yaml`; every file has an exact role, path, byte size, and
+SHA-256, and the fixture records generator identity and seed. Competition hashes
+and linked or extra files are prohibited. See
+[the fixture manifest template](templates/deployment_synthetic_fixture_v1.example.yaml)
+and [the threshold evidence template](templates/deployment_threshold_evidence_v1.example.yaml).

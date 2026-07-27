@@ -1,7 +1,7 @@
 # Documentation-only template. Approval is always authored manually and must
 # authenticate one semantically valid completed Experiment Core v2 run.
 schema_version: 1
-approval_id: replace-with-manual-approval-id
+approval_id: 0000000000000000000000000000000000000000000000000000000000000000 # Derived immutable SHA-256.
 component_id: replace-with-component-id
 component_name: Replace with a human-readable component name
 research_run:
@@ -17,7 +17,18 @@ research_run:
   adapter_sha256: 0000000000000000000000000000000000000000000000000000000000000000
   candidate_sha256: 0000000000000000000000000000000000000000000000000000000000000000
 fixed_resolved_model_parameters: {}
-threshold_evidence_reference: replace-with-preapproved-threshold-evidence
+threshold_evidence:
+  schema_version: 1
+  path: configs/deployment_v1/evidence/replace-with-threshold.yaml
+  size_bytes: 1
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  source_type: experiment_core_v2_manual_threshold_v1
+  source_run_id: replace-with-run-id
+  source_manifest_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  threshold: 0.5
+  threshold_policy_id: replace-with-fixed-policy-id
+  plan_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  candidate_sha256: 0000000000000000000000000000000000000000000000000000000000000000
 paired_comparison:
   reference: null
   manifest_sha256: null

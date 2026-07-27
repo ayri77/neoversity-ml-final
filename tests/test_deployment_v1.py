@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import os
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -14,9 +16,15 @@ import pytest
 import yaml
 
 from src.churn_ml.deployment_v1 import execute_deployment
+from src.churn_ml.deployment_v1_auth import (
+    derive_approval_id,
+    load_synthetic_fixture,
+)
 from src.churn_ml.deployment_v1_artifacts import (
     DeploymentArtifactError,
     DeploymentArtifactStore,
+    build_inventory,
+    build_manifest,
     build_submission,
     validate_deployment_artifacts,
 )
@@ -31,7 +39,13 @@ from src.churn_ml.deployment_v1_contracts import (
 )
 from src.churn_ml.deployment_v1_features import (
     DeploymentData,
+    DeploymentDataError,
+    _validate_sample_and_alignment,
     build_full_data_encoding,
+)
+from src.churn_ml.deployment_v1_paths import (
+    DeploymentPathError,
+    prewalk_regular_tree,
 )
 from src.churn_ml.deployment_v1_models import (
     build_fixed_blend,
@@ -124,14 +138,15 @@ def test_approval_authenticates_completed_run_and_rejects_revocation(
 
 def test_validate_never_reads_competition_paths(tmp_path: Path) -> None:
     run = _fake_run(tmp_path)
-    approval_path, _ = _approval_file(tmp_path, run)
+    approval_path, approval_payload = _approval_file(tmp_path, run)
     payload = _config_payload()
     payload["components"][0]["approval_artifact_path"] = approval_path.relative_to(
         tmp_path
     ).as_posix()
     payload["components"][0]["fixed_parameters"] = deepcopy(
-        EXPECTED_ADAPTER_CONTRACT["lightgbm"]["parameters"]
+        cast(dict[str, Any], EXPECTED_ADAPTER_CONTRACT["lightgbm"])["parameters"]
     )
+    payload["threshold"]["evidence"] = deepcopy(approval_payload["threshold_evidence"])
     config_path = _write_yaml(tmp_path / "deployment.yaml", payload)
 
     def loader(*args: Any, **kwargs: Any) -> Any:
@@ -226,7 +241,7 @@ def test_seed_bagging_uses_all_rows_and_exact_average(tmp_path: Path) -> None:
         "component_id": "manual-component",
         "adapter_id": "manual_lightgbm_te_v1_compat",
         "fixed_parameters": deepcopy(
-            EXPECTED_ADAPTER_CONTRACT["lightgbm"]["parameters"]
+            cast(dict[str, Any], EXPECTED_ADAPTER_CONTRACT["lightgbm"])["parameters"]
         ),
         "bag_seeds": [1, 3],
         "component_weight": 1.0,
@@ -236,6 +251,7 @@ def test_seed_bagging_uses_all_rows_and_exact_average(tmp_path: Path) -> None:
         approval,
         encoding,  # type: ignore[arg-type]
         target,
+        row_keys=(100, 101, 102),
         estimator_factory=factory,
     )
     second = fit_component_bags(
@@ -243,6 +259,7 @@ def test_seed_bagging_uses_all_rows_and_exact_average(tmp_path: Path) -> None:
         approval,
         encoding,  # type: ignore[arg-type]
         target,
+        row_keys=(100, 101, 102),
         estimator_factory=factory,
     )
     assert fitted_rows == [10, 10, 10, 10]
@@ -256,8 +273,20 @@ def test_seed_bagging_uses_all_rows_and_exact_average(tmp_path: Path) -> None:
 
 
 def test_fixed_blend_threshold_and_submission_round_trip() -> None:
-    left = SimpleNamespace(component_id="left", probabilities=np.array([0.25, 0.5]))
-    right = SimpleNamespace(component_id="right", probabilities=np.array([0.75, 0.0]))
+    row_keys = (9, 8)
+    row_identity = canonical_sha256(list(row_keys))
+    left = SimpleNamespace(
+        component_id="left",
+        probabilities=np.array([0.25, 0.5]),
+        row_keys=row_keys,
+        row_identity_sha256=row_identity,
+    )
+    right = SimpleNamespace(
+        component_id="right",
+        probabilities=np.array([0.75, 0.0]),
+        row_keys=row_keys,
+        row_identity_sha256=row_identity,
+    )
     blend = build_fixed_blend(
         [left, right],  # type: ignore[list-item]
         {"left": 0.5, "right": 0.5},
@@ -328,6 +357,7 @@ def test_synthetic_lifecycle_success_failure_and_tamper(
         validated=validated,
         require_success=True,
         verify_manifest=True,
+        data=data,
     )
     with pytest.raises(FileExistsError):
         execute_deployment(
@@ -339,15 +369,34 @@ def test_synthetic_lifecycle_success_failure_and_tamper(
         )
 
     component_path = output / "component_probabilities.parquet"
-    tampered = pd.read_parquet(component_path)
+    original_component = pd.read_parquet(component_path)
+    tampered = original_component.copy()
     tampered.loc[0, "manual-component"] = 0.99
     tampered.to_parquet(component_path, index=False)
+    _reauthenticate_completed_tree(output)
     with pytest.raises(DeploymentArtifactError):
         validate_deployment_artifacts(
             output,
             validated=validated,
             require_success=True,
             verify_manifest=True,
+            data=data,
+        )
+
+    original_component.to_parquet(component_path, index=False)
+    submission_path = output / "submission.csv"
+    rows = submission_path.read_text(encoding="utf-8").splitlines()
+    first_id = rows[1].split(",", maxsplit=1)[0]
+    rows[1] = f"{first_id},0.5"
+    submission_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    _reauthenticate_completed_tree(output)
+    with pytest.raises(DeploymentArtifactError, match="strict binary"):
+        validate_deployment_artifacts(
+            output,
+            validated=validated,
+            require_success=True,
+            verify_manifest=True,
+            data=data,
         )
 
     failed_root = tmp_path / "failed-output"
@@ -355,6 +404,298 @@ def test_synthetic_lifecycle_success_failure_and_tamper(
     store.fail(RuntimeError("synthetic failure"))
     assert (failed_root / "_FAILED").is_file()
     assert not (failed_root / "_SUCCESS").exists()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "duplicate_encoding_assignment",
+        "missing_encoding_assignment",
+        "forged_encoding_identity",
+        "forged_fold_assignment",
+        "forged_bag_seed",
+        "forged_bag_probability_hash",
+        "altered_component_average",
+        "altered_blend_probability",
+        "altered_threshold_summary",
+        "nonbinary_submission",
+        "wrong_train_schema",
+        "wrong_feature_identity",
+        "forged_runtime",
+        "forged_environment",
+    ],
+)
+def test_completed_semantics_reject_coherently_remanifested_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    validated, data, fixture = _execution_fixture(tmp_path)
+    monkeypatch.setattr(
+        "src.churn_ml.deployment_v1.load_deployment_data",
+        lambda *args, **kwargs: data,
+    )
+
+    def provenance(root: Path) -> dict[str, Any]:
+        return {"schema_version": 1, "root": str(root)}
+
+    monkeypatch.setattr("src.churn_ml.deployment_v1.source_provenance", provenance)
+    monkeypatch.setattr(
+        "src.churn_ml.deployment_v1_artifacts.source_provenance", provenance
+    )
+
+    class Estimator:
+        classes_ = np.array([0, 1])
+
+        def fit(self, features: pd.DataFrame, labels: pd.Series) -> None:
+            assert len(features) == len(labels)
+
+        def predict_proba(self, features: pd.DataFrame) -> np.ndarray:
+            positive = np.linspace(0.3, 0.7, len(features))
+            return np.column_stack([1.0 - positive, positive])
+
+    output = tmp_path / "completed"
+    execute_deployment(
+        validated,
+        mode="dry-run",
+        output_dir=output,
+        fixture_dir=fixture,
+        estimator_factory=lambda *_: Estimator(),
+    )
+
+    if corruption in {
+        "duplicate_encoding_assignment",
+        "missing_encoding_assignment",
+        "forged_fold_assignment",
+    }:
+        path = output / "encoding_assignments.parquet"
+        frame = pd.read_parquet(path)
+        if corruption == "duplicate_encoding_assignment":
+            frame = pd.concat([frame, frame.iloc[[0]]], ignore_index=True)
+        elif corruption == "missing_encoding_assignment":
+            frame = frame.iloc[1:].reset_index(drop=True)
+        else:
+            frame.loc[0, "encoding_fold"] = (int(frame.loc[0, "encoding_fold"]) % 3) + 1
+        frame.to_parquet(path, index=False)
+    elif corruption == "forged_encoding_identity":
+        path = output / "encoding_identity.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["components"]["manual-component"]["test_fit_performed"] = True
+        _write_json(path, payload)
+    elif corruption in {"forged_bag_seed", "forged_bag_probability_hash"}:
+        path = output / "bag_summary.csv"
+        frame = pd.read_csv(path)
+        if corruption == "forged_bag_seed":
+            frame.loc[0, "bag_seed"] = 999
+        else:
+            frame.loc[0, "probability_sha256"] = "f" * 64
+        frame.to_csv(path, index=False)
+    elif corruption == "altered_component_average":
+        path = output / "component_probabilities.parquet"
+        frame = pd.read_parquet(path)
+        frame.loc[0, "manual-component"] = 0.99
+        frame.to_parquet(path, index=False)
+    elif corruption == "altered_blend_probability":
+        path = output / "blend_probabilities.parquet"
+        frame = pd.read_parquet(path)
+        frame.loc[0, "probability"] = 0.99
+        frame.to_parquet(path, index=False)
+    elif corruption == "altered_threshold_summary":
+        path = output / "prediction_summary.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["threshold"] = 0.25
+        _write_json(path, payload)
+    elif corruption == "nonbinary_submission":
+        path = output / "submission.csv"
+        rows = path.read_text(encoding="utf-8").splitlines()
+        identifier = rows[1].split(",", maxsplit=1)[0]
+        rows[1] = f"{identifier},0.5"
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    elif corruption == "wrong_train_schema":
+        path = output / "train_schema.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["source_rows"] = 999
+        _write_json(path, payload)
+    elif corruption == "wrong_feature_identity":
+        path = output / "feature_identity.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["pipeline_id"] = "forged"
+        _write_json(path, payload)
+    elif corruption == "forged_runtime":
+        path = output / "runtime.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["network_access"] = True
+        _write_json(path, payload)
+    elif corruption == "forged_environment":
+        path = output / "environment.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["python"] = "0.0.0"
+        _write_json(path, payload)
+    else:  # pragma: no cover - guards the explicit parameter allowlist.
+        raise AssertionError(corruption)
+
+    _reauthenticate_completed_tree(output)
+    with pytest.raises(DeploymentArtifactError):
+        validate_deployment_artifacts(
+            output,
+            validated=validated,
+            require_success=True,
+            verify_manifest=True,
+            data=data,
+        )
+
+
+def test_approval_id_excludes_only_documented_audit_fields(tmp_path: Path) -> None:
+    run = _fake_run(tmp_path)
+    _, payload = _approval_file(tmp_path, run)
+    original = payload["approval_id"]
+    audit = deepcopy(payload)
+    audit["component_name"] = "Renamed display label"
+    audit["manual_approval"]["approver"] = "another-auditor"
+    audit["manual_approval"]["approved_at_utc"] = "2026-02-01T00:00:00+00:00"
+    assert derive_approval_id(audit) == original
+    immutable = deepcopy(payload)
+    immutable["fixed_resolved_model_parameters"]["n_estimators"] += 1
+    assert derive_approval_id(immutable) != original
+
+
+def test_seed_order_is_canonical_and_blend_rejects_row_permutation(
+    tmp_path: Path,
+) -> None:
+    payload = _config_payload()
+    payload["components"][0]["bag_seeds"] = [9, 1, 5]
+    loaded = load_deployment_config(
+        _write_yaml(tmp_path / "seed-order.yaml", payload), project_root=tmp_path
+    )
+    assert loaded.payload["components"][0]["bag_seeds"] == [1, 5, 9]
+    left = SimpleNamespace(
+        component_id="left",
+        probabilities=np.array([0.1, 0.9]),
+        row_keys=(10, 11),
+        row_identity_sha256=canonical_sha256([10, 11]),
+    )
+    permuted = SimpleNamespace(
+        component_id="right",
+        probabilities=np.array([0.9, 0.1]),
+        row_keys=(11, 10),
+        row_identity_sha256=canonical_sha256([11, 10]),
+    )
+    with pytest.raises(ValueError, match="row alignment"):
+        build_fixed_blend(
+            [left, permuted],  # type: ignore[list-item]
+            {"left": 0.5, "right": 0.5},
+        )
+
+
+@pytest.mark.parametrize("which", ["test", "sample"])
+@pytest.mark.parametrize("bad", ["duplicate", "null"])
+def test_test_and_submission_ids_reject_duplicates_and_nulls_independently(
+    tmp_path: Path,
+    which: str,
+    bad: str,
+) -> None:
+    config = DeploymentConfig(_config_payload(), tmp_path / "c.yaml", tmp_path)
+    test = pd.DataFrame({"index": pd.Series([10, 11, 12], dtype="Int64")})
+    sample = pd.DataFrame(
+        {"index": pd.Series([10, 11, 12], dtype="Int64"), "y": [0, 0, 0]}
+    )
+    target = test if which == "test" else sample
+    target.loc[1, "index"] = target.loc[0, "index"] if bad == "duplicate" else pd.NA
+    with pytest.raises(DeploymentDataError, match="duplicates|null"):
+        _validate_sample_and_alignment(test, sample, config, False)
+
+
+def test_authenticated_fixture_rejects_extra_and_linked_files(tmp_path: Path) -> None:
+    _, _, fixture = _execution_fixture(tmp_path)
+    (fixture / "extra.txt").write_text("extra", encoding="utf-8")
+    with pytest.raises(ValueError, match="extra"):
+        load_synthetic_fixture(
+            fixture, project_root=tmp_path, forbidden_hashes={"0" * 64}
+        )
+    (fixture / "extra.txt").unlink()
+    link = fixture / "linked.csv"
+    try:
+        os.link(fixture / "sample_submission.csv", link)
+    except OSError:
+        pytest.skip("Hard-link creation is unavailable on this filesystem.")
+    if os.stat(link, follow_symlinks=False).st_nlink <= 1:
+        pytest.skip("Filesystem does not report hard-link counts.")
+    with pytest.raises(ValueError, match="linked"):
+        prewalk_regular_tree(fixture, reject_hardlinks=True)
+
+
+def test_tree_prewalk_rejects_root_reparse_link(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file.txt").write_text("safe", encoding="utf-8")
+    link = tmp_path / "linked-root"
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(source)],
+            check=False,
+            capture_output=True,
+        )
+        if created.returncode != 0:
+            pytest.skip("Junction creation is unavailable on this Windows host.")
+    else:
+        try:
+            link.symlink_to(source, target_is_directory=True)
+        except OSError:
+            pytest.skip("Directory-link creation is unavailable.")
+    with pytest.raises(DeploymentPathError, match="junctions|reparse|Links"):
+        prewalk_regular_tree(link, reject_hardlinks=True)
+
+
+def _reauthenticate_completed_tree(root: Path) -> None:
+    inventory = build_inventory(root)
+    _write_json(root / "artifact_inventory.json", inventory)
+    manifest = build_manifest(root)
+    _write_json(root / "manifest.json", manifest)
+    _write_json(
+        root / "_SUCCESS",
+        {
+            "schema_version": 1,
+            "manifest_sha256": manifest["manifest_sha256"],
+            "completed_at_utc": "2026-01-01T00:00:00+00:00",
+        },
+    )
+
+
+def _threshold_reference() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "path": "evidence/threshold.yaml",
+        "size_bytes": 1,
+        "sha256": "a" * 64,
+        "source_type": "experiment_core_v2_manual_threshold_v1",
+        "source_run_id": "run-one",
+        "source_manifest_sha256": "5" * 64,
+        "threshold": 0.5,
+        "threshold_policy_id": "fixed_manual_threshold_v1",
+        "plan_sha256": "1" * 64,
+        "candidate_sha256": "4" * 64,
+    }
+
+
+def _write_threshold_evidence(tmp_path: Path, run: Any) -> dict[str, Any]:
+    artifact = {
+        "schema_version": 1,
+        "source_type": "experiment_core_v2_manual_threshold_v1",
+        "source_run_id": run.metadata["run_id"],
+        "source_manifest_sha256": run.manifest["manifest_sha256"],
+        "threshold": 0.5,
+        "threshold_policy_id": "fixed_manual_threshold_v1",
+        "plan_sha256": "1" * 64,
+        "candidate_sha256": "4" * 64,
+    }
+    path = _write_yaml(tmp_path / "evidence/threshold.yaml", artifact)
+    raw = path.read_bytes()
+    return {
+        **artifact,
+        "path": path.relative_to(tmp_path).as_posix(),
+        "size_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
 
 
 def _config_payload() -> dict[str, Any]:
@@ -379,7 +720,7 @@ def _config_payload() -> dict[str, Any]:
         },
         "threshold": {
             "value": 0.5,
-            "source_reference": "synthetic-threshold-evidence",
+            "evidence": _threshold_reference(),
             "comparison": "greater_than_or_equal",
         },
         "bagging": {
@@ -466,7 +807,7 @@ def _fake_run(tmp_path: Path) -> Any:
 def _approval_file(tmp_path: Path, run: Any) -> tuple[Path, dict[str, Any]]:
     payload = {
         "schema_version": 1,
-        "approval_id": "manual-approval",
+        "approval_id": "0" * 64,
         "component_id": "manual-component",
         "component_name": "Synthetic manual component",
         "research_run": {
@@ -483,9 +824,9 @@ def _approval_file(tmp_path: Path, run: Any) -> tuple[Path, dict[str, Any]]:
             "candidate_sha256": "4" * 64,
         },
         "fixed_resolved_model_parameters": deepcopy(
-            EXPECTED_ADAPTER_CONTRACT["lightgbm"]["parameters"]
+            cast(dict[str, Any], EXPECTED_ADAPTER_CONTRACT["lightgbm"])["parameters"]
         ),
-        "threshold_evidence_reference": "synthetic-threshold-evidence",
+        "threshold_evidence": _write_threshold_evidence(tmp_path, run),
         "paired_comparison": {
             "reference": None,
             "manifest_sha256": None,
@@ -501,6 +842,7 @@ def _approval_file(tmp_path: Path, run: Any) -> tuple[Path, dict[str, Any]]:
         },
         "intended_deployment_role": "synthetic-test-only",
     }
+    payload["approval_id"] = derive_approval_id(payload)
     path = _write_yaml(tmp_path / "approvals/manual.yaml", payload)
     return path, payload
 
@@ -518,8 +860,9 @@ def _execution_fixture(
     )
     payload = _config_payload()
     payload["components"][0]["fixed_parameters"] = deepcopy(
-        EXPECTED_ADAPTER_CONTRACT["lightgbm"]["parameters"]
+        cast(dict[str, Any], EXPECTED_ADAPTER_CONTRACT["lightgbm"])["parameters"]
     )
+    payload["threshold"]["evidence"] = deepcopy(approval_payload["threshold_evidence"])
     config_path = _write_yaml(tmp_path / "deployment.yaml", payload)
     config = DeploymentConfig(payload, config_path, tmp_path)
     identity = {"schema_version": 1, "synthetic": True}
@@ -566,16 +909,46 @@ def _execution_fixture(
         train_schema={"synthetic": True},
         test_schema={"synthetic": True},
         dataset_identity=dataset_identity,
+        test_row_keys=(100, 101, 102),
+        test_row_identity_sha256=canonical_sha256([100, 101, 102]),
+        fixture_identity={},
     )
     fixture = tmp_path / "fixture"
     fixture.mkdir()
-    for name in (
-        "X_train.parquet",
-        "y_train.parquet",
-        "X_test.parquet",
-        "sample_submission.csv",
-    ):
-        (fixture / name).touch()
+    X_train.to_parquet(fixture / "X_train.parquet", index=False)
+    y_train.to_frame().to_parquet(fixture / "y_train.parquet", index=False)
+    X_test.to_parquet(fixture / "X_test.parquet", index=False)
+    sample.to_csv(fixture / "sample_submission.csv", index=False)
+    files = {}
+    for role, name in {
+        "train": "X_train.parquet",
+        "labels": "y_train.parquet",
+        "test": "X_test.parquet",
+        "sample_submission": "sample_submission.csv",
+    }.items():
+        raw = (fixture / name).read_bytes()
+        files[role] = {
+            "path": name,
+            "size_bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    manifest = {
+        "schema_version": 1,
+        "fixture_id": "0" * 64,
+        "fixture_type": "synthetic_noncompetition",
+        "files": files,
+        "generation": {"generator_id": "pytest_fixture_v1", "seed": 42},
+    }
+    manifest["fixture_id"] = canonical_sha256(
+        {key: value for key, value in manifest.items() if key != "fixture_id"}
+    )
+    _write_yaml(fixture / "fixture_manifest.yaml", manifest)
+    authenticated = load_synthetic_fixture(
+        fixture, project_root=tmp_path, forbidden_hashes={"0" * 64}
+    )
+    data = DeploymentData(
+        **{**data.__dict__, "fixture_identity": authenticated.identity}
+    )
     return validated, data, fixture
 
 

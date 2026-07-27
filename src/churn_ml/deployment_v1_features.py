@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 
+from src.churn_ml.deployment_v1_auth import SyntheticFixture
 from src.churn_ml.deployment_v1_contracts import (
     DeploymentConfig,
     ValidatedDeployment,
+)
+from src.churn_ml.deployment_v1_paths import (
+    DeploymentPathError,
+    validate_regular_file,
 )
 from src.churn_ml.experiment_v2 import get_feature_pipeline
 from src.churn_ml.experiment_v2_numeric_adapter import validate_numeric_matrix
@@ -36,6 +40,9 @@ class DeploymentData:
     train_schema: dict[str, Any]
     test_schema: dict[str, Any]
     dataset_identity: dict[str, Any]
+    test_row_keys: tuple[Any, ...]
+    test_row_identity_sha256: str
+    fixture_identity: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -49,31 +56,41 @@ class EncodingResult:
 def load_deployment_data(
     validated: ValidatedDeployment,
     *,
-    fixture_dir: Path | None = None,
+    fixture: SyntheticFixture | None = None,
 ) -> DeploymentData:
     """Load test/sample only after approval and config validation has succeeded."""
     config = validated.config
-    if fixture_dir is None:
+    if fixture is None:
         training = load_research_v2_training_data(
             validated.approvals[0].research_run.config
         )
         source_train = _load_source_train(validated)
         y_train = training.y.copy()
-        test_path = config.project_root / config.payload["test_data"]["path"]
-        sample_path = config.project_root / config.payload["sample_submission"]["path"]
+        try:
+            test_path = validate_regular_file(
+                config.project_root / config.payload["test_data"]["path"],
+                containment_root=config.project_root,
+                reject_hardlinks=True,
+            )
+            sample_path = validate_regular_file(
+                config.project_root / config.payload["sample_submission"]["path"],
+                containment_root=config.project_root,
+                reject_hardlinks=True,
+            )
+        except DeploymentPathError as error:
+            raise DeploymentDataError(str(error)) from error
     else:
-        fixture = fixture_dir.resolve()
-        source_train = pd.read_parquet(fixture / "X_train.parquet")
-        target = pd.read_parquet(fixture / "y_train.parquet")
+        source_train = pd.read_parquet(fixture.paths["train"])
+        target = pd.read_parquet(fixture.paths["labels"])
         if target.shape[1] != 1:
             raise DeploymentDataError("Fixture target must have exactly one column.")
         y_train = target.iloc[:, 0]
-        test_path = fixture / "X_test.parquet"
-        sample_path = fixture / "sample_submission.csv"
+        test_path = fixture.paths["test"]
+        sample_path = fixture.paths["sample_submission"]
 
     test_file_sha256 = hashlib.sha256(test_path.read_bytes()).hexdigest()
     sample_file_sha256 = hashlib.sha256(sample_path.read_bytes()).hexdigest()
-    if fixture_dir is None:
+    if fixture is None:
         if test_file_sha256 != config.payload["test_data"]["sha256"]:
             raise DeploymentDataError("Competition test file hash differs.")
         if sample_file_sha256 != config.payload["sample_submission"]["sha256"]:
@@ -81,7 +98,9 @@ def load_deployment_data(
     source_test = pd.read_parquet(test_path)
     sample = pd.read_csv(sample_path)
     _validate_source_frames(source_train, y_train, source_test)
-    _validate_sample_and_alignment(source_test, sample, config, fixture_dir is None)
+    test_row_keys, test_row_identity = _validate_sample_and_alignment(
+        source_test, sample, config, fixture is None
+    )
     pipeline = get_feature_pipeline(config.payload["pipeline_id"])
     pipeline_contract = validated.approvals[0].research_run.config.pipeline_contract
     train_output = pipeline.transform(source_train, pipeline_contract)
@@ -89,11 +108,11 @@ def load_deployment_data(
     if train_output.schema.to_dict() != test_output.schema.to_dict():
         raise DeploymentDataError("Train/test pipeline schemas differ.")
 
-    train_schema = _schema_record(source_train, train_output.features)
-    test_schema = _schema_record(source_test, test_output.features)
+    train_schema = schema_record(source_train, train_output.features)
+    test_schema = schema_record(source_test, test_output.features)
     expected_schema = config.payload["test_data"]["ordered_schema_sha256"]
     if (
-        fixture_dir is None
+        fixture is None
         and train_schema["source_ordered_names_sha256"] != expected_schema
     ):
         raise DeploymentDataError("Configured competition test schema hash differs.")
@@ -105,7 +124,7 @@ def load_deployment_data(
         "test_file_sha256": test_file_sha256,
         "sample_submission_file_sha256": sample_file_sha256,
         "train_row_order_sha256": canonical_sha256(list(range(len(source_train)))),
-        "test_row_order_sha256": canonical_sha256(list(range(len(source_test)))),
+        "test_row_order_sha256": test_row_identity,
         "target_sha256": canonical_sha256(
             {
                 "name": str(y_train.name),
@@ -114,7 +133,7 @@ def load_deployment_data(
             }
         ),
         "test_id_sha256": canonical_sha256(
-            source_test[config.payload["test_data"].get("id_column", "index")].tolist()
+            source_test[config.payload["sample_submission"]["id_column"]].tolist()
         ),
         "sample_id_sha256": canonical_sha256(
             sample[config.payload["sample_submission"]["id_column"]].tolist()
@@ -130,6 +149,26 @@ def load_deployment_data(
         train_schema=train_schema,
         test_schema=test_schema,
         dataset_identity=dataset_identity,
+        test_row_keys=test_row_keys,
+        test_row_identity_sha256=test_row_identity,
+        fixture_identity=(
+            fixture.identity
+            if fixture is not None
+            else {
+                "schema_version": 1,
+                "mode": "competition",
+                "sha256": canonical_sha256(
+                    {
+                        "test_sha256": test_file_sha256,
+                        "sample_sha256": sample_file_sha256,
+                    }
+                ),
+                "canonical": {
+                    "test_sha256": test_file_sha256,
+                    "sample_sha256": sample_file_sha256,
+                },
+            }
+        ),
     )
 
 
@@ -200,13 +239,13 @@ def build_full_data_encoding(
         "schema_version": 1,
         "method": "deterministic_oof_train_full_mapping_test",
         "encoder_contract": dict(encoder_contract),
-        "assignment_sha256": _frame_sha256(assignments),
+        "assignment_sha256": frame_sha256(assignments),
         "categorical_columns": list(encoder.categorical_columns_),
         "passthrough_columns": list(encoder.passthrough_columns_),
         "transformed_columns": encoded_train.columns.tolist(),
         "full_data_mappings": mappings,
-        "train_matrix_sha256": _numeric_frame_sha256(encoded_train),
-        "test_matrix_sha256": _numeric_frame_sha256(encoded_test),
+        "train_matrix_sha256": numeric_frame_sha256(encoded_train),
+        "test_matrix_sha256": numeric_frame_sha256(encoded_test),
         "test_fit_performed": False,
         "imputation_performed": False,
     }
@@ -223,6 +262,14 @@ def _load_source_train(validated: ValidatedDeployment) -> pd.DataFrame:
     dataset = first.config.plan_payload["dataset"]
     item = dataset["files"]["train_features"]
     path = first.config.dataset_dir / str(item["name"])
+    try:
+        path = validate_regular_file(
+            path,
+            containment_root=validated.config.project_root,
+            reject_hardlinks=True,
+        )
+    except DeploymentPathError as error:
+        raise DeploymentDataError(str(error)) from error
     source = pd.read_parquet(path)
     for approval in validated.approvals[1:]:
         if approval.research_run.dataset_fingerprints != first.dataset_fingerprints:
@@ -266,7 +313,7 @@ def _validate_sample_and_alignment(
     sample: pd.DataFrame,
     config: DeploymentConfig,
     enforce_configured_rows: bool,
-) -> None:
+) -> tuple[tuple[Any, ...], str]:
     sample_config = config.payload["sample_submission"]
     test_config = config.payload["test_data"]
     expected_rows = int(sample_config["expected_rows"])
@@ -282,15 +329,23 @@ def _validate_sample_and_alignment(
     test_id = str(test_config.get("id_column", sample_config["id_column"]))
     if test_id not in test.columns:
         raise DeploymentDataError("Configured test ID column is absent.")
-    if (
-        not test[test_id]
-        .reset_index(drop=True)
-        .equals(sample[sample_config["id_column"]].reset_index(drop=True))
-    ):
+    test_ids = test[test_id].reset_index(drop=True)
+    sample_ids = sample[sample_config["id_column"]].reset_index(drop=True)
+    for values, label in ((test_ids, "Test"), (sample_ids, "Sample submission")):
+        if values.isna().any():
+            raise DeploymentDataError(f"{label} IDs contain null values.")
+        if values.duplicated().any():
+            raise DeploymentDataError(f"{label} IDs contain duplicates.")
+    if str(test_ids.dtype) != str(sample_ids.dtype):
+        raise DeploymentDataError("Test and sample ID dtypes differ.")
+    if not test_ids.equals(sample_ids):
         raise DeploymentDataError("Test and sample ID/order alignment differs.")
+    keys = tuple(test_ids.tolist())
+    identity = canonical_sha256(list(keys))
+    return keys, identity
 
 
-def _schema_record(source: pd.DataFrame, model: pd.DataFrame) -> dict[str, Any]:
+def schema_record(source: pd.DataFrame, model: pd.DataFrame) -> dict[str, Any]:
     source_dtypes = [
         {"name": str(name), "dtype": str(dtype)}
         for name, dtype in source.dtypes.items()
@@ -322,7 +377,7 @@ def _array_sha256(values: Any) -> str:
     return digest.hexdigest()
 
 
-def _numeric_frame_sha256(frame: pd.DataFrame) -> str:
+def numeric_frame_sha256(frame: pd.DataFrame) -> str:
     digest = hashlib.sha256()
     digest.update(canonical_sha256(frame.columns.tolist()).encode("ascii"))
     digest.update(
@@ -331,7 +386,7 @@ def _numeric_frame_sha256(frame: pd.DataFrame) -> str:
     return digest.hexdigest()
 
 
-def _frame_sha256(frame: pd.DataFrame) -> str:
+def frame_sha256(frame: pd.DataFrame) -> str:
     return hashlib.sha256(
         frame.to_csv(index=False, lineterminator="\n").encode("utf-8")
     ).hexdigest()

@@ -5,13 +5,24 @@ import json
 import math
 import re
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Mapping
 
 import yaml
 
+from src.churn_ml.deployment_v1_auth import (
+    THRESHOLD_REFERENCE_KEYS,
+    approval_identity,
+    derive_approval_id,
+    load_threshold_evidence,
+)
+from src.churn_ml.deployment_v1_paths import (
+    DeploymentPathError,
+    prewalk_regular_tree,
+    validate_regular_file,
+)
 from src.churn_ml.experiment_v2_model_registry import get_candidate_adapter
 from src.churn_ml.paired_comparison import (
     CompletedResearchV2Run,
@@ -39,7 +50,7 @@ APPROVAL_KEYS = {
     "component_name",
     "research_run",
     "fixed_resolved_model_parameters",
-    "threshold_evidence_reference",
+    "threshold_evidence",
     "paired_comparison",
     "manual_approval",
     "intended_deployment_role",
@@ -84,7 +95,7 @@ COMPONENT_KEYS = {
     "component_weight",
 }
 BLEND_KEYS = {"method", "weight_sum_tolerance"}
-THRESHOLD_KEYS = {"value", "source_reference", "comparison"}
+THRESHOLD_KEYS = {"value", "evidence", "comparison"}
 BAGGING_KEYS = {"method", "aggregation", "model_persistence"}
 TEST_DATA_KEYS = {"path", "sha256", "expected_rows", "ordered_schema_sha256"}
 SAMPLE_KEYS = {
@@ -108,6 +119,8 @@ class CandidateApproval:
     source_path: Path
     source_sha256: str
     research_run: CompletedResearchV2Run
+    threshold_identity: dict[str, Any] = field(default_factory=dict)
+    identity: dict[str, Any] = field(default_factory=dict)
 
     @property
     def approval_id(self) -> str:
@@ -167,10 +180,9 @@ def load_candidate_approval(
     _exact_keys(payload, APPROVAL_KEYS, "approval")
     if _integer(payload["schema_version"], "approval.schema_version") != 1:
         raise DeploymentContractError("approval.schema_version must be 1.")
-    _slug(payload["approval_id"], "approval.approval_id")
+    _sha(payload["approval_id"], "approval.approval_id")
     _slug(payload["component_id"], "approval.component_id")
     _string(payload["component_name"], "approval.component_name")
-    _string(payload["threshold_evidence_reference"], "threshold evidence reference")
     _string(payload["intended_deployment_role"], "intended deployment role")
 
     reference = _mapping(payload["research_run"], "approval.research_run")
@@ -178,6 +190,17 @@ def load_candidate_approval(
     run_path = portable_repository_path(
         reference["path"], root, "approval.research_run.path"
     )
+    try:
+        unresolved_run_path = (
+            root / Path(*PurePosixPath(str(reference["path"])).parts)
+        ).absolute()
+        prewalk_regular_tree(
+            unresolved_run_path,
+            containment_roots=(root,),
+            reject_hardlinks=True,
+        )
+    except DeploymentPathError as error:
+        raise DeploymentContractError(str(error)) from error
     for key in ("run_id", "plan_id", "pipeline_id", "adapter_id"):
         _slug(reference[key], f"approval.research_run.{key}")
     for key in (
@@ -222,6 +245,17 @@ def load_candidate_approval(
         comparison_path = portable_repository_path(
             paired["reference"], root, "approval.paired_comparison.reference"
         )
+        try:
+            unresolved_comparison_path = (
+                root / Path(*PurePosixPath(str(paired["reference"])).parts)
+            ).absolute()
+            prewalk_regular_tree(
+                unresolved_comparison_path,
+                containment_roots=(root,),
+                reject_hardlinks=True,
+            )
+        except DeploymentPathError as error:
+            raise DeploymentContractError(str(error)) from error
         _sha(
             paired["manifest_sha256"],
             "approval.paired_comparison.manifest_sha256",
@@ -269,12 +303,25 @@ def load_candidate_approval(
         role="approved_research_run",
     )
     _authenticate_research_reference(reference, parameters, run)
+    try:
+        threshold_identity = load_threshold_evidence(
+            payload["threshold_evidence"], project_root=root, research_run=run
+        )
+    except ValueError as error:
+        raise DeploymentContractError(str(error)) from error
+    if payload["approval_id"] != derive_approval_id(payload):
+        raise DeploymentContractError(
+            "approval_id is not the deterministic immutable identity."
+        )
+    identity = approval_identity(payload)
     raw = source.read_bytes()
     return CandidateApproval(
         payload=deepcopy(payload),
         source_path=source,
         source_sha256=hashlib.sha256(raw).hexdigest(),
         research_run=run,
+        threshold_identity=threshold_identity,
+        identity=identity,
     )
 
 
@@ -331,6 +378,8 @@ def load_deployment_config(
         ]
         if len(set(parsed_seeds)) != len(parsed_seeds):
             raise DeploymentContractError(f"{label}.bag_seeds contains duplicates.")
+        payload["components"][index]["bag_seeds"] = sorted(parsed_seeds)
+        payload["components"][index]["bag_seeds"] = sorted(parsed_seeds)
         weight = _finite_float(component["component_weight"], f"{label}.weight")
         if weight < 0.0:
             raise DeploymentContractError("Component weights must be nonnegative.")
@@ -355,7 +404,25 @@ def load_deployment_config(
     threshold_value = _finite_float(threshold["value"], "threshold.value")
     if not 0.0 <= threshold_value <= 1.0:
         raise DeploymentContractError("threshold.value must be within [0, 1].")
-    _string(threshold["source_reference"], "threshold.source_reference")
+    evidence = _mapping(threshold["evidence"], "threshold.evidence")
+    _exact_keys(evidence, THRESHOLD_REFERENCE_KEYS, "threshold.evidence")
+    if _integer(evidence["schema_version"], "threshold.evidence.schema_version") != 1:
+        raise DeploymentContractError("threshold evidence schema must be 1.")
+    portable_repository_path(evidence["path"], root, "threshold.evidence.path")
+    _positive_integer(evidence["size_bytes"], "threshold.evidence.size_bytes")
+    for key in ("sha256", "source_manifest_sha256", "plan_sha256", "candidate_sha256"):
+        _sha(evidence[key], f"threshold.evidence.{key}")
+    if evidence["source_type"] != "experiment_core_v2_manual_threshold_v1":
+        raise DeploymentContractError("threshold evidence source_type differs.")
+    _slug(evidence["source_run_id"], "threshold.evidence.source_run_id")
+    _slug(evidence["threshold_policy_id"], "threshold.evidence.threshold_policy_id")
+    evidence_threshold = _finite_float(
+        evidence["threshold"], "threshold.evidence.threshold"
+    )
+    if evidence_threshold != threshold_value:
+        raise DeploymentContractError(
+            "threshold.value differs from threshold evidence."
+        )
     if threshold["comparison"] != "greater_than_or_equal":
         raise DeploymentContractError("threshold.comparison must encode exact >=.")
 
@@ -463,7 +530,7 @@ def validate_loaded_deployment(
         item.payload["research_run"]["pipeline_sha256"] for item in approvals
     }
     threshold_references = {
-        item.payload["threshold_evidence_reference"] for item in approvals
+        canonical_sha256(item.payload["threshold_evidence"]) for item in approvals
     }
     if len(dataset_hashes) != 1:
         raise DeploymentContractError(
@@ -473,7 +540,9 @@ def validate_loaded_deployment(
         raise DeploymentContractError(
             "Approved components do not share exact pipeline identity."
         )
-    if threshold_references != {config.payload["threshold"]["source_reference"]}:
+    if threshold_references != {
+        canonical_sha256(config.payload["threshold"]["evidence"])
+    }:
         raise DeploymentContractError(
             "Deployment threshold evidence differs from component approvals."
         )
@@ -487,6 +556,8 @@ def validate_loaded_deployment(
                 "research_manifest_sha256": item.payload["research_run"][
                     "manifest_sha256"
                 ],
+                "approval_identity_sha256": item.identity["sha256"],
+                "threshold_identity_sha256": item.threshold_identity["sha256"],
             }
             for item in approvals
         ],
@@ -631,10 +702,12 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _contained_file(path: Path, root: Path, label: str) -> Path:
     source = path if path.is_absolute() else root / path
-    resolved = source.resolve()
-    if root not in resolved.parents or not resolved.is_file():
-        raise DeploymentContractError(f"{label} must be a repository-contained file.")
-    return resolved
+    try:
+        return validate_regular_file(
+            source, containment_root=root, reject_hardlinks=True
+        )
+    except DeploymentPathError as error:
+        raise DeploymentContractError(f"{label} is unsafe: {error}") from error
 
 
 def _mapping(value: Any, label: str) -> dict[str, Any]:

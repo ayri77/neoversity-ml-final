@@ -12,6 +12,15 @@ from typing import Any, Iterator
 import numpy as np
 import pandas as pd
 
+from src.churn_ml.deployment_v1_auth import (
+    SyntheticFixture,
+    load_synthetic_fixture,
+)
+from src.churn_ml.deployment_v1_paths import (
+    prewalk_regular_tree,
+    validate_new_path,
+    validate_regular_file,
+)
 from src.churn_ml.deployment_v1_artifacts import (
     DeploymentArtifactError,
     DeploymentArtifactStore,
@@ -56,24 +65,31 @@ def execute_deployment(
 ) -> DeploymentExecution:
     if mode not in {"dry-run", "run"}:
         raise ValueError("Deployment execution mode must be dry-run or run.")
+    fixture: SyntheticFixture | None = None
     if mode == "dry-run":
         if fixture_dir is None or output_dir is None:
             raise ValueError("dry-run requires fixture_dir and output_dir.")
-        root = output_dir.resolve()
-        _assert_dry_run_paths(validated, fixture_dir.resolve(), root)
+        root = output_dir.absolute()
+        fixture = _assert_dry_run_paths(validated, fixture_dir, root)
     else:
         if fixture_dir is not None or output_dir is not None:
             raise ValueError("run cannot accept dry-run path overrides.")
-        root = (validated.config.output_root / validated.config.deployment_id).resolve()
-    _assert_inputs_outputs_disjoint(validated, root, fixture_dir)
-    before = _input_authentication(validated)
+        root = (
+            validated.config.project_root
+            / Path(validated.config.payload["output"]["root"])
+            / validated.config.deployment_id
+        ).absolute()
+    _assert_inputs_outputs_disjoint(
+        validated, root, fixture.root if fixture is not None else None
+    )
+    before = _input_authentication(validated, fixture)
     store: DeploymentArtifactStore | None = None
     started = perf_counter()
     started_at = datetime.now(timezone.utc)
     try:
         store = DeploymentArtifactStore(root)
         # Test/sample loading remains behind complete approval validation.
-        data = load_deployment_data(validated, fixture_dir=fixture_dir)
+        data = load_deployment_data(validated, fixture=fixture)
         encodings: dict[str, EncodingResult] = {}
         encoding_identities: dict[str, Any] = {}
         common_assignments: pd.DataFrame | None = None
@@ -116,6 +132,7 @@ def execute_deployment(
                 approval,
                 encoding,
                 data.y_train,
+                row_keys=data.test_row_keys,
                 estimator_factory=estimator_factory,
             )
             predictions.append(result)
@@ -153,6 +170,7 @@ def execute_deployment(
                 approval.payload,
             )
         store.write_json("dataset_identity.json", data.dataset_identity)
+        store.write_json("fixture_identity.json", data.fixture_identity)
         store.write_json("train_schema.json", data.train_schema)
         store.write_json("test_schema.json", data.test_schema)
         pipeline_identity = validated.approvals[0].research_run.evaluation_plan_identity
@@ -185,14 +203,28 @@ def execute_deployment(
         )
         store.write_csv("bag_summary.csv", pd.DataFrame.from_records(bag_records))
         component_frame = pd.DataFrame(
-            {"row_position": np.arange(len(blend), dtype=np.int64)}
+            {
+                "row_position": np.arange(len(blend), dtype=np.int64),
+                "row_id": list(data.test_row_keys),
+            }
         )
         for item in predictions:
             component_frame[item.component_id] = item.probabilities
         store.write_parquet("component_probabilities.parquet", component_frame)
+        bag_frame = pd.DataFrame(
+            {
+                "row_position": np.arange(len(blend), dtype=np.int64),
+                "row_id": list(data.test_row_keys),
+            }
+        )
+        for item in predictions:
+            for bag in item.bags:
+                bag_frame[bag.column] = bag.probabilities
+        store.write_parquet("bag_probabilities.parquet", bag_frame)
         blend_frame = pd.DataFrame(
             {
                 "row_position": np.arange(len(blend), dtype=np.int64),
+                "row_id": list(data.test_row_keys),
                 "probability": blend,
                 "prediction": labels,
             }
@@ -216,6 +248,7 @@ def execute_deployment(
             "runtime.json",
             {
                 "schema_version": 1,
+                "status": "completed",
                 "mode": mode,
                 "started_at_utc": started_at.isoformat(),
                 "finished_at_utc": finished_at.isoformat(),
@@ -230,11 +263,11 @@ def execute_deployment(
             "source_provenance.json",
             source_provenance(validated.config.project_root),
         )
-        if _input_authentication(validated) != before:
+        if _input_authentication(validated, fixture) != before:
             raise DeploymentArtifactError(
                 "Approval or research inputs changed during deployment."
             )
-        store.complete(validated)
+        store.complete(validated, data=data)
         return DeploymentExecution(
             root=root,
             deployment_identity_sha256=validated.identity_sha256,
@@ -274,34 +307,31 @@ def _assert_dry_run_paths(
     validated: ValidatedDeployment,
     fixture_dir: Path,
     output_dir: Path,
-) -> None:
-    if not fixture_dir.is_dir():
-        raise ValueError("Dry-run fixture directory does not exist.")
-    required = {
-        "X_train.parquet",
-        "y_train.parquet",
-        "X_test.parquet",
-        "sample_submission.csv",
+) -> SyntheticFixture:
+    forbidden_hashes = {
+        str(validated.config.payload["test_data"]["sha256"]),
+        str(validated.config.payload["sample_submission"]["sha256"]),
     }
-    actual = {item.name for item in fixture_dir.iterdir() if item.is_file()}
-    if not required.issubset(actual):
-        raise ValueError(
-            f"Dry-run fixture files are missing: {sorted(required - actual)}."
-        )
+    fixture = load_synthetic_fixture(
+        fixture_dir,
+        project_root=validated.config.project_root,
+        forbidden_hashes=forbidden_hashes,
+    )
     configured = {
         (
             validated.config.project_root
             / validated.config.payload["test_data"]["path"]
-        ).resolve(),
+        ).resolve(strict=False),
         (
             validated.config.project_root
             / validated.config.payload["sample_submission"]["path"]
-        ).resolve(),
+        ).resolve(strict=False),
     }
-    if any(path == fixture_dir or fixture_dir in path.parents for path in configured):
+    if any(path == fixture.root or fixture.root in path.parents for path in configured):
         raise ValueError("Dry-run fixtures overlap configured competition paths.")
     if output_dir.exists():
         raise FileExistsError("Dry-run output directory already exists.")
+    return fixture
 
 
 def _assert_inputs_outputs_disjoint(
@@ -309,6 +339,7 @@ def _assert_inputs_outputs_disjoint(
     output: Path,
     fixture_dir: Path | None,
 ) -> None:
+    output = validate_new_path(output)
     inputs = [
         validated.config.source_path,
         *[item.source_path for item in validated.approvals],
@@ -336,8 +367,15 @@ def _assert_inputs_outputs_disjoint(
         raise FileExistsError("Deployment output already exists.")
 
 
-def _input_authentication(validated: ValidatedDeployment) -> dict[str, str]:
-    records: dict[str, str] = {}
+def _input_authentication(
+    validated: ValidatedDeployment,
+    fixture: SyntheticFixture | None,
+) -> dict[str, str]:
+    records: dict[str, str] = {
+        validated.config.source_path.relative_to(
+            validated.config.project_root
+        ).as_posix(): _tree_sha256(validated.config.source_path)
+    }
     for approval in validated.approvals:
         records[
             approval.source_path.relative_to(validated.config.project_root).as_posix()
@@ -347,18 +385,21 @@ def _input_authentication(validated: ValidatedDeployment) -> dict[str, str]:
                 validated.config.project_root
             ).as_posix()
         ] = _tree_sha256(approval.research_run.root)
+    if fixture is not None:
+        records[fixture.root.relative_to(validated.config.project_root).as_posix()] = (
+            _tree_sha256(fixture.root)
+        )
     return records
 
 
 def _tree_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     if path.is_file():
-        digest.update(path.read_bytes())
+        safe = validate_regular_file(path, reject_hardlinks=True)
+        digest.update(safe.read_bytes())
         return digest.hexdigest()
-    for item in sorted(
-        (entry for entry in path.rglob("*") if entry.is_file()),
-        key=lambda entry: entry.relative_to(path).as_posix(),
-    ):
-        digest.update(item.relative_to(path).as_posix().encode("utf-8"))
-        digest.update(item.read_bytes())
+    tree = prewalk_regular_tree(path, reject_hardlinks=True)
+    for relative in sorted(tree.files, key=lambda item: item.as_posix()):
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update((tree.root / relative).read_bytes())
     return digest.hexdigest()

@@ -5,7 +5,7 @@ import json
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -78,7 +78,9 @@ def test_tiny_real_full_data_deployment_adapter(
         "bag_seeds": [7],
         "component_weight": 1.0,
     }
-    result = fit_component_bags(component, approval, encoding, y_train)
+    result = fit_component_bags(
+        component, approval, encoding, y_train, row_keys=(100, 101, 102)
+    )
     assert result.probabilities.shape == (3,)
     assert np.isfinite(result.probabilities).all()
     assert ((result.probabilities >= 0.0) & (result.probabilities <= 1.0)).all()
@@ -133,7 +135,7 @@ def _approval(
         payload=payload,
         source_path=source,
         source_sha256="0" * 64,
-        research_run=run,
+        research_run=cast(Any, run),
     )
 
 

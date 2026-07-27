@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import csv
 import json
-import os
 import platform
 import sys
 from dataclasses import dataclass
@@ -15,19 +15,33 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from src.churn_ml.deployment_v1_auth import load_synthetic_fixture
 from src.churn_ml.deployment_v1_contracts import (
     ValidatedDeployment,
     load_deployment_config,
     validate_loaded_deployment,
 )
+from src.churn_ml.deployment_v1_features import (
+    DeploymentData,
+    build_full_data_encoding,
+    load_deployment_data,
+)
 from src.churn_ml.deployment_v1_models import (
+    bag_parameter_identity,
     classify_fixed,
     probability_sha256,
+)
+from src.churn_ml.deployment_v1_paths import (
+    DeploymentPathError,
+    prewalk_regular_tree,
+    validate_regular_file,
 )
 from src.churn_ml.research_data import canonical_sha256
 
 
 DEPLOYMENT_SOURCE_PATHS = (
+    "src/churn_ml/deployment_v1_auth.py",
+    "src/churn_ml/deployment_v1_paths.py",
     "src/churn_ml/deployment_v1_contracts.py",
     "src/churn_ml/deployment_v1_features.py",
     "src/churn_ml/deployment_v1_models.py",
@@ -40,6 +54,7 @@ ORDINARY_FILES = {
     "resolved_deployment_config.yaml",
     "deployment_identity.json",
     "dataset_identity.json",
+    "fixture_identity.json",
     "train_schema.json",
     "test_schema.json",
     "feature_identity.json",
@@ -47,6 +62,7 @@ ORDINARY_FILES = {
     "encoding_assignments.parquet",
     "component_summary.json",
     "bag_summary.csv",
+    "bag_probabilities.parquet",
     "component_probabilities.parquet",
     "blend_probabilities.parquet",
     "prediction_summary.json",
@@ -136,13 +152,14 @@ class DeploymentArtifactStore:
         finally:
             self._terminal = True
 
-    def complete(self, validated: ValidatedDeployment) -> None:
+    def complete(self, validated: ValidatedDeployment, *, data: DeploymentData) -> None:
         self._guard_write()
         validate_deployment_artifacts(
             self.root,
             validated=validated,
             require_success=False,
             verify_manifest=False,
+            data=data,
         )
         inventory = build_inventory(self.root)
         self.write_json("artifact_inventory.json", inventory)
@@ -153,6 +170,7 @@ class DeploymentArtifactStore:
             validated=validated,
             require_success=False,
             verify_manifest=True,
+            data=data,
         )
         self.write_json(
             "_SUCCESS",
@@ -194,7 +212,14 @@ def build_submission(
 def source_provenance(project_root: Path) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     for relative in DEPLOYMENT_SOURCE_PATHS:
-        path = project_root / relative
+        try:
+            path = validate_regular_file(
+                project_root / relative,
+                containment_root=project_root,
+                reject_hardlinks=True,
+            )
+        except DeploymentPathError as error:
+            raise DeploymentArtifactError(str(error)) from error
         raw = path.read_bytes()
         records.append(
             {"path": relative, "size_bytes": len(raw), "sha256": _sha256(raw)}
@@ -259,8 +284,12 @@ def validate_deployment_artifacts(
     validated: ValidatedDeployment,
     require_success: bool,
     verify_manifest: bool,
+    data: DeploymentData,
 ) -> None:
-    deployment_root = root.resolve()
+    try:
+        deployment_root = prewalk_regular_tree(root, reject_hardlinks=True).root
+    except DeploymentPathError as error:
+        raise DeploymentArtifactError(str(error)) from error
     if not deployment_root.is_dir():
         raise DeploymentArtifactError("Deployment directory is missing.")
     if (deployment_root / "_FAILED").exists():
@@ -311,6 +340,81 @@ def validate_deployment_artifacts(
     if persisted_source != source_provenance(validated.config.project_root):
         raise DeploymentArtifactError("Deployment source provenance differs.")
 
+    if _read_json(deployment_root / "dataset_identity.json") != data.dataset_identity:
+        raise DeploymentArtifactError(
+            "Dataset identity differs from authenticated input."
+        )
+    if _read_json(deployment_root / "fixture_identity.json") != data.fixture_identity:
+        raise DeploymentArtifactError(
+            "Fixture identity differs from authenticated input."
+        )
+    if _read_json(deployment_root / "train_schema.json") != data.train_schema:
+        raise DeploymentArtifactError(
+            "Training schema differs from authenticated input."
+        )
+    if _read_json(deployment_root / "test_schema.json") != data.test_schema:
+        raise DeploymentArtifactError("Test schema differs from authenticated input.")
+    pipeline_identity = validated.approvals[0].research_run.evaluation_plan_identity
+    expected_feature_identity = {
+        "schema_version": 1,
+        "pipeline_id": validated.config.payload["pipeline_id"],
+        "pipeline_sha256": validated.approvals[0].payload["research_run"][
+            "pipeline_sha256"
+        ],
+        "transformed_columns": data.X_train.columns.tolist(),
+        "transformed_columns_sha256": canonical_sha256(data.X_train.columns.tolist()),
+        "evaluation_plan_sha256": pipeline_identity["sha256"],
+    }
+    if (
+        _read_json(deployment_root / "feature_identity.json")
+        != expected_feature_identity
+    ):
+        raise DeploymentArtifactError(
+            "Feature identity differs from authoritative input."
+        )
+
+    stored_encoding = _read_json(deployment_root / "encoding_identity.json")
+    if (
+        set(stored_encoding) != {"schema_version", "components"}
+        or stored_encoding["schema_version"] != 1
+        or not isinstance(stored_encoding["components"], dict)
+    ):
+        raise DeploymentArtifactError("Encoding identity schema differs.")
+    stored_assignments = pd.read_parquet(
+        deployment_root / "encoding_assignments.parquet"
+    )
+    expected_assignments: pd.DataFrame | None = None
+    expected_encoding_ids: dict[str, Any] = {}
+    for approval in validated.approvals:
+        contract = approval.research_run.config.adapter_contract
+        encoder_contract = (
+            contract["target_encoder"]
+            if approval.adapter_id == "manual_lightgbm_te_v1_compat"
+            else contract["numeric_features"]
+        )
+        encoding = build_full_data_encoding(
+            data.X_train, data.y_train, data.X_test, encoder_contract
+        )
+        expected_encoding_ids[approval.component_id] = encoding.identity
+        if expected_assignments is None:
+            expected_assignments = encoding.assignments
+        else:
+            _assert_frame_exact(expected_assignments, encoding.assignments, "encoding")
+    assert expected_assignments is not None
+    if stored_encoding["components"] != expected_encoding_ids:
+        raise DeploymentArtifactError("Encoding identity semantics differ.")
+    _assert_frame_exact(
+        stored_assignments, expected_assignments, "encoding assignments"
+    )
+
+    if _read_json(deployment_root / "environment.json") != environment_record():
+        raise DeploymentArtifactError("Runtime environment identity differs.")
+    _validate_runtime_artifact(
+        deployment_root / "runtime.json",
+        expected_mode="dry-run"
+        if data.fixture_identity["mode"] == "synthetic"
+        else "run",
+    )
     component_summary = _read_json(deployment_root / "component_summary.json")
     components = component_summary.get("components")
     if not isinstance(components, list) or len(components) != len(validated.approvals):
@@ -318,20 +422,137 @@ def validate_deployment_artifacts(
     component_frame = pd.read_parquet(
         deployment_root / "component_probabilities.parquet"
     )
-    if component_frame.columns[0] != "row_position":
+    if component_frame.columns[:2].tolist() != ["row_position", "row_id"]:
         raise DeploymentArtifactError("Component row identity is absent.")
     expected_positions = list(range(len(component_frame)))
-    if component_frame["row_position"].tolist() != expected_positions:
-        raise DeploymentArtifactError("Component row order differs.")
+    if (
+        component_frame["row_position"].tolist() != expected_positions
+        or tuple(component_frame["row_id"].tolist()) != data.test_row_keys
+    ):
+        raise DeploymentArtifactError("Component row identity/order differs.")
     config_components = validated.config.payload["components"]
     expected_component_columns = [
         str(item["component_id"]) for item in config_components
     ]
     if component_frame.columns.tolist() != [
         "row_position",
+        "row_id",
         *expected_component_columns,
     ]:
         raise DeploymentArtifactError("Component probability columns differ.")
+    if (
+        set(component_summary) != {"schema_version", "components"}
+        or component_summary["schema_version"] != 1
+    ):
+        raise DeploymentArtifactError("Component summary schema differs.")
+    bag_frame = pd.read_parquet(deployment_root / "bag_probabilities.parquet")
+    expected_bag_columns = ["row_position", "row_id"]
+    for item in config_components:
+        for seed in sorted(item["bag_seeds"]):
+            expected_bag_columns.append(f"{item['component_id']}__seed_{int(seed)}")
+    if bag_frame.columns.tolist() != expected_bag_columns:
+        raise DeploymentArtifactError("Per-bag probability schema differs.")
+    if (
+        bag_frame["row_position"].tolist() != expected_positions
+        or tuple(bag_frame["row_id"].tolist()) != data.test_row_keys
+    ):
+        raise DeploymentArtifactError("Per-bag row identity/order differs.")
+    bag_summary = pd.read_csv(deployment_root / "bag_summary.csv")
+    bag_columns = [
+        "component_id",
+        "adapter_id",
+        "bag_index",
+        "bag_seed",
+        "training_rows",
+        "test_rows",
+        "parameter_sha256",
+        "probability_sha256",
+        "probability_column",
+        "row_identity_sha256",
+        "probability_bytes",
+        "duration_seconds",
+        "early_stopping",
+        "evaluation_set",
+        "model_persisted",
+    ]
+    if bag_summary.columns.tolist() != bag_columns:
+        raise DeploymentArtifactError("Bag summary schema differs.")
+    expected_bag_count = sum(len(item["bag_seeds"]) for item in config_components)
+    if len(bag_summary) != expected_bag_count:
+        raise DeploymentArtifactError("Bag summary count differs.")
+    environments = environment_record()["distributions"]
+    distribution_key = {
+        "manual_lightgbm_te_v1_compat": "lightgbm",
+        "xgboost_numeric_v1": "xgboost",
+        "catboost_numeric_v1": "catboost",
+    }
+    expected_summaries: list[dict[str, Any]] = []
+    record_index = 0
+    for item, approval in zip(config_components, validated.approvals, strict=True):
+        accumulator = np.zeros(len(data.test_row_keys), dtype=np.float64)
+        seeds = sorted(int(seed) for seed in item["bag_seeds"])
+        for bag_index, seed in enumerate(seeds, start=1):
+            column = f"{item['component_id']}__seed_{seed}"
+            probabilities = bag_frame[column].to_numpy(dtype=np.float64)
+            _validate_probabilities(probabilities)
+            record = bag_summary.iloc[record_index].to_dict()
+            expected_values = {
+                "component_id": item["component_id"],
+                "adapter_id": item["adapter_id"],
+                "bag_index": bag_index,
+                "bag_seed": seed,
+                "training_rows": len(data.X_train),
+                "test_rows": len(data.X_test),
+                "parameter_sha256": canonical_sha256(
+                    bag_parameter_identity(item, approval, seed)
+                ),
+                "probability_sha256": probability_sha256(probabilities),
+                "probability_column": column,
+                "row_identity_sha256": data.test_row_identity_sha256,
+                "probability_bytes": len(probabilities) * 8,
+                "early_stopping": False,
+                "evaluation_set": False,
+                "model_persisted": False,
+            }
+            for key, value in expected_values.items():
+                if record[key] != value:
+                    raise DeploymentArtifactError(f"Bag summary {key} differs.")
+            duration = record["duration_seconds"]
+            if (
+                not isinstance(duration, (int, float))
+                or not np.isfinite(duration)
+                or duration < 0
+            ):
+                raise DeploymentArtifactError("Bag duration differs.")
+            accumulator += probabilities
+            record_index += 1
+        average = np.asarray(accumulator / len(seeds), dtype=np.float64)
+        component_values = component_frame[item["component_id"]].to_numpy(
+            dtype=np.float64
+        )
+        if not np.array_equal(component_values, average):
+            raise DeploymentArtifactError("Component bag average differs.")
+        expected_summaries.append(
+            {
+                "schema_version": 1,
+                "component_id": item["component_id"],
+                "adapter_id": item["adapter_id"],
+                "bag_seeds": seeds,
+                "bag_count": len(seeds),
+                "training_rows_per_bag": len(data.X_train),
+                "all_training_rows_used": True,
+                "aggregation": "arithmetic_mean",
+                "component_probability_sha256": probability_sha256(average),
+                "runtime_library_version": environments[
+                    distribution_key[item["adapter_id"]]
+                ],
+                "row_identity_sha256": data.test_row_identity_sha256,
+                "model_persistence": False,
+            }
+        )
+    if components != expected_summaries:
+        raise DeploymentArtifactError("Component summary semantics differ.")
+
     summaries = {
         str(item["component_id"]): item
         for item in components
@@ -348,12 +569,16 @@ def validate_deployment_artifacts(
     blend_frame = pd.read_parquet(deployment_root / "blend_probabilities.parquet")
     if blend_frame.columns.tolist() != [
         "row_position",
+        "row_id",
         "probability",
         "prediction",
     ]:
         raise DeploymentArtifactError("Blend probability schema differs.")
-    if blend_frame["row_position"].tolist() != expected_positions:
-        raise DeploymentArtifactError("Blend row order differs.")
+    if (
+        blend_frame["row_position"].tolist() != expected_positions
+        or tuple(blend_frame["row_id"].tolist()) != data.test_row_keys
+    ):
+        raise DeploymentArtifactError("Blend row identity/order differs.")
     recomputed = np.zeros(len(component_frame), dtype=np.float64)
     for item in config_components:
         recomputed += float(item["component_weight"]) * component_frame[
@@ -370,24 +595,16 @@ def validate_deployment_artifacts(
     ):
         raise DeploymentArtifactError("Fixed >= threshold labels differ.")
 
-    submission = pd.read_csv(deployment_root / "submission.csv")
     sample_config = validated.config.payload["sample_submission"]
-    if submission.columns.tolist() != [
-        sample_config["id_column"],
-        sample_config["target_column"],
-    ]:
-        raise DeploymentArtifactError("Submission schema differs.")
+    submission = _read_strict_submission(
+        deployment_root / "submission.csv",
+        id_column=str(sample_config["id_column"]),
+        target_column=str(sample_config["target_column"]),
+        expected_ids=data.test_row_keys,
+    )
     labels = submission[sample_config["target_column"]].to_numpy(dtype=np.int8)
     if not np.array_equal(labels, predictions):
         raise DeploymentArtifactError("Submission labels differ from predictions.")
-    if set(np.unique(labels)).difference({0, 1}):
-        raise DeploymentArtifactError("Submission labels are not binary.")
-    dataset_identity = _read_json(deployment_root / "dataset_identity.json")
-    if (
-        canonical_sha256(submission[sample_config["id_column"]].tolist())
-        != (dataset_identity["sample_id_sha256"])
-    ):
-        raise DeploymentArtifactError("Submission ID/order identity differs.")
     summary = _read_json(deployment_root / "prediction_summary.json")
     expected_summary = {
         "schema_version": 1,
@@ -401,12 +618,6 @@ def validate_deployment_artifacts(
     }
     if summary != expected_summary:
         raise DeploymentArtifactError("Prediction summary differs.")
-
-    roundtrip = pd.read_csv(deployment_root / "submission.csv")
-    try:
-        pd.testing.assert_frame_equal(roundtrip, submission, check_exact=True)
-    except AssertionError as error:
-        raise DeploymentArtifactError("Submission CSV round-trip differs.") from error
 
     if verify_manifest:
         inventory = _read_json(deployment_root / "artifact_inventory.json")
@@ -438,7 +649,10 @@ def load_completed_deployment(
     *,
     project_root: Path,
 ) -> CompletedDeployment:
-    deployment_root = root.resolve()
+    try:
+        deployment_root = prewalk_regular_tree(root, reject_hardlinks=True).root
+    except DeploymentPathError as error:
+        raise DeploymentArtifactError(str(error)) from error
     resolved = _read_yaml(deployment_root / "resolved_deployment_config.yaml")
     temporary_config = deployment_root / "resolved_deployment_config.yaml"
     config = load_deployment_config(
@@ -449,11 +663,32 @@ def load_completed_deployment(
     validated = validate_loaded_deployment(config)
     if resolved != validated.config.resolved_payload():
         raise DeploymentArtifactError("Persisted deployment config differs.")
+    fixture_identity = _read_json(deployment_root / "fixture_identity.json")
+    mode = fixture_identity.get("mode")
+    fixture = None
+    if mode == "synthetic":
+        relative = fixture_identity.get("canonical", {}).get("repository_relative_path")
+        if not isinstance(relative, str):
+            raise DeploymentArtifactError("Synthetic fixture identity differs.")
+        fixture = load_synthetic_fixture(
+            project_root / relative,
+            project_root=project_root,
+            forbidden_hashes={
+                str(validated.config.payload["test_data"]["sha256"]),
+                str(validated.config.payload["sample_submission"]["sha256"]),
+            },
+        )
+        if fixture.identity != fixture_identity:
+            raise DeploymentArtifactError("Synthetic fixture authentication differs.")
+    elif mode != "competition":
+        raise DeploymentArtifactError("Fixture identity mode differs.")
+    data = load_deployment_data(validated, fixture=fixture)
     validate_deployment_artifacts(
         deployment_root,
         validated=validated,
         require_success=True,
         verify_manifest=True,
+        data=data,
     )
     return CompletedDeployment(
         root=deployment_root,
@@ -475,23 +710,14 @@ def load_failed_deployment(root: Path) -> FailedDeployment:
 
 
 def _tree_paths(root: Path) -> tuple[set[str], set[str]]:
-    files: set[str] = set()
-    directories: set[str] = set()
-    for directory, directory_names, file_names in os.walk(root):
-        base = Path(directory)
-        for name in directory_names:
-            path = base / name
-            if path.is_symlink():
-                raise DeploymentArtifactError(
-                    "Linked artifact directories are forbidden."
-                )
-            directories.add(path.relative_to(root).as_posix())
-        for name in file_names:
-            path = base / name
-            if path.is_symlink():
-                raise DeploymentArtifactError("Linked artifact files are forbidden.")
-            files.add(path.relative_to(root).as_posix())
-    return files, directories
+    try:
+        tree = prewalk_regular_tree(root, reject_hardlinks=True)
+    except DeploymentPathError as error:
+        raise DeploymentArtifactError(str(error)) from error
+    return (
+        {item.as_posix() for item in tree.files},
+        {item.as_posix() for item in tree.directories},
+    )
 
 
 def _tree_records(
@@ -507,6 +733,86 @@ def _tree_records(
             {"path": relative, "size_bytes": len(raw), "sha256": _sha256(raw)}
         )
     return records, sorted(directories)
+
+
+def _assert_frame_exact(
+    actual: pd.DataFrame, expected: pd.DataFrame, label: str
+) -> None:
+    try:
+        pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+    except AssertionError as error:
+        raise DeploymentArtifactError(f"{label} differs.") from error
+
+
+def _validate_runtime_artifact(path: Path, *, expected_mode: str) -> None:
+    payload = _read_json(path)
+    expected_keys = {
+        "schema_version",
+        "status",
+        "mode",
+        "started_at_utc",
+        "finished_at_utc",
+        "duration_seconds",
+        "competition_test_access_authorized",
+        "network_access",
+        "tracking_enabled",
+    }
+    if set(payload) != expected_keys or payload["schema_version"] != 1:
+        raise DeploymentArtifactError("Runtime artifact schema differs.")
+    if payload["status"] != "completed" or payload["mode"] != expected_mode:
+        raise DeploymentArtifactError("Runtime lifecycle state differs.")
+    expected_access = expected_mode == "run"
+    if payload["competition_test_access_authorized"] is not expected_access:
+        raise DeploymentArtifactError("Competition access flag differs.")
+    if (
+        payload["network_access"] is not False
+        or payload["tracking_enabled"] is not False
+    ):
+        raise DeploymentArtifactError("Runtime isolation flags differ.")
+    try:
+        started = datetime.fromisoformat(payload["started_at_utc"])
+        finished = datetime.fromisoformat(payload["finished_at_utc"])
+    except (TypeError, ValueError) as error:
+        raise DeploymentArtifactError("Runtime timestamps differ.") from error
+    if (
+        started.tzinfo is None
+        or finished.tzinfo is None
+        or finished < started
+        or type(payload["duration_seconds"]) is not float
+        or not np.isfinite(payload["duration_seconds"])
+        or payload["duration_seconds"] < 0.0
+    ):
+        raise DeploymentArtifactError("Runtime timing semantics differ.")
+
+
+def _read_strict_submission(
+    path: Path,
+    *,
+    id_column: str,
+    target_column: str,
+    expected_ids: tuple[Any, ...],
+) -> pd.DataFrame:
+    try:
+        raw = path.read_text(encoding="utf-8")
+        rows = list(csv.reader(raw.splitlines()))
+    except (OSError, UnicodeDecodeError, csv.Error) as error:
+        raise DeploymentArtifactError("Submission CSV is malformed.") from error
+    if not rows or rows[0] != [id_column, target_column]:
+        raise DeploymentArtifactError("Submission raw header differs.")
+    body = rows[1:]
+    if len(body) != len(expected_ids) or any(len(row) != 2 for row in body):
+        raise DeploymentArtifactError("Submission raw row shape differs.")
+    raw_ids = [row[0] for row in body]
+    if any(not value for value in raw_ids) or len(set(raw_ids)) != len(raw_ids):
+        raise DeploymentArtifactError("Submission IDs are null or duplicated.")
+    if raw_ids != [str(value) for value in expected_ids]:
+        raise DeploymentArtifactError("Submission raw ID/order identity differs.")
+    raw_labels = [row[1] for row in body]
+    if any(value not in {"0", "1"} for value in raw_labels):
+        raise DeploymentArtifactError("Submission labels are not strict binary tokens.")
+    return pd.DataFrame(
+        {id_column: raw_ids, target_column: np.asarray(raw_labels, dtype=np.int8)}
+    )
 
 
 def _validate_probabilities(values: np.ndarray) -> None:
