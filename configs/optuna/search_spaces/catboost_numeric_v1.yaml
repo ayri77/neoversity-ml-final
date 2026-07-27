@@ -1,0 +1,42 @@
+schema_version: 1
+search_space_id: catboost_numeric_v1_space_v1
+adapter_id: catboost_numeric_v1
+parameters:
+  iterations:
+    distribution: int
+    low: 100
+    high: 600
+    step: 50
+    log: false
+  learning_rate:
+    distribution: float
+    low: 0.01
+    high: 0.2
+    log: true
+  depth:
+    distribution: int
+    low: 4
+    high: 10
+    step: 1
+    log: false
+  l2_leaf_reg:
+    distribution: float
+    low: 0.1
+    high: 50.0
+    log: true
+  random_strength:
+    distribution: float
+    low: 0.0
+    high: 5.0
+    log: false
+  bagging_temperature:
+    distribution: float
+    low: 0.0
+    high: 5.0
+    log: false
+  border_count:
+    distribution: int
+    low: 64
+    high: 256
+    step: 32
+    log: false

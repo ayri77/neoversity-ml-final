@@ -36,6 +36,16 @@ ROOT_KEYS = {
     "persistence",
     "tracking",
 }
+SEARCH_PROVENANCE_KEYS = {
+    "schema_version",
+    "search_id",
+    "study_name",
+    "best_trial_number",
+    "search_identity_sha256",
+    "search_space_id",
+    "search_space_sha256",
+    "evidence_scope",
+}
 SECTION_KEYS = {
     "experiment": {"id"},
     "dataset": {"version"},
@@ -129,7 +139,9 @@ def load_research_v2_config(
             "V2 configuration must be inside the repository."
         )
     payload = _load_mapping(source, "v2 configuration")
-    _exact_keys(payload, ROOT_KEYS, "root")
+    actual_root_keys = set(payload)
+    if actual_root_keys not in (ROOT_KEYS, ROOT_KEYS | {"search_provenance"}):
+        _exact_keys(payload, ROOT_KEYS, "root")
     for name, expected in SECTION_KEYS.items():
         _exact_keys(_section(payload, name), expected, name)
     if _integer(payload["schema_version"], "schema_version") != 2:
@@ -207,6 +219,8 @@ def load_research_v2_config(
     tracking = _section(payload, "tracking")
     if tracking["enabled"] is not False:
         raise ResearchV2ConfigurationError("Optional tracking must remain disabled.")
+    if "search_provenance" in payload:
+        _validate_search_provenance(payload["search_provenance"])
     return ResearchV2Config(
         payload=deepcopy(dict(payload)),
         plan_payload=deepcopy(dict(plan)),
@@ -281,3 +295,33 @@ def _repo_path(value: str, root: Path, label: str) -> Path:
     if resolved != root and root not in resolved.parents:
         raise ResearchV2ConfigurationError(f"{label} escapes the repository.")
     return resolved
+
+
+def _validate_search_provenance(value: Any) -> None:
+    provenance = _section({"search_provenance": value}, "search_provenance")
+    _exact_keys(provenance, SEARCH_PROVENANCE_KEYS, "search_provenance")
+    if _integer(provenance["schema_version"], "search_provenance.schema_version") != 1:
+        raise ResearchV2ConfigurationError(
+            "search_provenance.schema_version must be 1."
+        )
+    _slug(provenance["search_id"], "search_provenance.search_id")
+    _slug(provenance["study_name"], "search_provenance.study_name")
+    best_trial = _integer(
+        provenance["best_trial_number"],
+        "search_provenance.best_trial_number",
+    )
+    if best_trial < 0:
+        raise ResearchV2ConfigurationError(
+            "search_provenance.best_trial_number must be non-negative."
+        )
+    for key in ("search_identity_sha256", "search_space_sha256"):
+        digest = _string(provenance[key], f"search_provenance.{key}")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ResearchV2ConfigurationError(
+                f"search_provenance.{key} must be a lowercase SHA-256."
+            )
+    _slug(provenance["search_space_id"], "search_provenance.search_space_id")
+    if provenance["evidence_scope"] != "tuning_only_not_unbiased_final_evidence":
+        raise ResearchV2ConfigurationError(
+            "search_provenance.evidence_scope is invalid."
+        )

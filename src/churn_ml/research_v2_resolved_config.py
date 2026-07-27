@@ -19,6 +19,7 @@ from src.churn_ml.research_v2_config import (
     SAFE_SLUG,
     SECTION_KEYS,
     ResearchV2Config,
+    _validate_search_provenance,
 )
 
 
@@ -60,11 +61,13 @@ def load_resolved_research_v2_config(
             field_path="resolved_config",
         )
     resolved = dict(value)
-    _exact_keys(
-        resolved,
-        ROOT_KEYS | {"evaluation_plan"},
-        "resolved_config",
-    )
+    actual_root_keys = set(resolved)
+    base_resolved_keys = ROOT_KEYS | {"evaluation_plan"}
+    if actual_root_keys not in (
+        base_resolved_keys,
+        base_resolved_keys | {"search_provenance"},
+    ):
+        _exact_keys(resolved, base_resolved_keys, "resolved_config")
     payload = deepcopy(resolved)
     plan = _mapping(
         payload.pop("evaluation_plan"),
@@ -225,6 +228,15 @@ def load_resolved_research_v2_config(
             "RESOLVED_TRACKING_ENABLED",
             "resolved_config.tracking.enabled",
         )
+    if "search_provenance" in payload:
+        try:
+            _validate_search_provenance(payload["search_provenance"])
+        except ValueError as error:
+            raise ResolvedResearchV2ConfigurationError(
+                str(error),
+                reason_code="RESOLVED_SEARCH_PROVENANCE_INVALID",
+                field_path="resolved_config.search_provenance",
+            ) from error
     return ResearchV2Config(
         payload=deepcopy(payload),
         plan_payload=deepcopy(dict(plan)),

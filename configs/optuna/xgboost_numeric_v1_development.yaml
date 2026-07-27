@@ -1,0 +1,28 @@
+schema_version: 1
+search_plan_id: xgboost_numeric_v1_development_search_v1
+dataset_version: v3_targeted_missingness
+pipeline_id: manual_v3_pipeline_v1_compat
+adapter_id: xgboost_numeric_v1
+base_candidate_config: configs/research_v2/xgboost_numeric_v1_development.yaml
+search_space: configs/optuna/search_spaces/xgboost_numeric_v1.yaml
+repeats: 2
+folds: 5
+assignment_seed: 20260727
+threshold_policy: grid_balanced_accuracy_v1
+threshold_grid:
+  minimum: 0.01
+  maximum: 0.99
+  step: 0.001
+  comparison: greater_than_or_equal
+  maximizer_absolute_tolerance: 1.0e-12
+  tie_break: median_maximizer_lower_on_even
+  constant_probability_fallback: 0.5
+metric: balanced_accuracy
+direction: maximize
+n_trials: 50
+timeout_seconds: 21600
+sampler: {name: stateless_random_v1, seed: 20260727}
+pruner: nop
+study_name: xgboost_numeric_v1_development_search_v1
+storage: artifacts/optuna/optuna.db
+artifacts_root: artifacts/optuna_searches

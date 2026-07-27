@@ -1,0 +1,57 @@
+schema_version: 1
+search_space_id: xgboost_numeric_v1_space_v1
+adapter_id: xgboost_numeric_v1
+parameters:
+  n_estimators:
+    distribution: int
+    low: 100
+    high: 600
+    step: 50
+    log: false
+  learning_rate:
+    distribution: float
+    low: 0.01
+    high: 0.2
+    log: true
+  max_depth:
+    distribution: int
+    low: 3
+    high: 10
+    step: 1
+    log: false
+  min_child_weight:
+    distribution: float
+    low: 0.1
+    high: 20.0
+    log: true
+  subsample:
+    distribution: float
+    low: 0.6
+    high: 1.0
+    log: false
+  colsample_bytree:
+    distribution: float
+    low: 0.6
+    high: 1.0
+    log: false
+  gamma:
+    distribution: float
+    low: 0.0
+    high: 5.0
+    log: false
+  reg_alpha:
+    distribution: zero_or_log_float
+    zero_probability: 0.2
+    low_positive: 1.0e-8
+    high: 10.0
+  reg_lambda:
+    distribution: float
+    low: 1.0e-4
+    high: 100.0
+    log: true
+  max_bin:
+    distribution: int
+    low: 128
+    high: 512
+    step: 64
+    log: false
