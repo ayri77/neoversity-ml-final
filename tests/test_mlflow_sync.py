@@ -75,7 +75,7 @@ def make_record(
         params={"candidate_sha256": "1" * 64, "repeat_count": 2},
         tags={"terminal_status": status},
         metrics={"balanced_accuracy": 0.9},
-        artifact_relative_paths=(),
+        artifacts=(),
         local_source_path=run,
     )
 

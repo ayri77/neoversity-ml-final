@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import json
-import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -13,7 +12,16 @@ import pandas as pd
 import yaml
 
 from src.churn_ml.autogluon_inspection import inspect_run
+from src.churn_ml.mlflow_artifacts import (
+    ArtifactContentError,
+    select_indexed_artifacts,
+)
 from src.churn_ml.mlflow_config import MLflowIndexConfig
+from src.churn_ml.mlflow_lifecycle import (
+    FailedLifecycleError,
+    validate_failed_autogluon_run,
+    validate_failed_research_run,
+)
 from src.churn_ml.mlflow_mapping import (
     IndexedRun,
     SourceType,
@@ -105,6 +113,12 @@ _RESEARCH_ARTIFACT_ALLOWLIST = (
     "run_metadata.json",
     "thresholds/threshold_summary.json",
 )
+_RESEARCH_FAILED_ARTIFACT_ALLOWLIST = (
+    "_FAILED",
+    "execution_status.json",
+    "resolved_config.yaml",
+    "run_metadata.json",
+)
 _AUTOGLUON_ARTIFACT_ALLOWLIST = (
     "_FAILED",
     "_SUCCESS",
@@ -116,6 +130,14 @@ _AUTOGLUON_ARTIFACT_ALLOWLIST = (
     "resolved_config.yaml",
     "run_metadata.json",
     "worker_result.json",
+)
+_AUTOGLUON_FAILED_ARTIFACT_ALLOWLIST = (
+    "_FAILED",
+    "artifact_inventory.json",
+    "execution_status.json",
+    "profile_resolution.json",
+    "resolved_config.yaml",
+    "run_metadata.json",
 )
 
 
@@ -152,6 +174,12 @@ class ResearchV2SourceAdapter:
                 f"Research run has both terminal markers: {relative}",
             )
         if not success and not failed:
+            state = _status_without_marker(resolved_run)
+            if state in {"completed", "failed"}:
+                raise SourceValidationError(
+                    "terminal_marker_missing",
+                    f"Terminal research status lacks its marker: {relative}",
+                )
             raise SourceSkip(
                 "terminal_marker_missing",
                 f"Research run is incomplete or running: {relative}",
@@ -162,14 +190,25 @@ class ResearchV2SourceAdapter:
         resolved_config = _read_optional_yaml_mapping(
             resolved_run / "resolved_config.yaml"
         )
-        artifacts = _select_small_artifacts(
-            resolved_run,
-            _RESEARCH_ARTIFACT_ALLOWLIST,
-            enabled=config.sync.log_small_artifacts,
-            size_limit=config.sync.max_artifact_size_bytes,
-        )
         if failed:
-            _validate_failed_research_status(resolved_run, status, metadata)
+            try:
+                validate_failed_research_run(
+                    resolved_run,
+                    status=status,
+                    metadata=metadata,
+                    resolved_config=resolved_config,
+                )
+                artifacts = select_indexed_artifacts(
+                    resolved_run,
+                    _RESEARCH_FAILED_ARTIFACT_ALLOWLIST,
+                    enabled=config.sync.log_small_artifacts,
+                    size_limit=config.sync.max_artifact_size_bytes,
+                )
+            except (FailedLifecycleError, ArtifactContentError) as error:
+                raise SourceValidationError(
+                    "failed_research_lifecycle_invalid",
+                    f"Failed research lifecycle is invalid: {relative}: {error}",
+                ) from error
             identity = canonical_sha256(
                 {
                     "status": status,
@@ -189,7 +228,7 @@ class ResearchV2SourceAdapter:
                 resolved_config=resolved_config,
                 terminal_status="failed",
                 source_identity=identity,
-                artifact_relative_paths=artifacts,
+                artifacts=artifacts,
             )
 
         if resolved_config is None:
@@ -234,6 +273,18 @@ class ResearchV2SourceAdapter:
         threshold_std = float(
             threshold_frame["selected_threshold"].to_numpy(dtype=float).std(ddof=0)
         )
+        try:
+            artifacts = select_indexed_artifacts(
+                resolved_run,
+                _RESEARCH_ARTIFACT_ALLOWLIST,
+                enabled=config.sync.log_small_artifacts,
+                size_limit=config.sync.max_artifact_size_bytes,
+            )
+        except ArtifactContentError as error:
+            raise SourceValidationError(
+                "artifact_content_invalid",
+                f"Research metadata artifact is invalid: {relative}: {error}",
+            ) from error
         return build_research_mapping(
             run_dir=resolved_run,
             source_relative_path=relative,
@@ -245,7 +296,7 @@ class ResearchV2SourceAdapter:
             aggregate=aggregate,
             threshold_summary=threshold_summary,
             threshold_standard_deviation=threshold_std,
-            artifact_relative_paths=artifacts,
+            artifacts=artifacts,
         )
 
 
@@ -282,17 +333,17 @@ class AutoGluonSourceAdapter:
                 f"AutoGluon run has both terminal markers: {relative}",
             )
         if not success and not failed:
+            state = _status_without_marker(resolved_run)
+            if state in {"completed", "failed"}:
+                raise SourceValidationError(
+                    "terminal_marker_missing",
+                    f"Terminal AutoGluon status lacks its marker: {relative}",
+                )
             raise SourceSkip(
                 "terminal_marker_missing",
                 f"AutoGluon run is incomplete or running: {relative}",
             )
 
-        report = inspect_run(resolved_run, attempt_load=False)
-        if report.get("predictor_loading_attempted") is not False:
-            raise SourceValidationError(
-                "predictor_loading_attempted",
-                f"AutoGluon inspection attempted predictor loading: {relative}",
-            )
         metadata = _read_json_mapping(resolved_run / "run_metadata.json")
         status = _read_json_mapping(resolved_run / "execution_status.json")
         resolved_config = _read_optional_yaml_mapping(
@@ -305,13 +356,13 @@ class AutoGluonSourceAdapter:
         inspection_summary = _read_optional_json_mapping(
             resolved_run / "inspection" / "summary.json"
         )
-        artifacts = _select_small_artifacts(
-            resolved_run,
-            _AUTOGLUON_ARTIFACT_ALLOWLIST,
-            enabled=config.sync.log_small_artifacts,
-            size_limit=config.sync.max_artifact_size_bytes,
-        )
         if success:
+            report = inspect_run(resolved_run, attempt_load=False)
+            if report.get("predictor_loading_attempted") is not False:
+                raise SourceValidationError(
+                    "predictor_loading_attempted",
+                    f"AutoGluon inspection attempted predictor loading: {relative}",
+                )
             if report.get("classification") != "complete":
                 raise SourceValidationError(
                     "completed_run_corrupt",
@@ -324,6 +375,18 @@ class AutoGluonSourceAdapter:
                     f"AutoGluon completed run lacks worker_result.json: {relative}",
                 )
             inventory = _read_json_mapping(resolved_run / "artifact_inventory.json")
+            try:
+                artifacts = select_indexed_artifacts(
+                    resolved_run,
+                    _AUTOGLUON_ARTIFACT_ALLOWLIST,
+                    enabled=config.sync.log_small_artifacts,
+                    size_limit=config.sync.max_artifact_size_bytes,
+                )
+            except ArtifactContentError as error:
+                raise SourceValidationError(
+                    "artifact_content_invalid",
+                    f"AutoGluon metadata artifact is invalid: {relative}: {error}",
+                ) from error
             identity = canonical_sha256(
                 {
                     "config_identity_sha256": metadata.get("config_identity_sha256"),
@@ -343,22 +406,32 @@ class AutoGluonSourceAdapter:
                 terminal_status="completed",
                 source_identity=identity,
                 predictor_classification="complete",
-                artifact_relative_paths=artifacts,
+                artifacts=artifacts,
             )
 
-        _validate_failed_autogluon_status(resolved_run, status, metadata)
-        corrupt_reasons = [
-            str(reason)
-            for reason in report.get("reason_codes", [])
-            if _failed_inspection_reason_is_corrupt(str(reason))
-        ]
-        if corrupt_reasons:
-            raise SourceValidationError(
-                "failed_run_corrupt",
-                f"AutoGluon failed run metadata is corrupt: {relative}: "
-                f"{corrupt_reasons}",
-            )
         marker = _read_json_mapping(resolved_run / "_FAILED")
+        inventory = _read_json_mapping(resolved_run / "artifact_inventory.json")
+        try:
+            validate_failed_autogluon_run(
+                resolved_run,
+                status=status,
+                metadata=metadata,
+                marker=marker,
+                resolved_config=resolved_config,
+                profile_resolution=profile_resolution,
+                inventory=inventory,
+            )
+            artifacts = select_indexed_artifacts(
+                resolved_run,
+                _AUTOGLUON_FAILED_ARTIFACT_ALLOWLIST,
+                enabled=config.sync.log_small_artifacts,
+                size_limit=config.sync.max_artifact_size_bytes,
+            )
+        except (FailedLifecycleError, ArtifactContentError) as error:
+            raise SourceValidationError(
+                "failed_autogluon_lifecycle_invalid",
+                f"Failed AutoGluon lifecycle is invalid: {relative}: {error}",
+            ) from error
         identity = canonical_sha256(
             {
                 "marker": marker,
@@ -379,7 +452,7 @@ class AutoGluonSourceAdapter:
             terminal_status="failed",
             source_identity=identity,
             predictor_classification="failed_terminal_not_loaded",
-            artifact_relative_paths=artifacts,
+            artifacts=artifacts,
         )
 
 
@@ -481,156 +554,11 @@ def _persisted_research_config(
     )
 
 
-def _validate_failed_research_status(
-    run_dir: Path,
-    status: Mapping[str, Any],
-    metadata: Mapping[str, Any],
-) -> None:
-    expected = {
-        "schema_version",
-        "run_id",
-        "status",
-        "started_at_utc",
-        "finished_at_utc",
-        "completed_outer_folds",
-        "expected_outer_folds",
-        "failure",
-    }
-    if set(status) != expected:
-        raise SourceValidationError(
-            "failed_status_schema_invalid",
-            "Failed research execution_status.json has missing or extra keys",
-        )
-    if (
-        type(status["schema_version"]) is not int
-        or status["schema_version"] != 2
-        or status["status"] != "failed"
-        or type(status["run_id"]) is not str
-        or status["run_id"] != run_dir.name
-        or type(status["started_at_utc"]) is not str
-        or type(status["finished_at_utc"]) is not str
-        or type(status["completed_outer_folds"]) is not int
-        or type(status["expected_outer_folds"]) is not int
-    ):
-        raise SourceValidationError(
-            "failed_status_value_invalid",
-            "Failed research execution status contains invalid exact types or values",
-        )
-    failure = status["failure"]
-    if (
-        type(failure) is not dict
-        or set(failure) != {"type", "message"}
-        or type(failure["type"]) is not str
-        or type(failure["message"]) is not str
-    ):
-        raise SourceValidationError(
-            "failed_status_failure_invalid",
-            "Failed research failure payload is invalid",
-        )
-    if metadata.get("status") != "failed" or metadata.get("run_id") != run_dir.name:
-        raise SourceValidationError(
-            "failed_metadata_mismatch",
-            "Failed research metadata disagrees with the terminal run",
-        )
-
-
-def _validate_failed_autogluon_status(
-    run_dir: Path,
-    status: Mapping[str, Any],
-    metadata: Mapping[str, Any],
-) -> None:
-    required_types: dict[str, type | tuple[type, ...]] = {
-        "status": str,
-        "run_id": str,
-        "config_identity_sha256": str,
-        "profile_sha256": str,
-        "requested_seed": int,
-        "started_at_utc": str,
-        "ended_at_utc": str,
-        "duration_seconds": (int, float),
-        "child_process_exit_code": (int, type(None)),
-        "last_completed_observable_stage": str,
-        "failure_codes": list,
-        "predictor_loading_attempted": bool,
-        "predictor_loading_succeeded": bool,
-    }
-    for key, accepted in required_types.items():
-        value = status.get(key)
-        types = accepted if isinstance(accepted, tuple) else (accepted,)
-        if not any(type(value) is item for item in types):
-            raise SourceValidationError(
-                "failed_status_schema_invalid",
-                f"Failed AutoGluon status field has invalid type: {key}",
-            )
-    if (
-        status["status"] != "failed"
-        or status["run_id"] != run_dir.name
-        or metadata.get("run_id") != run_dir.name
-        or metadata.get("config_identity_sha256")
-        != status.get("config_identity_sha256")
-        or metadata.get("profile_sha256") != status.get("profile_sha256")
-        or metadata.get("requested_seed") != status.get("requested_seed")
-        or status["predictor_loading_attempted"] is not False
-        or status["predictor_loading_succeeded"] is not False
-        or not math.isfinite(float(status["duration_seconds"]))
-        or float(status["duration_seconds"]) < 0
-        or any(type(item) is not str for item in status["failure_codes"])
-    ):
-        raise SourceValidationError(
-            "failed_status_value_invalid",
-            "Failed AutoGluon status and metadata are inconsistent",
-        )
-    marker = _read_json_mapping(run_dir / "_FAILED")
-    if (
-        marker.get("status") != "failed"
-        or marker.get("run_id") != run_dir.name
-        or marker.get("failure_codes") != status.get("failure_codes")
-    ):
-        raise SourceValidationError(
-            "failed_terminal_marker_invalid",
-            "Failed AutoGluon marker disagrees with execution status",
-        )
-
-
-def _failed_inspection_reason_is_corrupt(reason: str) -> bool:
-    return (
-        "mismatch" in reason
-        or "conflict" in reason
-        or "malformed" in reason
-        or reason.endswith("invalid_json")
-    )
-
-
-def _select_small_artifacts(
-    run_dir: Path,
-    allowlist: Iterable[str],
-    *,
-    enabled: bool,
-    size_limit: int,
-) -> tuple[str, ...]:
-    if not enabled:
-        return ()
-    selected: list[str] = []
-    resolved_run = run_dir.resolve(strict=True)
-    for relative in allowlist:
-        candidate = run_dir / Path(*relative.split("/"))
-        if not candidate.exists():
-            continue
-        if candidate.is_symlink() or not candidate.is_file():
-            raise SourceValidationError(
-                "artifact_symlink_or_type_rejected",
-                f"Allowlisted metadata artifact is not a regular file: {relative}",
-            )
-        try:
-            candidate.resolve(strict=True).relative_to(resolved_run)
-        except ValueError as error:
-            raise SourceValidationError(
-                "artifact_path_escape",
-                f"Allowlisted metadata artifact escapes source run: {relative}",
-            ) from error
-        if candidate.stat().st_size <= size_limit:
-            selected.append(relative)
-    return tuple(selected)
+def _status_without_marker(run_dir: Path) -> Any:
+    path = run_dir / "execution_status.json"
+    if not path.is_file():
+        return None
+    return _read_json_mapping(path).get("status")
 
 
 def _read_json_mapping(path: Path) -> dict[str, Any]:

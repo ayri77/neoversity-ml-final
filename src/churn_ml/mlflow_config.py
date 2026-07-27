@@ -144,12 +144,20 @@ def load_mlflow_config(
             raise MLflowConfigError(
                 f"{label} must remain inside the ignored artifacts area"
             ) from error
-    if backend_store == artifact_root or backend_store in artifact_root.parents:
-        raise MLflowConfigError(
-            "SQLite backend and MLflow artifact root must be separate locations"
-        )
-    receipts_root = backend_store.parent / "sync_receipts"
-    _require_contained(receipts_root.resolve(strict=False), root, "sync receipts")
+    receipts_root = (backend_store.parent / "sync_receipts").resolve(strict=False)
+    _require_contained(receipts_root, root, "sync receipts")
+    storage_locations = (
+        ("SQLite backend", backend_store),
+        ("MLflow artifact root", artifact_root),
+        ("sync receipts", receipts_root),
+    )
+    for index, (left_label, left) in enumerate(storage_locations):
+        for right_label, right in storage_locations[index + 1 :]:
+            if _paths_overlap(left, right):
+                raise MLflowConfigError(
+                    f"{left_label} and {right_label} must be separate, "
+                    "non-overlapping locations"
+                )
 
     return MLflowIndexConfig(
         schema_version=1,
@@ -250,6 +258,10 @@ def _resolve_repository_path(root: Path, value: str, label: str) -> Path:
     resolved = (root / Path(*posix.parts)).resolve(strict=False)
     _require_contained(resolved, root, label)
     return resolved
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or left in right.parents or right in left.parents
 
 
 def _require_contained(path: Path, root: Path, label: str) -> None:

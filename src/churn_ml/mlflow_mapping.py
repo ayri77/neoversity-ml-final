@@ -7,13 +7,16 @@ import json
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Mapping
+
+from src.churn_ml.mlflow_artifacts import IndexedArtifact
 
 
 SourceType = str
 TerminalStatus = Literal["completed", "failed"]
 MLflowTerminalStatus = Literal["FINISHED", "FAILED"]
+SOURCE_KEY_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -29,17 +32,33 @@ class IndexedRun:
     params: dict[str, Any]
     tags: dict[str, str]
     metrics: dict[str, float]
-    artifact_relative_paths: tuple[str, ...]
+    artifacts: tuple[IndexedArtifact, ...]
     local_source_path: Path
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "source_relative_path",
+            canonical_source_relative_path(self.source_relative_path),
+        )
 
     @property
     def source_key(self) -> str:
         return canonical_sha256(
             {
+                "source_key_schema_version": SOURCE_KEY_SCHEMA_VERSION,
                 "source_type": self.source_type,
+                "source_relative_path": canonical_source_relative_path(
+                    self.source_relative_path
+                ),
                 "source_run_id": self.source_run_id,
             }
         )
+
+    @property
+    def artifact_relative_paths(self) -> tuple[str, ...]:
+        """Return portable paths for display and compatibility."""
+        return tuple(artifact.relative_path for artifact in self.artifacts)
 
 
 def canonical_sha256(value: Any) -> str:
@@ -54,6 +73,21 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def canonical_source_relative_path(value: str) -> str:
+    """Normalize and validate a repository-relative POSIX source path."""
+    normalized = value.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if (
+        not normalized
+        or path.is_absolute()
+        or path.root
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or (path.parts and ":" in path.parts[0])
+    ):
+        raise ValueError(f"Invalid source-relative path: {value!r}")
+    return path.as_posix()
+
+
 def build_research_mapping(
     *,
     run_dir: Path,
@@ -66,7 +100,7 @@ def build_research_mapping(
     aggregate: Mapping[str, Any] | None = None,
     threshold_summary: Mapping[str, Any] | None = None,
     threshold_standard_deviation: float | None = None,
-    artifact_relative_paths: tuple[str, ...] = (),
+    artifacts: tuple[IndexedArtifact, ...] = (),
 ) -> IndexedRun:
     """Map structurally/semantically validated research-v2 metadata."""
     hashes = _mapping(metadata.get("hashes"))
@@ -156,14 +190,14 @@ def build_research_mapping(
     return IndexedRun(
         source_type="research_v2",
         source_run_id=run_dir.name,
-        source_relative_path=source_relative_path,
+        source_relative_path=canonical_source_relative_path(source_relative_path),
         source_identity=source_identity,
         terminal_status=terminal_status,
         mlflow_status="FINISHED" if terminal_status == "completed" else "FAILED",
         params=_without_none(params),
         tags=tags,
         metrics=metrics,
-        artifact_relative_paths=artifact_relative_paths,
+        artifacts=artifacts,
         local_source_path=run_dir,
     )
 
@@ -181,7 +215,7 @@ def build_autogluon_mapping(
     terminal_status: TerminalStatus,
     source_identity: str,
     predictor_classification: str,
-    artifact_relative_paths: tuple[str, ...] = (),
+    artifacts: tuple[IndexedArtifact, ...] = (),
 ) -> IndexedRun:
     """Map validated standalone-runner metadata without loading a predictor."""
     profile = _mapping(metadata.get("profile"))
@@ -193,8 +227,11 @@ def build_autogluon_mapping(
     configured_resources = _mapping(config.get("resources"))
     included = profile.get("included_model_types")
     excluded = profile.get("excluded_model_types")
+    completion_is_valid = (
+        terminal_status == "completed" and predictor_classification == "complete"
+    )
     models = completion.get("model_names")
-    model_count = len(models) if type(models) is list else None
+    model_count = len(models) if completion_is_valid and type(models) is list else None
     params: dict[str, Any] = {
         "source_run_id": run_dir.name,
         "runner_schema_version": metadata.get("schema_version", 1),
@@ -203,8 +240,11 @@ def build_autogluon_mapping(
         "profile_sha256": metadata.get("profile_sha256"),
         "dataset_version": metadata.get("dataset_version"),
         "requested_seed": metadata.get("requested_seed"),
-        "autogluon_version": completion.get("autogluon_version")
-        or profile.get("autogluon_version"),
+        "autogluon_version": (
+            completion.get("autogluon_version")
+            if completion_is_valid
+            else profile.get("autogluon_version")
+        ),
         "included_families": included,
         "excluded_families": excluded,
         "resolved_families": resolution.get("resolved_families"),
@@ -214,12 +254,10 @@ def build_autogluon_mapping(
         "gpu_budget": resources.get("gpu_budget")
         if "gpu_budget" in resources
         else configured_resources.get("num_gpus"),
-        "best_model": completion.get("best_model")
-        if terminal_status == "completed"
-        else None,
-        "decision_threshold": completion.get("decision_threshold")
-        if terminal_status == "completed"
-        else None,
+        "best_model": completion.get("best_model") if completion_is_valid else None,
+        "decision_threshold": (
+            completion.get("decision_threshold") if completion_is_valid else None
+        ),
         "model_count": model_count,
         "child_process_exit_code": status.get("child_process_exit_code"),
         "windows_exit_code_unsigned": status.get("windows_exit_code_unsigned"),
@@ -230,11 +268,10 @@ def build_autogluon_mapping(
         "source_identity": source_identity,
     }
     metrics: dict[str, float] = {}
-    _metric(
-        metrics,
-        "duration_seconds",
-        status.get("duration_seconds") or metadata.get("duration_seconds"),
-    )
+    duration = _terminal_duration(status)
+    if duration is None:
+        duration = _finite_float(metadata.get("duration_seconds"))
+    _metric(metrics, "duration_seconds", duration)
     tags = {
         "source_type": "autogluon",
         "source_relative_path": source_relative_path,
@@ -258,14 +295,14 @@ def build_autogluon_mapping(
     return IndexedRun(
         source_type="autogluon",
         source_run_id=run_dir.name,
-        source_relative_path=source_relative_path,
+        source_relative_path=canonical_source_relative_path(source_relative_path),
         source_identity=source_identity,
         terminal_status=terminal_status,
         mlflow_status="FINISHED" if terminal_status == "completed" else "FAILED",
         params=_without_none(params),
         tags=tags,
         metrics=metrics,
-        artifact_relative_paths=artifact_relative_paths,
+        artifacts=artifacts,
         local_source_path=run_dir,
     )
 

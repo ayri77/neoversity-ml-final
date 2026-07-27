@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument(
         "--fail-fast",
         action="store_true",
-        help="stop after the first rejected or errored source",
+        help="stop after the first rejected, recoverable, or errored source",
     )
     return parser
 

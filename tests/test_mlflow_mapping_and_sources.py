@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -8,6 +7,13 @@ from typing import Any
 import pytest
 import yaml
 
+from src.churn_ml.autogluon_artifacts import build_inventory
+from src.churn_ml.autogluon_config import config_identity_sha256
+from src.churn_ml.autogluon_profiles import (
+    get_profile,
+    profile_sha256,
+    profile_summary,
+)
 from src.churn_ml.mlflow_config import load_mlflow_config
 from src.churn_ml.mlflow_mapping import (
     build_autogluon_mapping,
@@ -187,10 +193,9 @@ def test_failed_research_artifact_policy_and_no_source_mutation(
     _write_json(
         run / "run_metadata.json",
         {
-            "schema_version": 2,
-            "run_id": "failed-run",
             "status": "failed",
-            "hashes": {"candidate": "1" * 64},
+            "finished_at_utc": "2026-01-01T00:00:01+00:00",
+            "failure": {"type": "RuntimeError", "message": "failed"},
         },
     )
     (run / "resolved_config.yaml").write_text(
@@ -258,48 +263,7 @@ def test_failed_autogluon_never_loads_predictor(
     )
     run = config.paths.autogluon_root / "failed-ag-run"
     run.mkdir(parents=True)
-    profile = {}
-    profile_hash = hashlib.sha256(
-        json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    metadata = {
-        "schema_version": 1,
-        "run_id": run.name,
-        "config_identity_sha256": "1" * 64,
-        "profile_id": "profile",
-        "profile_sha256": profile_hash,
-        "profile": profile,
-        "dataset_version": "v3",
-        "requested_seed": 42,
-        "child_pid": 123,
-    }
-    status = {
-        "status": "failed",
-        "run_id": run.name,
-        "config_identity_sha256": "1" * 64,
-        "profile_sha256": profile_hash,
-        "requested_seed": 42,
-        "started_at_utc": "2026-01-01T00:00:00Z",
-        "ended_at_utc": "2026-01-01T00:00:01Z",
-        "duration_seconds": 1.0,
-        "child_pid": 123,
-        "child_process_exit_code": 23,
-        "last_completed_observable_stage": "fit_started",
-        "failure_codes": ["worker_exit_code:23"],
-        "failure_reason": "worker_exit_code:23",
-        "predictor_loading_attempted": False,
-        "predictor_loading_succeeded": False,
-    }
-    _write_json(run / "run_metadata.json", metadata)
-    _write_json(run / "execution_status.json", status)
-    _write_json(
-        run / "_FAILED",
-        {
-            "status": "failed",
-            "run_id": run.name,
-            "failure_codes": status["failure_codes"],
-        },
-    )
+    _write_exact_failed_autogluon(run)
 
     def forbidden_loader(_path: Path) -> Any:
         raise AssertionError("predictor loader must not be called")
@@ -310,6 +274,147 @@ def test_failed_autogluon_never_loads_predictor(
     record = AutoGluonSourceAdapter().prepare(run, config)
     assert record.terminal_status == "failed"
     assert record.tags["predictor_loading_attempted"] == "false"
+
+
+def _write_exact_failed_autogluon(run: Path) -> None:
+    run.mkdir(parents=True, exist_ok=True)
+    profile_id = "lightgbmprep_only_cpu_v1"
+    seed = 42
+    gpu_budget = 0
+    configured_profile = get_profile(profile_id)
+    profile = profile_summary(configured_profile, seed, gpu_budget)
+    resolved = {
+        "schema_version": 1,
+        "profile_id": profile_id,
+        "seed": seed,
+        "dataset": {
+            "version": "v3",
+            "directory": "data/processed/v3",
+            "train_features_file": "X_train.parquet",
+            "train_target_file": "y_train.parquet",
+            "label": "target",
+        },
+        "predictor": {
+            "problem_type": "binary",
+            "eval_metric": "balanced_accuracy",
+            "positive_class": 1,
+            "verbosity": 2,
+        },
+        "resources": {
+            "time_limit_seconds": 30,
+            "num_cpus": 2,
+            "num_gpus": gpu_budget,
+            "fit_strategy": "sequential",
+            "fold_fitting_strategy": "sequential_local",
+        },
+        "fit": {
+            "presets": "extreme_quality",
+            "calibrate_decision_threshold": True,
+        },
+        "artifacts": {"root": "artifacts/autogluon_runs"},
+    }
+    config_hash = config_identity_sha256(resolved)
+    profile_hash = profile_sha256(configured_profile, seed, gpu_budget)
+    started = "2026-01-01T00:00:00Z"
+    ended = "2026-01-01T00:00:01Z"
+    codes = [
+        "worker_exit_code:23",
+        "missing_expected_artifacts",
+        "worker_result_missing",
+    ]
+    resources = {
+        "time_limit_seconds": 30,
+        "num_cpus": 2,
+        "gpu_budget": gpu_budget,
+        "top_level_num_gpus_passed_to_fit": False,
+        "fit_strategy": "sequential",
+        "fold_fitting_strategy": "sequential_local",
+    }
+    completion_reasons = ["worker_result_missing"]
+    metadata = {
+        "schema_version": 1,
+        "run_id": run.name,
+        "config_identity_sha256": config_hash,
+        "profile_id": profile_id,
+        "profile_sha256": profile_hash,
+        "profile": profile,
+        "dataset_version": "v3",
+        "requested_seed": seed,
+        "resources": resources,
+        "started_at_utc": started,
+        "child_pid": 123,
+        "launched_process_pid": 123,
+        "local_operational_nonportable": {
+            "repository_root": str(run.parent),
+            "run_directory": str(run),
+            "python_executable": "python",
+            "worker_command": ["python", "worker.py"],
+        },
+        "ended_at_utc": ended,
+        "duration_seconds": 1.0,
+        "child_process_exit_code": 23,
+        "windows_exit_code_unsigned": 23,
+        "worker_completion_valid": False,
+        "worker_completion_reason_codes": completion_reasons,
+        "log_pump_failures": [],
+    }
+    status = {
+        "status": "failed",
+        "run_id": run.name,
+        "config_identity_sha256": config_hash,
+        "profile_sha256": profile_hash,
+        "requested_seed": seed,
+        "started_at_utc": started,
+        "child_pid": 123,
+        "launched_process_pid": 123,
+        "child_process_exit_code": 23,
+        "windows_exit_code_unsigned": 23,
+        "last_completed_observable_stage": "fit_started",
+        "predictor_loading_attempted": False,
+        "predictor_loading_succeeded": False,
+        "ended_at_utc": ended,
+        "duration_seconds": 1.0,
+        "failure_reason": ";".join(codes),
+        "failure_codes": codes,
+        "missing_expected_artifacts": [
+            "worker_result.json",
+            "dataset_manifest.json",
+            "profile_resolution.json",
+            "predictor/predictor.pkl",
+            "predictor/learner.pkl",
+            "predictor/version.txt",
+            "inspection/leaderboard.csv",
+            "inspection/summary.json",
+            "logs/worker.stdout.log",
+            "logs/worker.stderr.log",
+        ],
+        "worker_completion_valid": False,
+        "worker_completion_reason_codes": completion_reasons,
+        "worker_completion_details": ["worker_result.json is missing"],
+        "log_pump_failures": [],
+        "discovered_model_directories": [],
+        "stderr_tail_bounded": "worker failed",
+        "full_logs_authoritative": True,
+    }
+    (run / "resolved_config.yaml").write_text(
+        yaml.safe_dump(resolved, sort_keys=False), encoding="utf-8"
+    )
+    _write_json(run / "environment.json", {"python": "3.12"})
+    _write_json(run / "run_metadata.json", metadata)
+    _write_json(run / "execution_status.json", status)
+    _write_json(run / "artifact_inventory.json", build_inventory(run))
+    _write_json(
+        run / "_FAILED",
+        {
+            "status": "failed",
+            "run_id": run.name,
+            "ended_at_utc": ended,
+            "child_process_exit_code": 23,
+            "windows_exit_code_unsigned": 23,
+            "failure_reason": ";".join(codes),
+            "failure_codes": codes,
+        },
+    )
 
 
 def _minimal_resolved_research() -> dict[str, Any]:
