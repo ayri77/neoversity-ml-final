@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "generation_note": "Generated once with the production v2 adapter in the locked main environment; tests never regenerate expectations.",
+  "source_columns": ["num_a", "cat_a", "num_b", "cat_b"],
+  "training_data": {
+    "num_a": [
+      0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
+      1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9,
+      2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9
+    ],
+    "cat_a": [
+      "A", "C", "C", "E", "E", "B", "B", "D", "D", "A",
+      "A", "C", "C", "E", "E", "B", "B", "D", "D", "A",
+      "A", "C", "C", "E", "E", "B", "B", "D", "D", "A"
+    ],
+    "num_b": [
+      0.0, 7.0, 1.0, 8.0, 2.0, 9.0, 3.0, 10.0, 4.0, 11.0,
+      5.0, 12.0, 6.0, 0.0, 7.0, 1.0, 8.0, 2.0, 9.0, 3.0,
+      10.0, 4.0, 11.0, 5.0, 12.0, 6.0, 0.0, 7.0, 1.0, 8.0
+    ],
+    "cat_b": [
+      "red", "red", "blue", "blue", "green", "green",
+      "red", "red", "blue", "blue", "green", "green",
+      "red", "red", "blue", "blue", "green", "green",
+      "red", "red", "blue", "blue", "green", "green",
+      "red", "red", "blue", "blue", "green", "green"
+    ]
+  },
+  "training_labels": [
+    0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    0, 1, 0, 1, 0, 1, 0, 1, 0, 1
+  ],
+  "prediction_data": {
+    "num_a": [3.1, 3.2, 3.3, 3.4, 3.5, 3.6],
+    "cat_a": ["A", "B", "unseen", null, "E", "C"],
+    "num_b": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+    "cat_b": ["red", "blue", "green", null, "red", "blue"]
+  },
+  "adapter_contract": {
+    "target_encoder": {
+      "implementation": "custom_autogluon_compatible_binary_oof_target_encoder",
+      "inner_splits": 5,
+      "shuffle": true,
+      "random_state": 42,
+      "alpha": 10.0,
+      "prior": "unweighted_mean_of_category_level_target_means",
+      "keep_original_categorical_features": false
+    },
+    "lightgbm": {
+      "estimator": "LGBMClassifier",
+      "parameters": {
+        "objective": "binary",
+        "n_estimators": 376,
+        "learning_rate": 0.0397613094741,
+        "num_leaves": 16,
+        "min_data_in_leaf": 1,
+        "feature_fraction": 0.5791844062459,
+        "bagging_fraction": 0.9591526242875,
+        "bagging_freq": 1,
+        "lambda_l1": 0.938461750637,
+        "lambda_l2": 0.9899852075056,
+        "extra_trees": false,
+        "max_cat_to_onehot": 27,
+        "cat_l2": 1.8962346412823,
+        "cat_smooth": 0.0215219089995,
+        "min_data_per_group": 39,
+        "random_state": 0,
+        "n_jobs": -1,
+        "verbosity": -1
+      }
+    }
+  },
+  "expected_transformed_columns": [
+    "num_a",
+    "num_b",
+    "cat_a__te",
+    "cat_b__te"
+  ],
+  "expected_transformed_schema_sha256": "39851e00ffb44f7b67104ba0e34a7be38383ca1c1e4425789fdd866039c6d946",
+  "expected_encoded_values_sha256": "dc1d5ce9035cc02791e5518676c2e88cec1fa05af8f37f5d70dbbee12cd00f39",
+  "expected_probabilities": [
+    0.8167947789253822,
+    0.8167947789253822,
+    0.8167947789253822,
+    0.8167947789253822,
+    0.883448552646377,
+    0.883448552646377
+  ],
+  "expected_probabilities_sha256": "cf06fdaadc029b4ed0e22557f9bf34cf93721fce1facac3cf31fdc0e6af346d6"
+}
