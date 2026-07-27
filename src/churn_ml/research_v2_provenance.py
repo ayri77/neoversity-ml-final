@@ -15,9 +15,13 @@ SOURCE_PATHS = (
     "src/churn_ml/config.py",
     "src/churn_ml/experiment_v2.py",
     "src/churn_ml/experiment_v2_adapter.py",
+    "src/churn_ml/experiment_v2_catboost_adapter.py",
     "src/churn_ml/experiment_v2_contract.py",
+    "src/churn_ml/experiment_v2_model_registry.py",
+    "src/churn_ml/experiment_v2_numeric_adapter.py",
     "src/churn_ml/experiment_v2_pipeline.py",
     "src/churn_ml/experiment_v2_schema.py",
+    "src/churn_ml/experiment_v2_xgboost_adapter.py",
     "src/churn_ml/research_v2_artifact_validation.py",
     "src/churn_ml/research_v2_artifacts.py",
     "src/churn_ml/research_v2_cli.py",
@@ -81,7 +85,7 @@ def loaded_module_identity(root: Path) -> tuple[dict[str, Any], str]:
     return canonical, canonical_sha256(canonical)
 
 
-def environment_identity() -> dict[str, str]:
+def environment_identity(adapter_id: str | None = None) -> dict[str, str]:
     result = {"python": sys.version.split()[0]}
     for distribution, label in (
         ("numpy", "numpy"),
@@ -90,6 +94,16 @@ def environment_identity() -> dict[str, str]:
         ("lightgbm", "lightgbm"),
         ("pyarrow", "pyarrow"),
     ):
+        result[label] = importlib.metadata.version(distribution)
+    adapter_distributions = {
+        "xgboost_numeric_v1": ("xgboost", "xgboost"),
+        "catboost_numeric_v1": ("catboost", "catboost"),
+    }
+    adapter_distribution = (
+        None if adapter_id is None else adapter_distributions.get(adapter_id)
+    )
+    if adapter_distribution is not None:
+        distribution, label = adapter_distribution
         result[label] = importlib.metadata.version(distribution)
     return result
 

@@ -1,0 +1,57 @@
+schema_version: 2
+experiment: {id: catboost_numeric_v1_smoke}
+dataset: {version: v3_targeted_missingness}
+evaluation_plan_path: configs/research_v2/plans/telecom_v3_smoke_r1x3_t2_v1.yaml
+feature_pipeline:
+  id: manual_v3_pipeline_v1_compat
+  contract:
+    source_feature_count: 217
+    drop: [Var214, Var220, Var222, Var218_is_missing]
+    categorical: [Var192, Var193, Var194, Var195, Var196, Var197, Var198, Var199, Var200, Var201, Var202, Var203, Var204, Var205, Var206, Var207, Var208, Var210, Var211, Var212, Var216, Var217, Var218, Var219, Var221, Var223, Var225, Var226, Var227, Var228, Var229]
+    expected_model_feature_count: 213
+    expected_source_schema_sha256: fa4cd8017a05520ca7f6c0fb81fb2f05b9cabe572e757eb43e424befebb9c62e
+    expected_model_input_schema_sha256: e19efe336426c09071db296920353a0b967284a1288a1d9ab54aaa83ca179616
+    expected_transformed_schema_sha256: 7c1fe2610edaa837baf4f041faf024361b896bb52e1fd81121c5ac6652180c41
+candidate_adapter:
+  id: catboost_numeric_v1
+  contract:
+    numeric_features:
+      implementation: existing_v2_fold_local_oof_target_encoding
+      inner_splits: 5
+      shuffle: true
+      random_state: 42
+      alpha: 10.0
+      prior: unweighted_mean_of_category_level_target_means
+      keep_original_categorical_features: false
+      output: numeric_matrix
+      missing_value_policy: native_nan
+    catboost:
+      estimator: CatBoostClassifier
+      parameters:
+        iterations: 300
+        learning_rate: 0.05
+        depth: 6
+        l2_leaf_reg: 3.0
+        random_strength: 1.0
+        bagging_temperature: 1.0
+        border_count: 254
+        random_seed: 42
+        thread_count: 1
+        bootstrap_type: Bayesian
+        grow_policy: SymmetricTree
+        loss_function: Logloss
+        eval_metric: Logloss
+        nan_mode: Min
+        task_type: CPU
+        allow_writing_files: false
+        verbose: false
+artifacts: {root: artifacts/research_v2}
+persistence:
+  resolved_config: true
+  identities: true
+  assignments: true
+  predictions: true
+  metrics: true
+  threshold_curves: true
+  models: false
+tracking: {enabled: false}

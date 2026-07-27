@@ -18,6 +18,25 @@ ADAPTER_IMPLEMENTATION_SOURCES = (
     "src/churn_ml/research_manual_lightgbm.py",
     "src/churn_ml/target_encoding.py",
 )
+NUMERIC_ADAPTER_SHARED_SOURCES = (
+    "src/churn_ml/experiment_v2_adapter.py",
+    "src/churn_ml/experiment_v2_contract.py",
+    "src/churn_ml/experiment_v2_numeric_adapter.py",
+    "src/churn_ml/target_encoding.py",
+)
+XGBOOST_ADAPTER_IMPLEMENTATION_SOURCES = (
+    *NUMERIC_ADAPTER_SHARED_SOURCES,
+    "src/churn_ml/experiment_v2_xgboost_adapter.py",
+)
+CATBOOST_ADAPTER_IMPLEMENTATION_SOURCES = (
+    *NUMERIC_ADAPTER_SHARED_SOURCES,
+    "src/churn_ml/experiment_v2_catboost_adapter.py",
+)
+ADAPTER_IMPLEMENTATION_SOURCES_BY_ID = {
+    "manual_lightgbm_te_v1_compat": ADAPTER_IMPLEMENTATION_SOURCES,
+    "xgboost_numeric_v1": XGBOOST_ADAPTER_IMPLEMENTATION_SOURCES,
+    "catboost_numeric_v1": CATBOOST_ADAPTER_IMPLEMENTATION_SOURCES,
+}
 
 
 def build_component_identities(
@@ -36,7 +55,10 @@ def build_component_identities(
     )
     adapter_sources = _implementation_source_payload(
         source_records,
-        ADAPTER_IMPLEMENTATION_SOURCES,
+        ADAPTER_IMPLEMENTATION_SOURCES_BY_ID.get(
+            str(adapter_inputs.get("id")),
+            ADAPTER_IMPLEMENTATION_SOURCES,
+        ),
     )
     pipeline_canonical = {
         "schema_version": 2,

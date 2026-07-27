@@ -47,7 +47,11 @@ TRAIN_PATH = PROJECT_ROOT / "data/processed/v3_targeted_missingness/X_train.parq
 
 def test_registries_are_explicit_read_only_and_reject_unknown_ids() -> None:
     assert set(feature_pipeline_registry()) == {"manual_v3_pipeline_v1_compat"}
-    assert set(candidate_adapter_registry()) == {"manual_lightgbm_te_v1_compat"}
+    assert set(candidate_adapter_registry()) == {
+        "manual_lightgbm_te_v1_compat",
+        "xgboost_numeric_v1",
+        "catboost_numeric_v1",
+    }
     with pytest.raises(TypeError):
         feature_pipeline_registry()["new"] = object()  # type: ignore[index,assignment]
     with pytest.raises(ExperimentV2ContractError, match="Unknown feature pipeline"):

@@ -85,9 +85,9 @@ def preflight(config_path: Path) -> ResearchV2Preflight:
             config.plan_path.relative_to(PROJECT_ROOT).as_posix(),
         ),
     )
-    environment = environment_identity()
     pipeline = get_feature_pipeline(config.pipeline_id)
     adapter = get_candidate_adapter(config.adapter_id)
+    environment = environment_identity(config.adapter_id)
     component_identities, component_hashes = build_component_identities(
         pipeline_inputs=pipeline.identity_inputs(config.pipeline_contract),
         adapter_inputs=adapter.identity_inputs(config.adapter_contract),
