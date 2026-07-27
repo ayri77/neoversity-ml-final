@@ -1,0 +1,41 @@
+# Documentation-only template. This is intentionally not an executable production
+# deployment and does not select a candidate, weight, or threshold.
+schema_version: 1
+deployment_id: replace-with-approved-deployment-id
+dataset_version: replace-with-approved-dataset-version
+pipeline_id: replace-with-approved-pipeline-id
+components:
+  - component_id: replace-with-approved-component-id
+    approval_artifact_path: configs/deployment_v1/approvals/replace-me.yaml
+    adapter_id: replace-with-supported-adapter-id
+    fixed_parameters: {} # Exact approved resolved estimator parameter mapping.
+    bag_seeds: [0]
+    component_weight: 1.0
+blend:
+  method: fixed_weighted_mean
+  weight_sum_tolerance: 1.0e-12
+threshold:
+  value: 0.5 # Replace with the preapproved fixed value.
+  source_reference: replace-with-preapproved-threshold-evidence
+  comparison: greater_than_or_equal
+bagging:
+  method: full_data_seed_bagging
+  aggregation: arithmetic_mean
+  model_persistence: false
+test_data:
+  path: data/competition/replace-with-test.parquet
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  expected_rows: 1
+  ordered_schema_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+sample_submission:
+  path: data/competition/replace-with-sample.csv
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  expected_rows: 1
+  id_column: index
+  target_column: y
+output:
+  root: artifacts/deployments
+  submission_filename: submission.csv
+runtime:
+  tracking_enabled: false
+  network_enabled: false

@@ -1,0 +1,31 @@
+# Documentation-only template. Approval is always authored manually and must
+# authenticate one semantically valid completed Experiment Core v2 run.
+schema_version: 1
+approval_id: replace-with-manual-approval-id
+component_id: replace-with-component-id
+component_name: Replace with a human-readable component name
+research_run:
+  path: artifacts/research_v2/replace-with-run
+  run_id: replace-with-run-id
+  manifest_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  plan_id: replace-with-plan-id
+  plan_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  dataset_identity_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  pipeline_id: replace-with-pipeline-id
+  pipeline_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  adapter_id: replace-with-supported-adapter-id
+  adapter_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  candidate_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+fixed_resolved_model_parameters: {}
+threshold_evidence_reference: replace-with-preapproved-threshold-evidence
+paired_comparison:
+  reference: null
+  manifest_sha256: null
+  exception:
+    granted: true
+    reason: Replace with the explicit manual exception reason
+manual_approval:
+  status: approved
+  approver: replace-with-approver
+  approved_at_utc: "2000-01-01T00:00:00+00:00"
+intended_deployment_role: replace-with-intended-role
