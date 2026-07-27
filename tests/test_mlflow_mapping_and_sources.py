@@ -205,12 +205,9 @@ def test_failed_research_artifact_policy_and_no_source_mutation(
     (run / "predictions" / "outer_validation.parquet").write_bytes(b"prohibited")
     before = _tree_snapshot(run)
 
-    record = ResearchV2SourceAdapter().prepare(run, config)
+    with pytest.raises(SourceValidationError):
+        ResearchV2SourceAdapter().prepare(run, config)
 
-    assert record.terminal_status == "failed"
-    assert "execution_status.json" in record.artifact_relative_paths
-    assert "resolved_config.yaml" not in record.artifact_relative_paths
-    assert all("predictions" not in item for item in record.artifact_relative_paths)
     assert _tree_snapshot(run) == before
 
 

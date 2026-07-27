@@ -16,7 +16,7 @@ from src.churn_ml.mlflow_artifacts import IndexedArtifact
 SourceType = str
 TerminalStatus = Literal["completed", "failed"]
 MLflowTerminalStatus = Literal["FINISHED", "FAILED"]
-SOURCE_KEY_SCHEMA_VERSION = 2
+SOURCE_KEY_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -43,17 +43,20 @@ class IndexedRun:
         )
 
     @property
+    def source_key_payload(self) -> dict[str, Any]:
+        """Return the portable schema-v3 lookup-key payload."""
+        return {
+            "source_key_schema_version": SOURCE_KEY_SCHEMA_VERSION,
+            "source_type": self.source_type,
+            "source_relative_path": canonical_source_relative_path(
+                self.source_relative_path
+            ),
+            "source_run_id": self.source_run_id,
+        }
+
+    @property
     def source_key(self) -> str:
-        return canonical_sha256(
-            {
-                "source_key_schema_version": SOURCE_KEY_SCHEMA_VERSION,
-                "source_type": self.source_type,
-                "source_relative_path": canonical_source_relative_path(
-                    self.source_relative_path
-                ),
-                "source_run_id": self.source_run_id,
-            }
-        )
+        return canonical_sha256(self.source_key_payload)
 
     @property
     def artifact_relative_paths(self) -> tuple[str, ...]:

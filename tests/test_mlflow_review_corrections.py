@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pytest
+import yaml
 
 from src.churn_ml.autogluon_artifacts import build_inventory
 from src.churn_ml.mlflow_artifacts import (
@@ -33,6 +34,8 @@ from src.churn_ml.mlflow_sources import (
 from src.churn_ml.mlflow_sync import SyncItem, _sync_one, _write_receipt, sync_sources
 from tests.test_mlflow_config import valid_payload, write_config
 from tests.test_mlflow_mapping_and_sources import _write_exact_failed_autogluon
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass
@@ -809,12 +812,18 @@ def _write_full_failed_research(run: Path) -> None:
         "source": "5" * 64,
         "loaded_modules": "6" * 64,
     }
+    config_path = (
+        PROJECT_ROOT / "configs/research_v2/manual_lightgbm_te_v1_compat_smoke.yaml"
+    )
+    resolved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    plan_path = PROJECT_ROOT / resolved["evaluation_plan_path"]
+    resolved["evaluation_plan"] = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
     metadata = {
         "schema_version": 2,
-        "experiment_id": "experiment",
-        "plan_id": "plan",
-        "feature_pipeline_id": "pipeline",
-        "candidate_adapter_id": "adapter",
+        "experiment_id": resolved["experiment"]["id"],
+        "plan_id": resolved["evaluation_plan"]["plan"]["id"],
+        "feature_pipeline_id": resolved["feature_pipeline"]["id"],
+        "candidate_adapter_id": resolved["candidate_adapter"]["id"],
         "hashes": hashes,
         "status": "failed",
         "started_at_utc": started,
@@ -857,22 +866,7 @@ def _write_full_failed_research(run: Path) -> None:
         "failure": failure,
     }
     (run / "resolved_config.yaml").write_text(
-        "schema_version: 2\n"
-        "experiment:\n  id: experiment\n"
-        "dataset:\n  version: v3\n"
-        "evaluation_plan_path: configs/research_v2/plans/test.yaml\n"
-        "feature_pipeline:\n  id: pipeline\n  contract: {}\n"
-        "candidate_adapter:\n  id: adapter\n  contract: {}\n"
-        "artifacts:\n  root: artifacts/research_v2\n"
-        "persistence:\n"
-        "  resolved_config: true\n  identities: true\n"
-        "  assignments: true\n  predictions: true\n  metrics: true\n"
-        "  threshold_curves: false\n  models: false\n"
-        "tracking:\n  enabled: false\n"
-        "evaluation_plan:\n  plan:\n    id: plan\n"
-        "  dataset:\n    version: v3\n"
-        "  outer_evaluation:\n    repeat_seeds: [1]\n    n_splits: 3\n",
-        encoding="utf-8",
+        yaml.safe_dump(resolved, sort_keys=False), encoding="utf-8"
     )
     (run / "run_metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"

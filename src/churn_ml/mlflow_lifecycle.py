@@ -6,6 +6,8 @@ import json
 import math
 import stat
 from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -21,11 +23,30 @@ from src.churn_ml.autogluon_profiles import (
     profile_summary,
 )
 from src.churn_ml.autogluon_supervisor import unsigned_windows_exit_code
+from src.churn_ml.experiment_v2 import get_candidate_adapter, get_feature_pipeline
 from src.churn_ml.mlflow_mapping import canonical_sha256
+from src.churn_ml.research_config import (
+    _validate_plan_invariants,
+    _validate_plan_structure,
+)
+from src.churn_ml.research_v2_artifact_validation import (
+    validate_portable_payload_paths,
+)
+from src.churn_ml.research_v2_config import ROOT_KEYS, SAFE_SLUG, SECTION_KEYS
 
 
 class FailedLifecycleError(RuntimeError):
     """Raised when a failed source does not prove an exact trusted lifecycle."""
+
+
+@dataclass(frozen=True)
+class ValidatedFailedResearchArtifacts:
+    """Optional artifacts trusted after exact failed-run validation."""
+
+    resolved_config: dict[str, Any] | None
+    identity_hashes: dict[str, str]
+    context_hashes: dict[str, str]
+    artifact_relative_paths: tuple[str, ...]
 
 
 _RESEARCH_STATUS_KEYS = {
@@ -66,28 +87,6 @@ _RESEARCH_IDENTITY_NAMES = {
     "loaded_modules": "loaded_modules",
 }
 _RESEARCH_HASH_KEYS = set(_RESEARCH_IDENTITY_NAMES.values())
-_RESEARCH_RESOLVED_CONFIG_KEYS = {
-    "schema_version",
-    "experiment",
-    "dataset",
-    "evaluation_plan_path",
-    "feature_pipeline",
-    "candidate_adapter",
-    "artifacts",
-    "persistence",
-    "tracking",
-    "evaluation_plan",
-}
-_RESEARCH_PERSISTENCE_KEYS = {
-    "resolved_config",
-    "identities",
-    "assignments",
-    "predictions",
-    "metrics",
-    "threshold_curves",
-    "models",
-}
-
 _AUTO_STATUS_KEYS = {
     "status",
     "run_id",
@@ -223,8 +222,9 @@ def validate_failed_research_run(
     status: Mapping[str, Any],
     metadata: Mapping[str, Any],
     resolved_config: Mapping[str, Any] | None,
-) -> None:
-    """Validate the exact failed Experiment Core v2 lifecycle without promotion."""
+    repository_root: Path,
+) -> ValidatedFailedResearchArtifacts:
+    """Validate a failed v2 lifecycle and return only trusted optional artifacts."""
     _validate_terminal_files(run_dir, failed_marker_must_be_json=False)
     _validate_tree_safety(run_dir, research=True)
     _exact_keys(status, _RESEARCH_STATUS_KEYS, "research execution status")
@@ -263,133 +263,540 @@ def validate_failed_research_run(
         or _failure_mapping(metadata["failure"], "research metadata failure") != failure
     ):
         raise FailedLifecycleError("Research metadata disagrees with terminal status")
+    hashes: dict[str, str] | None = None
     if early:
         if completed != 0:
             raise FailedLifecycleError("Research early failure claims fold progress")
-        return
+    else:
+        if (
+            _exact_int(metadata["schema_version"]) != 2
+            or _nonempty_string(metadata["run_id"], "research metadata run_id")
+            != run_dir.name
+            or _utc(metadata["started_at_utc"], "research metadata started_at_utc")
+            != started
+            or metadata["competition_assets_accessed"] is not False
+            or metadata["tracking_enabled"] is not False
+        ):
+            raise FailedLifecycleError("Research full metadata identity differs")
+        hashes = _sha_mapping(metadata["hashes"], "research metadata hashes")
+        if set(hashes) != _RESEARCH_HASH_KEYS:
+            raise FailedLifecycleError("Research identity hash keys differ")
+        _validate_research_metadata_context(metadata)
 
-    if (
-        _exact_int(metadata["schema_version"]) != 2
-        or _nonempty_string(metadata["run_id"], "research metadata run_id")
-        != run_dir.name
-        or _utc(metadata["started_at_utc"], "research metadata started_at_utc")
-        != started
-        or metadata["competition_assets_accessed"] is not False
-        or metadata["tracking_enabled"] is not False
-    ):
-        raise FailedLifecycleError("Research full metadata identity differs")
-    hashes = _sha_mapping(metadata["hashes"], "research metadata hashes")
-    if set(hashes) != _RESEARCH_HASH_KEYS:
-        raise FailedLifecycleError("Research identity hash keys differ")
-    _validate_research_metadata_context(metadata)
-    if resolved_config is None:
+    if full and resolved_config is None:
         raise FailedLifecycleError("Research full failure lacks resolved config")
-    _validate_research_resolved_config(resolved_config)
-    plan = _mapping(resolved_config.get("evaluation_plan"), "evaluation plan")
-    configured_expected = len(
-        _list(
-            _mapping(plan.get("outer_evaluation"), "outer evaluation").get(
-                "repeat_seeds"
-            )
-        )
-    ) * _exact_int(
-        _mapping(plan.get("outer_evaluation"), "outer evaluation").get("n_splits"),
-        "outer n_splits",
+    validated_config = (
+        _validate_research_resolved_config(resolved_config, repository_root)
+        if resolved_config is not None
+        else None
     )
-    expected_values = {
-        "experiment_id": _mapping(
-            resolved_config.get("experiment"), "research experiment"
-        ).get("id"),
-        "plan_id": _mapping(plan.get("plan"), "research plan identity").get("id"),
-        "feature_pipeline_id": _mapping(
-            resolved_config.get("feature_pipeline"), "research feature pipeline"
-        ).get("id"),
-        "candidate_adapter_id": _mapping(
-            resolved_config.get("candidate_adapter"), "research candidate adapter"
-        ).get("id"),
-    }
-    if any(metadata.get(key) != value for key, value in expected_values.items()):
-        raise FailedLifecycleError(
-            "Research plan/dataset/pipeline/adapter metadata disagrees with config"
+    if full:
+        assert validated_config is not None
+        plan = _mapping(
+            validated_config.get("evaluation_plan"), "research evaluation plan"
         )
-    if configured_expected != expected:
-        raise FailedLifecycleError("Research expected fold count disagrees with plan")
+        outer = _mapping(plan.get("outer_evaluation"), "outer evaluation")
+        configured_expected = len(_list(outer.get("repeat_seeds"))) * _exact_int(
+            outer.get("n_splits"), "outer n_splits"
+        )
+        expected_values = {
+            "experiment_id": _mapping(
+                validated_config.get("experiment"), "research experiment"
+            ).get("id"),
+            "plan_id": _mapping(plan.get("plan"), "research plan").get("id"),
+            "feature_pipeline_id": _mapping(
+                validated_config.get("feature_pipeline"), "research feature pipeline"
+            ).get("id"),
+            "candidate_adapter_id": _mapping(
+                validated_config.get("candidate_adapter"), "research candidate adapter"
+            ).get("id"),
+        }
+        if any(metadata.get(key) != value for key, value in expected_values.items()):
+            raise FailedLifecycleError(
+                "Research plan/pipeline/adapter metadata disagrees with config"
+            )
+        if configured_expected != expected:
+            raise FailedLifecycleError(
+                "Research expected fold count disagrees with plan"
+            )
+
+    identity_hashes, identity_paths = _validate_research_identity_artifacts(
+        run_dir,
+        repository_root=repository_root,
+        resolved_config=validated_config,
+        metadata_hashes=hashes,
+        require_all=full and completed > 0,
+    )
+    context_hashes, context_paths = _validate_optional_research_context_artifacts(
+        run_dir,
+        metadata=metadata,
+        status_started=started,
+        status_finished=finished,
+    )
+    if early:
+        _reject_unsupported_early_research_artifacts(run_dir)
+    artifact_paths = [
+        *(["resolved_config.yaml"] if validated_config is not None else []),
+        *identity_paths,
+        *context_paths,
+    ]
+    return ValidatedFailedResearchArtifacts(
+        resolved_config=validated_config,
+        identity_hashes=identity_hashes,
+        context_hashes=context_hashes,
+        artifact_relative_paths=tuple(sorted(artifact_paths)),
+    )
+
+
+def _validate_research_resolved_config(
+    config: Mapping[str, Any],
+    repository_root: Path,
+) -> dict[str, Any]:
+    """Apply the production v2 loader contract to a persisted resolved payload."""
+    _exact_keys(config, ROOT_KEYS | {"evaluation_plan"}, "research resolved config")
+    payload = {key: value for key, value in config.items() if key != "evaluation_plan"}
+    for name, keys in SECTION_KEYS.items():
+        section = _mapping(payload.get(name), f"research config {name}")
+        _exact_keys(section, keys, f"research config {name}")
+    if _exact_int(payload["schema_version"], "research config schema") != 2:
+        raise FailedLifecycleError("Research resolved config schema differs")
+    for value, label in (
+        (_mapping(payload["experiment"], "experiment")["id"], "experiment.id"),
+        (_mapping(payload["dataset"], "dataset")["version"], "dataset.version"),
+        (
+            _mapping(payload["feature_pipeline"], "feature pipeline")["id"],
+            "feature_pipeline.id",
+        ),
+        (
+            _mapping(payload["candidate_adapter"], "candidate adapter")["id"],
+            "candidate_adapter.id",
+        ),
+    ):
+        if SAFE_SLUG.fullmatch(_nonempty_string(value, label)) is None:
+            raise FailedLifecycleError(f"Research config {label} is not a safe slug")
+    root = repository_root.resolve()
+    _repository_path(
+        payload["evaluation_plan_path"], root, "research evaluation_plan_path"
+    )
+    _repository_path(
+        _mapping(payload["artifacts"], "research artifacts")["root"],
+        root,
+        "research artifacts.root",
+    )
+    plan = _mapping(config["evaluation_plan"], "research evaluation plan")
+    try:
+        _validate_plan_structure(dict(plan))
+        _validate_plan_invariants(dict(plan))
+    except (KeyError, TypeError, ValueError) as error:
+        raise FailedLifecycleError(
+            f"Research evaluation plan contract differs: {error}"
+        ) from error
+    dataset = _mapping(payload["dataset"], "research dataset")
+    plan_dataset = _mapping(plan["dataset"], "research plan dataset")
+    if plan_dataset["version"] != dataset["version"]:
+        raise FailedLifecycleError("Research plan/config dataset version differs")
+    _repository_path(
+        plan_dataset["processed_dir"], root, "research dataset.processed_dir"
+    )
+    files = _mapping(plan_dataset["files"], "research dataset files")
+    for label, item in files.items():
+        record = _mapping(item, f"research dataset file {label}")
+        name = _nonempty_string(record.get("name"), f"dataset.files.{label}.name")
+        if (
+            Path(name).name != name
+            or PurePosixPath(name).name != name
+            or PureWindowsPath(name).name != name
+        ):
+            raise FailedLifecycleError(
+                f"Research dataset.files.{label}.name is not a basename"
+            )
+    pipeline = _mapping(payload["feature_pipeline"], "research feature pipeline")
+    adapter = _mapping(payload["candidate_adapter"], "research candidate adapter")
+    try:
+        get_feature_pipeline(str(pipeline["id"])).validate_contract(
+            _mapping(pipeline["contract"], "research feature pipeline contract")
+        )
+        get_candidate_adapter(str(adapter["id"])).validate_contract(
+            _mapping(adapter["contract"], "research candidate adapter contract")
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise FailedLifecycleError(
+            f"Research pipeline/adapter contract differs: {error}"
+        ) from error
+    persistence = _mapping(payload["persistence"], "research persistence")
+    required_true = {
+        "resolved_config",
+        "identities",
+        "assignments",
+        "predictions",
+        "metrics",
+    }
+    for key, value in persistence.items():
+        if type(value) is not bool:
+            raise FailedLifecycleError(f"Research persistence.{key} must be boolean")
+        if key in required_true and value is not True:
+            raise FailedLifecycleError(f"Research persistence.{key} must be true")
+    if persistence["models"] is not False:
+        raise FailedLifecycleError("Research model persistence must be disabled")
+    if _mapping(payload["tracking"], "research tracking")["enabled"] is not False:
+        raise FailedLifecycleError("Research tracking must remain disabled")
+    try:
+        validate_portable_payload_paths(
+            config,
+            label="resolved_config",
+            project_root=root,
+        )
+    except Exception as error:
+        raise FailedLifecycleError(
+            f"Research resolved config contains a nonportable path: {error}"
+        ) from error
+    return deepcopy(dict(config))
+
+
+def _validate_research_identity_artifacts(
+    run_dir: Path,
+    *,
+    repository_root: Path,
+    resolved_config: Mapping[str, Any] | None,
+    metadata_hashes: Mapping[str, str] | None,
+    require_all: bool,
+) -> tuple[dict[str, str], list[str]]:
     identities = run_dir / "identities"
-    if completed > 0 and not identities.is_dir():
+    if require_all and not identities.is_dir():
         raise FailedLifecycleError("Research progressed failure lacks identities")
+    if identities.exists() and not identities.is_dir():
+        raise FailedLifecycleError("Research identities path is not a directory")
+    allowed = {f"{name}.json" for name in _RESEARCH_IDENTITY_NAMES}
+    if identities.is_dir():
+        unexpected = [
+            path.relative_to(identities).as_posix()
+            for path in identities.rglob("*")
+            if path.is_file() and path.relative_to(identities).as_posix() not in allowed
+        ]
+        if unexpected:
+            raise FailedLifecycleError(
+                f"Research identities contain unknown artifacts: {sorted(unexpected)}"
+            )
+    hashes: dict[str, str] = {}
+    paths: list[str] = []
+    canonicals: dict[str, Mapping[str, Any]] = {}
     for filename, hash_key in _RESEARCH_IDENTITY_NAMES.items():
         path = identities / f"{filename}.json"
-        if completed > 0 and not path.is_file():
+        if require_all and not path.is_file():
             raise FailedLifecycleError(
                 f"Research identity artifact is missing: {filename}"
             )
-        if path.exists():
-            if not path.is_file():
-                raise FailedLifecycleError(
-                    f"Research identity artifact is not a file: {filename}"
-                )
-            payload = _strict_json(path, f"research identity {filename}")
-            _exact_keys(payload, {"sha256", "canonical"}, f"identity {filename}")
-            if (
-                payload["sha256"] != hashes[hash_key]
-                or canonical_sha256(payload["canonical"]) != hashes[hash_key]
-            ):
-                raise FailedLifecycleError(
-                    f"Research identity hash differs: {filename}"
-                )
-
-
-def _validate_research_resolved_config(config: Mapping[str, Any]) -> None:
-    _exact_keys(config, _RESEARCH_RESOLVED_CONFIG_KEYS, "research resolved config")
-    if _exact_int(config["schema_version"], "research config schema") != 2:
-        raise FailedLifecycleError("Research resolved config schema differs")
-    sections = {
-        "experiment": {"id"},
-        "dataset": {"version"},
-        "feature_pipeline": {"id", "contract"},
-        "candidate_adapter": {"id", "contract"},
-        "artifacts": {"root"},
-        "persistence": _RESEARCH_PERSISTENCE_KEYS,
-        "tracking": {"enabled"},
-    }
-    for name, keys in sections.items():
-        section = _mapping(config[name], f"research config {name}")
-        _exact_keys(section, keys, f"research config {name}")
-    for section_name, key in (
-        ("experiment", "id"),
-        ("dataset", "version"),
-        ("feature_pipeline", "id"),
-        ("candidate_adapter", "id"),
-        ("artifacts", "root"),
-    ):
-        _nonempty_string(
-            _mapping(config[section_name], section_name)[key],
-            f"research config {section_name}.{key}",
+        if not path.exists():
+            continue
+        if not path.is_file():
+            raise FailedLifecycleError(
+                f"Research identity artifact is not a file: {filename}"
+            )
+        payload = _strict_json(path, f"research identity {filename}")
+        _exact_keys(payload, {"sha256", "canonical"}, f"identity {filename}")
+        digest = _sha(payload["sha256"], f"research identity {filename} hash")
+        canonical = _mapping(
+            payload["canonical"], f"research identity {filename} canonical"
         )
-    _nonempty_string(config["evaluation_plan_path"], "research evaluation plan path")
-    _mapping(
-        _mapping(config["feature_pipeline"], "feature pipeline")["contract"],
-        "research feature pipeline contract",
-    )
-    _mapping(
-        _mapping(config["candidate_adapter"], "candidate adapter")["contract"],
-        "research candidate adapter contract",
-    )
-    persistence = _mapping(config["persistence"], "research persistence")
-    if any(type(persistence[key]) is not bool for key in _RESEARCH_PERSISTENCE_KEYS):
-        raise FailedLifecycleError("Research persistence flag types differ")
-    if _mapping(config["tracking"], "research tracking")["enabled"] is not False:
-        raise FailedLifecycleError("Research tracking must remain disabled")
-    plan = _mapping(config["evaluation_plan"], "research evaluation plan")
-    plan_identity = _mapping(plan.get("plan"), "research plan identity")
-    _nonempty_string(plan_identity.get("id"), "research plan ID")
-    plan_dataset = _mapping(plan.get("dataset"), "research plan dataset")
-    if plan_dataset.get("version") != _mapping(config["dataset"], "dataset")["version"]:
-        raise FailedLifecycleError("Research plan/config dataset version differs")
+        if canonical_sha256(canonical) != digest:
+            raise FailedLifecycleError(f"Research identity hash differs: {filename}")
+        try:
+            validate_portable_payload_paths(
+                canonical,
+                label=f"identities.{filename}.canonical",
+                project_root=repository_root,
+            )
+        except Exception as error:
+            raise FailedLifecycleError(
+                f"Research identity path differs: {filename}: {error}"
+            ) from error
+        if metadata_hashes is not None and digest != metadata_hashes[hash_key]:
+            raise FailedLifecycleError(
+                f"Research identity metadata hash differs: {filename}"
+            )
+        _validate_research_identity_semantics(
+            filename,
+            canonical,
+            repository_root=repository_root,
+            resolved_config=resolved_config,
+        )
+        hashes[hash_key] = digest
+        canonicals[filename] = canonical
+        paths.append(f"identities/{filename}.json")
+    candidate = canonicals.get("candidate")
+    if candidate is not None:
+        for component, hash_key in (
+            ("feature_pipeline", "feature_pipeline"),
+            ("candidate_adapter", "candidate_adapter"),
+        ):
+            component_identity = _mapping(candidate[component], component)
+            if hash_key in hashes and component_identity["sha256"] != hashes[hash_key]:
+                raise FailedLifecycleError(
+                    f"Research candidate/{component} identity differs"
+                )
+    return hashes, paths
+
+
+def _validate_research_identity_semantics(
+    name: str,
+    canonical: Mapping[str, Any],
+    *,
+    repository_root: Path,
+    resolved_config: Mapping[str, Any] | None,
+) -> None:
+    config = resolved_config or {}
+    plan = _mapping(config.get("evaluation_plan"), "research evaluation plan")
+    pipeline = _mapping(config.get("feature_pipeline"), "research feature pipeline")
+    adapter = _mapping(config.get("candidate_adapter"), "research candidate adapter")
+    dataset = _mapping(config.get("dataset"), "research dataset")
+    if name == "evaluation_plan":
+        _exact_keys(
+            canonical,
+            {
+                "schema_version",
+                "plan_id",
+                "dataset",
+                "outer_evaluation",
+                "threshold_selection",
+                "threshold_policy",
+                "metrics",
+                "aggregation",
+                "assignment_fingerprints",
+            },
+            "evaluation plan identity",
+        )
+        if _exact_int(canonical["schema_version"]) != 1:
+            raise FailedLifecycleError("Evaluation plan identity schema differs")
+        if config and (
+            canonical["plan_id"] != _mapping(plan.get("plan"), "research plan")["id"]
+            or _mapping(canonical["dataset"], "plan identity dataset")[
+                "dataset_version"
+            ]
+            != dataset["version"]
+            or canonical["outer_evaluation"] != plan["outer_evaluation"]
+            or canonical["threshold_selection"] != plan["threshold_selection"]
+            or canonical["threshold_policy"] != plan["threshold_policy"]
+            or canonical["metrics"] != plan["metrics"]
+            or canonical["aggregation"] != plan["aggregation"]
+        ):
+            raise FailedLifecycleError("Evaluation plan identity disagrees with config")
+    elif name in {"feature_pipeline", "candidate_adapter"}:
+        expected = (
+            {
+                "schema_version",
+                "id",
+                "contract",
+                "resolved_feature_schema",
+                "implementation_sources",
+            }
+            if name == "feature_pipeline"
+            else {
+                "schema_version",
+                "id",
+                "contract",
+                "probability_semantics",
+                "runtime_dependencies",
+                "implementation_sources",
+            }
+        )
+        _exact_keys(canonical, expected, f"{name} identity")
+        if _exact_int(canonical["schema_version"]) != 2:
+            raise FailedLifecycleError(f"Research {name} identity schema differs")
+        configured = pipeline if name == "feature_pipeline" else adapter
+        if config and (
+            canonical["id"] != configured["id"]
+            or canonical["contract"] != configured["contract"]
+        ):
+            raise FailedLifecycleError(
+                f"Research {name} identity disagrees with config"
+            )
+        _validate_source_file_manifest(
+            _mapping(canonical["implementation_sources"], "implementation sources"),
+            repository_root,
+            f"{name} implementation sources",
+        )
+    elif name == "candidate":
+        _exact_keys(
+            canonical,
+            {
+                "schema_version",
+                "dataset_version",
+                "feature_pipeline",
+                "candidate_adapter",
+                "probability_semantics",
+                "evaluation_boundary",
+            },
+            "candidate identity",
+        )
+        if _exact_int(canonical["schema_version"]) != 2:
+            raise FailedLifecycleError("Research candidate identity schema differs")
+        candidate_pipeline = _mapping(
+            canonical["feature_pipeline"], "candidate pipeline"
+        )
+        candidate_adapter = _mapping(
+            canonical["candidate_adapter"], "candidate adapter"
+        )
+        _exact_keys(candidate_pipeline, {"id", "sha256"}, "candidate pipeline")
+        _exact_keys(candidate_adapter, {"id", "sha256"}, "candidate adapter")
+        _sha(candidate_pipeline["sha256"], "candidate pipeline hash")
+        _sha(candidate_adapter["sha256"], "candidate adapter hash")
+        if config and (
+            canonical["dataset_version"] != dataset["version"]
+            or candidate_pipeline["id"] != pipeline["id"]
+            or candidate_adapter["id"] != adapter["id"]
+        ):
+            raise FailedLifecycleError(
+                "Research candidate identity disagrees with config"
+            )
+    elif name == "source":
+        _validate_source_file_manifest(canonical, repository_root, "source identity")
+    elif name == "loaded_modules":
+        _exact_keys(
+            canonical,
+            {"schema_version", "fresh_process_required", "modules"},
+            "loaded modules identity",
+        )
+        if (
+            _exact_int(canonical["schema_version"]) != 2
+            or canonical["fresh_process_required"] is not True
+            or type(canonical["modules"]) is not list
+        ):
+            raise FailedLifecycleError("Loaded modules identity contract differs")
+        for item in canonical["modules"]:
+            record = _mapping(item, "loaded module record")
+            _exact_keys(
+                record,
+                {"module", "path", "loaded_source_sha256"},
+                "loaded module record",
+            )
+            _nonempty_string(record["module"], "loaded module name")
+            _validate_repository_file_hash(
+                repository_root,
+                record["path"],
+                record["loaded_source_sha256"],
+                "loaded module",
+            )
+
+
+def _validate_source_file_manifest(
+    canonical: Mapping[str, Any],
+    repository_root: Path,
+    label: str,
+) -> None:
+    _exact_keys(canonical, {"schema_version", "hashing_method", "files"}, label)
+    if _exact_int(canonical["schema_version"]) not in {1, 2}:
+        raise FailedLifecycleError(f"{label} schema differs")
+    _nonempty_string(canonical["hashing_method"], f"{label} hashing method")
+    files = canonical["files"]
+    if type(files) is not list or not files:
+        raise FailedLifecycleError(f"{label} files must be a nonempty list")
+    seen: set[str] = set()
+    for item in files:
+        record = _mapping(item, f"{label} file")
+        _exact_keys(record, {"path", "sha256"}, f"{label} file")
+        path = _nonempty_string(record["path"], f"{label} file path")
+        if path in seen:
+            raise FailedLifecycleError(f"{label} contains duplicate paths")
+        seen.add(path)
+        _validate_repository_file_hash(repository_root, path, record["sha256"], label)
+
+
+def _validate_repository_file_hash(
+    repository_root: Path,
+    value: Any,
+    expected_sha256: Any,
+    label: str,
+) -> None:
+    _repository_path(value, repository_root.resolve(), f"{label} path")
+    _sha(expected_sha256, f"{label} sha256")
+
+
+def _validate_optional_research_context_artifacts(
+    run_dir: Path,
+    *,
+    metadata: Mapping[str, Any],
+    status_started: datetime,
+    status_finished: datetime,
+) -> tuple[dict[str, str], list[str]]:
+    hashes: dict[str, str] = {}
+    paths: list[str] = []
+    for name in ("environment", "runtime", "git"):
+        path = run_dir / f"{name}.json"
+        if not path.exists():
+            continue
+        if not path.is_file():
+            raise FailedLifecycleError(f"Research optional {name} is not a file")
+        payload = _strict_json(path, f"research optional {name}")
+        if name == "environment":
+            _validate_research_environment(payload)
+        elif name == "runtime":
+            _validate_research_runtime(
+                payload,
+                status_started=status_started,
+                status_finished=status_finished,
+            )
+        else:
+            _validate_research_git(payload)
+        if name in metadata and payload != metadata[name]:
+            raise FailedLifecycleError(
+                f"Research optional {name} disagrees with run metadata"
+            )
+        hashes[name] = canonical_sha256(payload)
+        paths.append(f"{name}.json")
+    return hashes, paths
+
+
+def _reject_unsupported_early_research_artifacts(run_dir: Path) -> None:
+    allowed_files = {
+        "_FAILED",
+        "execution_status.json",
+        "run_metadata.json",
+        "resolved_config.yaml",
+        "environment.json",
+        "runtime.json",
+        "git.json",
+        *(f"identities/{name}.json" for name in _RESEARCH_IDENTITY_NAMES),
+    }
+    actual_files = {
+        path.relative_to(run_dir).as_posix()
+        for path in run_dir.rglob("*")
+        if path.is_file()
+    }
+    unexpected = sorted(actual_files - allowed_files)
+    if unexpected:
+        raise FailedLifecycleError(
+            f"Research early failure has unsupported authoritative artifacts: {unexpected}"
+        )
+
+
+def _repository_path(value: Any, root: Path, label: str) -> Path:
+    text = _nonempty_string(value, label)
+    posix = PurePosixPath(text)
+    windows = PureWindowsPath(text)
+    if (
+        posix.is_absolute()
+        or windows.is_absolute()
+        or ".." in posix.parts
+        or ".." in windows.parts
+    ):
+        raise FailedLifecycleError(
+            f"{label} must be a repository-relative path without traversal"
+        )
+    resolved = (root / Path(text)).resolve()
+    if resolved != root and root not in resolved.parents:
+        raise FailedLifecycleError(f"{label} escapes the repository")
+    return resolved
 
 
 def _validate_research_metadata_context(metadata: Mapping[str, Any]) -> None:
-    environment = _mapping(metadata["environment"], "research environment")
+    _validate_research_environment(
+        _mapping(metadata["environment"], "research environment")
+    )
+    _validate_research_runtime(_mapping(metadata["runtime"], "research runtime"))
+    _validate_research_git(_mapping(metadata["git"], "research git state"))
+
+
+def _validate_research_environment(environment: Mapping[str, Any]) -> None:
     environment_keys = {
         "python",
         "numpy",
@@ -401,7 +808,14 @@ def _validate_research_metadata_context(metadata: Mapping[str, Any]) -> None:
     _exact_keys(environment, environment_keys, "research environment")
     for key in environment_keys:
         _nonempty_string(environment[key], f"research environment {key}")
-    runtime = _mapping(metadata["runtime"], "research runtime")
+
+
+def _validate_research_runtime(
+    runtime: Mapping[str, Any],
+    *,
+    status_started: datetime | None = None,
+    status_finished: datetime | None = None,
+) -> None:
     runtime_keys = {
         "process_started_at_utc",
         "preflight_at_utc",
@@ -417,6 +831,10 @@ def _validate_research_metadata_context(metadata: Mapping[str, Any]) -> None:
     preflight = _utc(runtime["preflight_at_utc"], "research preflight")
     if preflight < process_started:
         raise FailedLifecycleError("Research preflight predates process start")
+    if status_started is not None and preflight > status_started:
+        raise FailedLifecycleError("Research preflight follows run start")
+    if status_finished is not None and process_started > status_finished:
+        raise FailedLifecycleError("Research process starts after run finish")
     _nonempty_string(runtime["entry_point"], "research runtime entry point")
     if (
         runtime["fresh_process_required"] is not True
@@ -424,7 +842,9 @@ def _validate_research_metadata_context(metadata: Mapping[str, Any]) -> None:
         or runtime["competition_assets_accessed"] is not False
     ):
         raise FailedLifecycleError("Research runtime safety claims differ")
-    git = _mapping(metadata["git"], "research git state")
+
+
+def _validate_research_git(git: Mapping[str, Any]) -> None:
     success_keys = {"branch", "commit", "dirty", "status_porcelain"}
     failure_keys = {"branch", "commit", "dirty", "error"}
     if set(git) == success_keys:

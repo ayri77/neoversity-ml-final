@@ -90,12 +90,22 @@ manifest, and `_SUCCESS` contract.
 Failed research runs use a separate exact validator. It requires `_FAILED`, rejects
 `_SUCCESS` and a stale success manifest, parses ordered UTC timestamps, validates
 exact status and full-or-native-early metadata schemas, bounded fold progress,
-nonempty typed failure details, plan/pipeline/adapter/run agreement, hash shapes,
-resolved-plan fold counts, any persisted identity payloads, environment/runtime/Git
-schemas, and the no-network/no-competition safety claims. Native early and partial
-initialization failures are allowed when their persisted state is internally
-consistent. Reparse paths and forbidden competition, submission, model, pickle, or
-AutoGluon content are rejected.
+nonempty typed failure details, plan/pipeline/adapter/run agreement, hash shapes, and
+resolved-plan fold counts. An early failure is not accepted until every authoritative
+artifact that is present has been classified. A persisted resolved config must satisfy
+the strict Experiment Core v2 key, primitive-type, plan, registered pipeline/adapter,
+persistence, tracking, and repository-contained-path contracts. Present identity,
+environment, runtime, and Git artifacts must satisfy their exact schemas, hashes,
+lifecycle timestamps, and every identity field available from status, metadata, and
+config. Unsupported inventory/manifest-like or other partial artifacts make an early
+source corrupt. Native early failures with no optional config remain valid; consistent
+optional artifacts remain valid. Reparse paths and forbidden competition, submission,
+model, pickle, or AutoGluon content are rejected.
+
+Only the validated result returned by that lifecycle check can supply mapping fields,
+immutable source identity, or additions to the failed-run artifact-copy allowlist. A
+malformed or contradictory optional artifact is rejected before an MLflow client or
+run is created, and cannot be copied or influence mapped parameters.
 
 Completed AutoGluon runs use the standalone read-only inspection classification with
 `attempt_load=False` and must classify exactly as `complete`. The sync never calls a
@@ -123,28 +133,35 @@ The terminal mapping is therefore:
 
 ## Scoped identity and mutation policy
 
-Sync schema version 2 derives the portable source key from:
+Sync schema version 3 derives the portable source key from:
 
 - sync/source-key schema version;
 - source type;
-- canonical source-relative path;
+- the complete canonical source-run path relative to `repository_root`;
 - leaf run ID.
 
-Backslashes normalize to `/`; absolute, rooted, drive, empty, dot, and traversal paths
-are rejected. Path case is preserved. Thus equal leaf IDs under different plans,
-pipelines, candidates, or source directories have distinct keys, while the same
-canonical source repeats the same key. Absolute local paths are excluded.
+The adapters derive that path from the resolved run directory and the resolved
+repository root, not merely from the configured research or AutoGluon source root.
+For example, keys retain `artifacts/research_v2/plan/candidate/run-id` or
+`artifacts/autogluon_runs/run-id`. Backslashes normalize to `/`; absolute, rooted,
+drive, empty, dot, traversal, and repository-escape paths are rejected. Path case is
+preserved. Thus identical internal paths under two differently configured source roots
+have different keys, while repeated sync of the same full repository-relative path
+has the same key. Absolute local paths are excluded from the portable key payload.
+Research and AutoGluon use this same scoping rule.
 
 The separately computed immutable source identity covers the verified terminal source
-(manifest/inventory or failed terminal identity). A new identity at the same canonical
-source key is `source_mutation_detected`; mutation is not hidden by creating another
-row. `mlflow_index.local_source_path_nonportable` is explicitly operational and is not
-part of portable identity.
+(manifest/inventory or validated failed terminal identity). It is deliberately checked
+separately from the lookup key: a new immutable identity at the same complete path is
+`source_mutation_detected`, not a second row.
+`mlflow_index.local_source_path_nonportable` is explicitly operational and is not part
+of portable identity.
 
-Schema-version-1 index rows used the old unscoped key and are not adopted by schema
-version 2. Because this feature has not been merged, migration is a clean index-schema
-bump: use a new/empty local SQLite index or retain old rows only as local historical
-state. Version-2 sync creates and queries only scoped version-2 rows.
+Schema-version-1 rows used an unscoped key, and schema-version-2 rows omitted the
+repository-relative source-root prefix. Neither old key is automatically adopted by
+schema version 3. Because this feature has not been merged, local development should
+reindex into a new/empty SQLite database; old rows may be retained only as local
+historical state. Version-3 sync creates and queries only schema-version-3 keys.
 
 ## Two-phase synchronization and recovery
 
@@ -195,7 +212,8 @@ Research parameters include source/run identity, schema and plan identity, datas
 pipeline, adapter, candidate/source/module hashes, repeat/fold counts, and threshold
 policy. Completed metrics include the defined evaluation metrics, directions, repeat
 summaries, thresholds, and duration. Failed mappings expose only validated failure
-diagnostics.
+diagnostics and fields from optional artifacts that passed the failed-run validator;
+raw optional files never provide fallback mapping values.
 
 AutoGluon parameters include config/profile/dataset/seed/resource identities and
 validated status diagnostics. `predictor_classification` is a tag, not a parameter.

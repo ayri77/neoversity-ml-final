@@ -116,7 +116,6 @@ _RESEARCH_ARTIFACT_ALLOWLIST = (
 _RESEARCH_FAILED_ARTIFACT_ALLOWLIST = (
     "_FAILED",
     "execution_status.json",
-    "resolved_config.yaml",
     "run_metadata.json",
 )
 _AUTOGLUON_ARTIFACT_ALLOWLIST = (
@@ -165,7 +164,9 @@ class ResearchV2SourceAdapter:
     ) -> IndexedRun:
         source_root = self.source_root(config)
         resolved_run = _validated_source_directory(run_dir, source_root)
-        relative = resolved_run.relative_to(source_root).as_posix()
+        relative = _repository_relative_run_path(
+            resolved_run, config.paths.repository_root
+        )
         success = (resolved_run / "_SUCCESS").is_file()
         failed = (resolved_run / "_FAILED").is_file()
         if success and failed:
@@ -192,15 +193,19 @@ class ResearchV2SourceAdapter:
         )
         if failed:
             try:
-                validate_failed_research_run(
+                validated = validate_failed_research_run(
                     resolved_run,
                     status=status,
                     metadata=metadata,
                     resolved_config=resolved_config,
+                    repository_root=config.paths.repository_root,
                 )
                 artifacts = select_indexed_artifacts(
                     resolved_run,
-                    _RESEARCH_FAILED_ARTIFACT_ALLOWLIST,
+                    (
+                        *_RESEARCH_FAILED_ARTIFACT_ALLOWLIST,
+                        *validated.artifact_relative_paths,
+                    ),
                     enabled=config.sync.log_small_artifacts,
                     size_limit=config.sync.max_artifact_size_bytes,
                 )
@@ -209,13 +214,36 @@ class ResearchV2SourceAdapter:
                     "failed_research_lifecycle_invalid",
                     f"Failed research lifecycle is invalid: {relative}: {error}",
                 ) from error
+            trusted_metadata = dict(metadata)
+            if validated.identity_hashes:
+                trusted_metadata["hashes"] = dict(validated.identity_hashes)
+            if validated.resolved_config is not None:
+                plan = cast(
+                    Mapping[str, Any],
+                    validated.resolved_config["evaluation_plan"],
+                )
+                trusted_metadata.update(
+                    {
+                        "plan_id": cast(Mapping[str, Any], plan["plan"])["id"],
+                        "feature_pipeline_id": cast(
+                            Mapping[str, Any],
+                            validated.resolved_config["feature_pipeline"],
+                        )["id"],
+                        "candidate_adapter_id": cast(
+                            Mapping[str, Any],
+                            validated.resolved_config["candidate_adapter"],
+                        )["id"],
+                    }
+                )
             identity = canonical_sha256(
                 {
                     "status": status,
                     "metadata_hashes": metadata.get("hashes"),
+                    "validated_identity_hashes": validated.identity_hashes,
+                    "validated_context_hashes": validated.context_hashes,
                     "resolved_config_sha256": (
-                        canonical_sha256(resolved_config)
-                        if resolved_config is not None
+                        canonical_sha256(validated.resolved_config)
+                        if validated.resolved_config is not None
                         else None
                     ),
                 }
@@ -223,9 +251,9 @@ class ResearchV2SourceAdapter:
             return build_research_mapping(
                 run_dir=resolved_run,
                 source_relative_path=relative,
-                metadata=metadata,
+                metadata=trusted_metadata,
                 status=status,
-                resolved_config=resolved_config,
+                resolved_config=validated.resolved_config,
                 terminal_status="failed",
                 source_identity=identity,
                 artifacts=artifacts,
@@ -324,7 +352,9 @@ class AutoGluonSourceAdapter:
     ) -> IndexedRun:
         source_root = self.source_root(config)
         resolved_run = _validated_source_directory(run_dir, source_root)
-        relative = resolved_run.relative_to(source_root).as_posix()
+        relative = _repository_relative_run_path(
+            resolved_run, config.paths.repository_root
+        )
         success = (resolved_run / "_SUCCESS").is_file()
         failed = (resolved_run / "_FAILED").is_file()
         if success and failed:
@@ -487,6 +517,18 @@ def _discover_run_directories(
             if artifact.is_file():
                 candidates.add(artifact.parent.resolve(strict=True))
     return tuple(sorted(candidates, key=lambda item: item.as_posix()))
+
+
+def _repository_relative_run_path(run_dir: Path, repository_root: Path) -> str:
+    try:
+        root = repository_root.resolve(strict=True)
+        relative = run_dir.resolve(strict=True).relative_to(root).as_posix()
+    except (OSError, ValueError) as error:
+        raise SourceValidationError(
+            "source_path_escape",
+            f"Source run must be inside repository root {repository_root}: {run_dir}",
+        ) from error
+    return relative
 
 
 def _validated_source_directory(run_dir: Path, source_root: Path) -> Path:

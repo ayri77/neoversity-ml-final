@@ -21,7 +21,7 @@ from src.churn_ml.mlflow_sources import (
 )
 
 
-SYNC_SCHEMA_VERSION = 2
+SYNC_SCHEMA_VERSION = 3
 Outcome = Literal[
     "created",
     "unchanged",
