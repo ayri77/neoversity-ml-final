@@ -1,0 +1,8 @@
+schema_version: 1
+
+policy:
+  id: paired_comparison_development_v1
+  tie_epsilon: 1.0e-12
+  promising_min_mean_balanced_accuracy_delta: 0.0001
+  promising_min_repeat_win_fraction: 0.5
+  threshold_stability_max_sample_standard_deviation: 0.05
