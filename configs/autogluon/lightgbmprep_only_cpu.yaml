@@ -1,0 +1,29 @@
+schema_version: 1
+profile_id: lightgbmprep_only_cpu_v1
+
+dataset:
+  version: v3_targeted_missingness
+  directory: data/processed/v3_targeted_missingness
+  train_features_file: X_train.parquet
+  train_target_file: y_train.parquet
+  label: target
+
+predictor:
+  problem_type: binary
+  eval_metric: balanced_accuracy
+  positive_class: 1
+  verbosity: 2
+
+resources:
+  time_limit_seconds: 28800
+  num_cpus: auto
+  num_gpus: 0
+  fit_strategy: sequential
+  fold_fitting_strategy: sequential_local
+
+fit:
+  presets: extreme_quality
+  calibrate_decision_threshold: true
+
+artifacts:
+  root: artifacts/autogluon_runs
