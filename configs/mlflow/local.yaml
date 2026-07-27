@@ -1,0 +1,17 @@
+schema_version: 1
+
+tracking:
+  backend_store_uri: sqlite:///artifacts/mlflow/mlflow.db
+  artifact_root: artifacts/mlflow/mlartifacts
+
+experiments:
+  research_v2: neoversity-churn-research-v2
+  autogluon: neoversity-churn-autogluon
+
+sources:
+  research_v2_root: artifacts/research_v2
+  autogluon_root: artifacts/autogluon_runs
+
+sync:
+  log_small_artifacts: true
+  max_artifact_size_bytes: 1048576
