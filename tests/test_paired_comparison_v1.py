@@ -37,9 +37,7 @@ from src.churn_ml.research_protocol import (
     calculate_outer_metrics,
     select_balanced_accuracy_threshold,
 )
-from src.churn_ml.research_v2_artifact_validation import (
-    ResearchV2SemanticValidationError,
-)
+
 from src.churn_ml.research_v2_config import ResearchV2Config
 
 
@@ -568,7 +566,7 @@ policy:
         load_comparison_policy(policy_path)
 
 
-def test_failed_input_delegates_to_production_validator(
+def test_malformed_resolved_config_fails_before_semantic_validator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "input"
@@ -578,19 +576,19 @@ def test_failed_input_delegates_to_production_validator(
         "evaluation_plan: {}\n",
         encoding="utf-8",
     )
-    (root / "run_metadata.json").write_text(
-        json.dumps({"hashes": {"plan": "a"}}), encoding="utf-8"
-    )
+    semantic_called = False
 
-    def reject(*args: Any, **kwargs: Any) -> None:
+    def semantic_spy(*args: Any, **kwargs: Any) -> None:
+        nonlocal semantic_called
         del args, kwargs
-        raise ResearchV2SemanticValidationError("Run contains _FAILED.")
+        semantic_called = True
 
     monkeypatch.setattr(
-        "src.churn_ml.paired_comparison.validate_research_v2_run", reject
+        "src.churn_ml.paired_comparison.validate_research_v2_run", semantic_spy
     )
-    with pytest.raises(ResearchV2SemanticValidationError, match="_FAILED"):
+    with pytest.raises(PairedComparisonError, match="RESOLVED_CONFIG_KEYS_INVALID"):
         load_completed_research_v2_run(root, project_root=tmp_path)
+    assert semantic_called is False
 
 
 def test_path_and_symlink_escape_are_rejected_where_supported(
@@ -598,14 +596,14 @@ def test_path_and_symlink_escape_are_rejected_where_supported(
 ) -> None:
     outside = tmp_path.parent / f"{tmp_path.name}_outside"
     outside.mkdir(exist_ok=True)
-    with pytest.raises(PairedComparisonError, match="escapes"):
+    with pytest.raises(PairedComparisonError, match="PATH_(OUTSIDE_REPOSITORY|LINK)"):
         load_completed_research_v2_run(outside, project_root=tmp_path)
     link = tmp_path / "escaped_link"
     try:
         os.symlink(outside, link, target_is_directory=True)
     except OSError:
         return
-    with pytest.raises(PairedComparisonError, match="escapes"):
+    with pytest.raises(PairedComparisonError, match="PATH_(OUTSIDE_REPOSITORY|LINK)"):
         load_completed_research_v2_run(link, project_root=tmp_path)
 
 
@@ -614,8 +612,10 @@ def _patch_artifact_validation(
     baseline: CompletedResearchV2Run,
     candidate: CompletedResearchV2Run,
 ) -> None:
-    def load(path: Path, *, project_root: Path) -> CompletedResearchV2Run:
-        del project_root
+    def load(
+        path: Path, *, project_root: Path, role: str = "input_run"
+    ) -> CompletedResearchV2Run:
+        del project_root, role
         return baseline if path.resolve().name == "baseline" else candidate
 
     provenance = {
@@ -719,13 +719,16 @@ def test_validate_only_allocates_nothing(
         "src.churn_ml.paired_comparison_cli.load_comparison_policy",
         lambda path: POLICY,
     )
+    monkeypatch.setattr("src.churn_ml.paired_comparison_cli.PROJECT_ROOT", tmp_path)
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text("synthetic", encoding="utf-8")
     output = tmp_path / "must_not_exist"
     args = argparse.Namespace(
         baseline_run_dir=baseline.root,
         candidate_run_dir=candidate.root,
         comparison_id=None,
         output_root=output,
-        policy=Path("configs/research_v2/comparison_policy_v1.yaml"),
+        policy=Path("policy.yaml"),
         validate_only=True,
     )
     assert execute(args) == 0

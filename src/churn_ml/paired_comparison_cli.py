@@ -17,6 +17,11 @@ from src.churn_ml.paired_comparison_artifacts import (
     PairedComparisonArtifactError,
     create_comparison_artifacts,
 )
+from src.churn_ml.paired_comparison_paths import (
+    PairedPathSafetyError,
+    assert_pairwise_disjoint_paths,
+    resolve_repository_path,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -41,15 +46,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def execute(args: argparse.Namespace) -> int:
     try:
-        policy_path = _resolve_repository_path(args.policy)
+        policy_path = resolve_repository_path(
+            args.policy,
+            project_root=PROJECT_ROOT,
+            role="comparison_policy",
+            field_path="paths.policy",
+            must_exist=True,
+            require_directory=False,
+        )
         policy = load_comparison_policy(policy_path)
         baseline = load_completed_research_v2_run(
             args.baseline_run_dir,
             project_root=PROJECT_ROOT,
+            role="baseline_run",
         )
         candidate = load_completed_research_v2_run(
             args.candidate_run_dir,
             project_root=PROJECT_ROOT,
+            role="candidate_run",
+        )
+        output_root = resolve_repository_path(
+            args.output_root,
+            project_root=PROJECT_ROOT,
+            role="comparison_output",
+            field_path="paths.output_root",
+            must_exist=False,
+            require_directory=True,
+        )
+        assert_pairwise_disjoint_paths(
+            {
+                "baseline_run": baseline.root,
+                "candidate_run": candidate.root,
+                "output_root": output_root,
+            }
         )
         compatibility = build_compatibility_summary(baseline, candidate)
         if not compatibility.compatible:
@@ -65,7 +94,6 @@ def execute(args: argparse.Namespace) -> int:
             print("Compatibility: compatible")
             return 0
         result = build_comparison_result(baseline, candidate, policy)
-        output_root = args.output_root
         comparison_root = create_comparison_artifacts(
             result=result,
             policy=policy,
@@ -85,6 +113,9 @@ def execute(args: argparse.Namespace) -> int:
         print(f"Decision status: {decision['status']}")
         print("Status: completed")
         return 0
+    except PairedPathSafetyError as error:
+        print(f"Status: failed ({type(error).__name__}: {error})", file=sys.stderr)
+        return 2
     except (PairedCompatibilityError, PairedComparisonError) as error:
         print(f"Status: failed ({type(error).__name__}: {error})", file=sys.stderr)
         return 2
@@ -94,14 +125,6 @@ def execute(args: argparse.Namespace) -> int:
     except RuntimeError as error:
         print(f"Status: failed ({type(error).__name__}: {error})", file=sys.stderr)
         return 1
-
-
-def _resolve_repository_path(path: Path) -> Path:
-    resolved = path if path.is_absolute() else PROJECT_ROOT / path
-    resolved = resolved.resolve()
-    if resolved == PROJECT_ROOT or PROJECT_ROOT not in resolved.parents:
-        raise PairedComparisonError("Policy path must be inside the repository.")
-    return resolved
 
 
 def main() -> int:

@@ -33,9 +33,33 @@ deviations where defined, wins/ties/losses under an explicit exact tie epsilon,
 sensitivity/specificity trade-offs, and threshold stability. It performs no
 formal inference and makes no scientific-significance claim.
 
-The versioned policy can label development evidence `promising`, `mixed`, or
-`not_improved`. These deterministic labels expose their thresholds in the
-artifact and are not scientific findings or deployment decisions.
+## Decision policy
+
+The status uses repeat-level Balanced Accuracy deltas, where
+`delta = candidate - baseline`, and the exact values in
+`configs/research_v2/comparison_policy_v1.yaml`. For each repeat, a win has
+`delta > 1.0e-12`, a tie has `abs(delta) <= 1.0e-12`, and a loss has
+`delta < -1.0e-12`. The repeat win fraction is exactly
+`wins / (wins + ties + losses)`, so every classified repeat is in the
+denominator.
+
+The status boundaries are exhaustive and ordered:
+
+- `promising` when `mean_delta >= 0.0001` and
+  `wins / (wins + ties + losses) >= 0.5`;
+- `mixed` when the promising rule is false and
+  `mean_delta > 1.0e-12 or wins > losses`;
+- `not_improved` otherwise, including an all-tie result.
+
+The `every_repeat_improved` field is advisory only and requires every repeat
+Balanced Accuracy delta to be strictly greater than `1.0e-12`. Candidate
+threshold stability is reported using the sample standard deviation and the
+policy limit `0.05`; threshold stability is advisory only; it does not affect the status label. Sensitivity/specificity trade-off reporting and the fixed
+blend diagnostic are also advisory and do not affect the status label.
+
+These deterministic development labels have no significance interpretation,
+perform no formal inference, and are neither scientific findings nor deployment
+decisions.
 
 Prediction comparison aligns the persisted outer-validation
 `repeat/repeat_seed/outer_fold/row_position` keys. It reports Pearson and
@@ -75,11 +99,28 @@ compatibility gate without creating an output directory:
   --validate-only
 ```
 
+All relative CLI paths are resolved against the repository root, not the
+process working directory, so the documented commands also work when invoked
+from another directory. Absolute paths outside the repository are rejected.
+
 The versioned development policy is
-`configs/research_v2/comparison_policy_v1.yaml`. Successful comparisons are
-stored under `artifacts/research_v2_comparisons/<comparison-id>/` with input
-manifest hashes, source provenance, CSV/JSON reports, an inventory, a manifest,
-and a final `_SUCCESS` marker. Failures never receive `_SUCCESS`.
+`configs/research_v2/comparison_policy_v1.yaml`. Before reading artifacts, each
+input tree is recursively prewalked without following links. Symbolic links,
+Windows junctions/reparse points, multiply linked regular files where link
+counts are available, forbidden asset namespaces, and resolved descendants
+outside the run or repository are rejected. Hard-link detection is limited by
+the metadata exposed by the host filesystem.
+
+Baseline, candidate, and proposed output paths must be pairwise disjoint: no
+pair may be equal or have an ancestor/descendant relationship. This check runs
+before allocation, including in validate-only mode. Successful comparisons are
+stored under `artifacts/research_v2_comparisons/<comparison-id>/` with an exact
+recursive file/directory structure. The recursive inventory and manifest use
+POSIX relative paths, byte sizes, and SHA-256 hashes, including the allowed
+`provenance/source_provenance.json` file. Unexpected files, empty directories,
+forbidden assets, and linked descendants are rejected. `_SUCCESS` is written
+last; failures after allocation receive only `_FAILED`, and failures before
+allocation never mutate an input run.
 
 The typed loaders and builders in `src/churn_ml/paired_comparison.py` are
 side-effect-free foundations for a later optional MLflow mirror and

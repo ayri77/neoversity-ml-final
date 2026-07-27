@@ -11,6 +11,11 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from src.churn_ml.paired_comparison_paths import (
+    PairedPathSafetyError,
+    prewalk_regular_tree,
+    resolve_repository_path,
+)
 from src.churn_ml.research_data import canonical_sha256
 from src.churn_ml.research_protocol import (
     build_repeat_metrics,
@@ -20,6 +25,10 @@ from src.churn_ml.research_protocol import (
 )
 from src.churn_ml.research_v2_artifact_validation import validate_research_v2_run
 from src.churn_ml.research_v2_config import ResearchV2Config
+from src.churn_ml.research_v2_resolved_config import (
+    ResolvedResearchV2ConfigurationError,
+    load_resolved_research_v2_config,
+)
 
 
 COMPARISON_SCHEMA_VERSION = 1
@@ -52,6 +61,18 @@ FOLD_KEYS = ["repeat", "outer_fold"]
 
 class PairedComparisonError(ValueError):
     """Raised when a paired comparison contract cannot be satisfied."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "PAIRED_COMPARISON_INVALID",
+        field_path: str = "comparison",
+    ) -> None:
+        self.reason_code = reason_code
+        self.field_path = field_path
+        self.detail = message
+        super().__init__(f"{reason_code} at {field_path}: {message}")
 
 
 class PairedCompatibilityError(PairedComparisonError):
@@ -279,28 +300,42 @@ def load_completed_research_v2_run(
     run_dir: Path,
     *,
     project_root: Path,
+    role: str = "input_run",
 ) -> CompletedResearchV2Run:
-    root = _validated_run_path(run_dir, project_root)
-    resolved = _read_yaml(root / "resolved_config.yaml")
-    plan = resolved.get("evaluation_plan")
-    if not isinstance(plan, dict):
-        raise PairedComparisonError(
-            "Input resolved_config.evaluation_plan must be a mapping."
+    try:
+        root = resolve_repository_path(
+            run_dir,
+            project_root=project_root,
+            role=role,
+            field_path=f"paths.{role}",
+            must_exist=True,
+            require_directory=True,
         )
-    payload = dict(resolved)
-    payload.pop("evaluation_plan")
-    plan_relative = payload.get("evaluation_plan_path")
-    if not isinstance(plan_relative, str):
-        raise PairedComparisonError(
-            "Input resolved_config.evaluation_plan_path must be a string."
+        prewalk_regular_tree(
+            root,
+            project_root=project_root,
+            role=role,
+            field_path=f"paths.{role}",
+            reject_hardlinks=True,
+            reject_forbidden_descendants=True,
         )
-    config = ResearchV2Config(
-        payload=payload,
-        plan_payload=plan,
-        source_path=project_root.resolve() / "resolved_input_run.yaml",
-        plan_path=(project_root.resolve() / plan_relative).resolve(),
-        project_root=project_root.resolve(),
-    )
+    except PairedPathSafetyError as error:
+        raise PairedComparisonError(
+            error.detail,
+            reason_code=error.reason_code,
+            field_path=error.field_path,
+        ) from error
+    try:
+        config = load_resolved_research_v2_config(
+            root / "resolved_config.yaml",
+            project_root=project_root,
+        )
+    except ResolvedResearchV2ConfigurationError as error:
+        raise PairedComparisonError(
+            error.detail,
+            reason_code=error.reason_code,
+            field_path=error.field_path,
+        ) from error
     metadata = _read_json(root / "run_metadata.json")
     hashes = metadata.get("hashes")
     if not isinstance(hashes, Mapping) or not all(
@@ -495,12 +530,28 @@ def build_compatibility_summary(
         sort_by=THRESHOLD_KEYS,
     )
     _compare_frame(
+        baseline.outer_predictions[OUTER_KEYS],
+        candidate.outer_predictions[OUTER_KEYS],
+        issues,
+        reason_code="OUTER_PREDICTION_KEY_COVERAGE_MISMATCH",
+        field_path="predictions.outer_validation.keys",
+        sort_by=OUTER_KEYS,
+    )
+    _compare_frame(
         baseline.outer_predictions[OUTER_KEYS + ["target"]],
         candidate.outer_predictions[OUTER_KEYS + ["target"]],
         issues,
         reason_code="OUTER_TARGET_ORDER_MISMATCH",
         field_path="predictions.outer_validation.keys_and_target",
         sort_by=OUTER_KEYS,
+    )
+    _compare_frame(
+        baseline.threshold_predictions[THRESHOLD_KEYS],
+        candidate.threshold_predictions[THRESHOLD_KEYS],
+        issues,
+        reason_code="THRESHOLD_PREDICTION_KEY_COVERAGE_MISMATCH",
+        field_path="predictions.threshold_selection_oof.keys",
+        sort_by=THRESHOLD_KEYS,
     )
     _compare_frame(
         baseline.threshold_predictions[THRESHOLD_KEYS + ["target"]],
@@ -1311,43 +1362,6 @@ def _strict_finite_float(value: Any, label: str) -> float:
     if type(value) is not float or not math.isfinite(value):
         raise PairedComparisonError(f"{label} must be an exact finite float.")
     return value
-
-
-def _validated_run_path(path: Path, project_root: Path) -> Path:
-    root = project_root.resolve()
-    try:
-        resolved = path.resolve(strict=True)
-    except OSError as error:
-        raise PairedComparisonError(
-            f"Input run directory does not exist: {path}."
-        ) from error
-    if not resolved.is_dir():
-        raise PairedComparisonError(f"Input run path is not a directory: {path}.")
-    if resolved == root or root not in resolved.parents:
-        raise PairedComparisonError("Input run directory escapes the repository.")
-    normalized = resolved.relative_to(root).as_posix().lower()
-    forbidden = (
-        "data/raw/",
-        "data/test/",
-        "submissions/",
-        "kaggle",
-        "autogluon",
-        "sample_submission",
-        "competition_test",
-        "competition-test",
-        "x_test",
-        "final-submission",
-        "final_submission",
-        "final-model",
-        "final_model",
-        "model-artifact",
-        "model_artifact",
-        "models/",
-        "/models/",
-    )
-    if any(marker in normalized for marker in forbidden):
-        raise PairedComparisonError("Input path is in a forbidden asset namespace.")
-    return resolved
 
 
 def _exact_equal(left: Any, right: Any) -> bool:

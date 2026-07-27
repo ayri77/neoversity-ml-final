@@ -20,6 +20,12 @@ from src.churn_ml.paired_comparison import (
     deterministic_comparison_identity,
     load_completed_research_v2_run,
 )
+from src.churn_ml.paired_comparison_paths import (
+    PairedPathSafetyError,
+    assert_pairwise_disjoint_paths,
+    prewalk_regular_tree,
+    resolve_repository_path,
+)
 from src.churn_ml.research_data import canonical_sha256
 
 
@@ -29,6 +35,8 @@ COMPARISON_SOURCE_PATHS = (
     "src/churn_ml/paired_comparison.py",
     "src/churn_ml/paired_comparison_artifacts.py",
     "src/churn_ml/paired_comparison_cli.py",
+    "src/churn_ml/paired_comparison_paths.py",
+    "src/churn_ml/research_v2_resolved_config.py",
 )
 PRIMARY_ARTIFACTS = {
     "resolved_comparison_config.yaml",
@@ -44,6 +52,8 @@ PRIMARY_ARTIFACTS = {
     "blend_summary.json",
     "decision_report.json",
 }
+PROVENANCE_ARTIFACT = "provenance/source_provenance.json"
+ARTIFACT_DIRECTORIES = {"provenance"}
 
 
 class PairedComparisonArtifactError(RuntimeError):
@@ -85,7 +95,40 @@ def create_comparison_artifacts(
     before_success: Callable[[], None] | None = None,
 ) -> Path:
     root = project_root.resolve()
-    output = _repository_path(output_root, root, "output root")
+    try:
+        output = resolve_repository_path(
+            output_root,
+            project_root=root,
+            role="comparison_output",
+            field_path="paths.output_root",
+            must_exist=False,
+            require_directory=True,
+        )
+        baseline_root = resolve_repository_path(
+            Path(result.baseline_reference.repository_relative_path),
+            project_root=root,
+            role="baseline_run",
+            field_path="paths.baseline_run",
+            must_exist=True,
+            require_directory=True,
+        )
+        candidate_root = resolve_repository_path(
+            Path(result.candidate_reference.repository_relative_path),
+            project_root=root,
+            role="candidate_run",
+            field_path="paths.candidate_run",
+            must_exist=True,
+            require_directory=True,
+        )
+        assert_pairwise_disjoint_paths(
+            {
+                "baseline_run": baseline_root,
+                "candidate_run": candidate_root,
+                "output_root": output,
+            }
+        )
+    except PairedPathSafetyError as error:
+        raise PairedComparisonArtifactError(str(error)) from error
     identity = deterministic_comparison_identity(
         result.baseline_reference,
         result.candidate_reference,
@@ -99,6 +142,15 @@ def create_comparison_artifacts(
     comparison_root = (output / resolved_id).resolve()
     if comparison_root.parent != output:
         raise PairedComparisonArtifactError("Comparison directory escapes output root.")
+    try:
+        assert_pairwise_disjoint_paths(
+            {"baseline_run": baseline_root, "comparison_root": comparison_root}
+        )
+        assert_pairwise_disjoint_paths(
+            {"candidate_run": candidate_root, "comparison_root": comparison_root}
+        )
+    except PairedPathSafetyError as error:
+        raise PairedComparisonArtifactError(str(error)) from error
     if comparison_root.exists():
         raise PairedComparisonArtifactError(
             f"Comparison directory already exists: {comparison_root}."
@@ -107,6 +159,8 @@ def create_comparison_artifacts(
     started = datetime.now(timezone.utc)
     try:
         provenance = comparison_source_provenance(root)
+        (comparison_root / "provenance").mkdir()
+        _atomic_json(comparison_root / PROVENANCE_ARTIFACT, provenance)
         resolved = {
             "schema_version": COMPARISON_SCHEMA_VERSION,
             "comparison_id": resolved_id,
@@ -213,9 +267,25 @@ def validate_comparison_artifacts(
     require_success: bool,
     verify_manifest: bool,
 ) -> None:
-    root = comparison_root.resolve()
-    if not root.is_dir():
-        raise PairedComparisonArtifactError("Comparison directory is missing.")
+    try:
+        root = resolve_repository_path(
+            comparison_root,
+            project_root=project_root,
+            role="comparison_artifact",
+            field_path="paths.comparison_root",
+            must_exist=True,
+            require_directory=True,
+        )
+        snapshot = prewalk_regular_tree(
+            root,
+            project_root=project_root,
+            role="comparison_artifact",
+            field_path="artifacts",
+            reject_hardlinks=True,
+            reject_forbidden_descendants=True,
+        )
+    except PairedPathSafetyError as error:
+        raise PairedComparisonArtifactError(str(error)) from error
     success = root / "_SUCCESS"
     failed = root / "_FAILED"
     if failed.exists():
@@ -226,17 +296,29 @@ def validate_comparison_artifacts(
         raise PairedComparisonArtifactError(
             "_SUCCESS exists before comparison semantic validation."
         )
-    expected = PRIMARY_ARTIFACTS | {"artifact_inventory.json", "manifest.json"}
+    expected_files = PRIMARY_ARTIFACTS | {
+        "artifact_inventory.json",
+        "manifest.json",
+        PROVENANCE_ARTIFACT,
+    }
     if require_success:
-        expected.add("_SUCCESS")
-    actual = {path.name for path in root.iterdir() if path.is_file()}
-    if actual != expected:
+        expected_files.add("_SUCCESS")
+    actual_files = {path.as_posix() for path in snapshot.files}
+    actual_directories = {path.as_posix() for path in snapshot.directories}
+    if actual_files != expected_files or actual_directories != ARTIFACT_DIRECTORIES:
         raise PairedComparisonArtifactError(
             "Comparison artifact inventory differs; "
-            f"missing={sorted(expected - actual)}, "
-            f"unexpected={sorted(actual - expected)}."
+            f"missing={sorted(expected_files - actual_files)}, "
+            f"unexpected={sorted(actual_files - expected_files)}, "
+            f"missing_directories={sorted(ARTIFACT_DIRECTORIES - actual_directories)}, "
+            f"unexpected_directories={sorted(actual_directories - ARTIFACT_DIRECTORIES)}."
         )
     resolved = _read_yaml(root / "resolved_comparison_config.yaml")
+    _assert_json_equal(
+        _read_json(root / PROVENANCE_ARTIFACT),
+        resolved["source_provenance"],
+        "nested source provenance",
+    )
     _validate_resolved_config(resolved, root, project_root)
     policy = _policy_from_resolved(resolved["comparison_policy"])
     baseline_reference = _read_json(root / "baseline_run_reference.json")
@@ -248,10 +330,12 @@ def validate_comparison_artifacts(
     baseline = load_completed_research_v2_run(
         project_root / baseline_reference["repository_relative_path"],
         project_root=project_root,
+        role="baseline_run",
     )
     candidate = load_completed_research_v2_run(
         project_root / candidate_reference["repository_relative_path"],
         project_root=project_root,
+        role="candidate_run",
     )
     recomputed = build_comparison_result(baseline, candidate, policy)
     _assert_json_equal(
@@ -348,14 +432,26 @@ def build_comparison_manifest(root: Path) -> dict[str, Any]:
 
 
 def _file_records(root: Path, *, excluded: set[str]) -> list[dict[str, Any]]:
+    try:
+        snapshot = prewalk_regular_tree(
+            root,
+            project_root=root.parent,
+            role="comparison_artifact",
+            field_path="artifacts",
+            reject_hardlinks=True,
+            reject_forbidden_descendants=True,
+        )
+    except PairedPathSafetyError as error:
+        raise PairedComparisonArtifactError(str(error)) from error
     records: list[dict[str, Any]] = []
-    for path in sorted(root.iterdir(), key=lambda item: item.name):
-        if not path.is_file() or path.name in excluded:
+    for relative in snapshot.files:
+        relative_name = relative.as_posix()
+        if relative_name in excluded:
             continue
-        raw = path.read_bytes()
+        raw = (root / relative).read_bytes()
         records.append(
             {
-                "path": path.name,
+                "path": relative_name,
                 "size_bytes": len(raw),
                 "sha256": hashlib.sha256(raw).hexdigest(),
             }
@@ -446,10 +542,12 @@ def _validate_resolved_config(
     baseline = load_completed_research_v2_run(
         project_root / str(baseline_reference["repository_relative_path"]),
         project_root=project_root,
+        role="baseline_run",
     )
     candidate = load_completed_research_v2_run(
         project_root / str(candidate_reference["repository_relative_path"]),
         project_root=project_root,
+        role="candidate_run",
     )
     _assert_json_equal(
         dict(baseline_reference),
@@ -526,37 +624,6 @@ def _policy_from_resolved(payload: Any) -> ComparisonPolicy:
             "threshold_stability_max_sample_standard_deviation"
         ],
     )
-
-
-def _repository_path(path: Path, project_root: Path, label: str) -> Path:
-    if not path.is_absolute():
-        path = project_root / path
-    resolved = path.resolve()
-    if resolved == project_root or project_root not in resolved.parents:
-        raise PairedComparisonArtifactError(f"{label} must be inside the repository.")
-    normalized = resolved.relative_to(project_root).as_posix().lower()
-    forbidden = (
-        "data/raw/",
-        "data/test/",
-        "submissions/",
-        "kaggle",
-        "autogluon",
-        "sample_submission",
-        "competition_test",
-        "competition-test",
-        "x_test",
-        "final-submission",
-        "final_submission",
-        "final-model",
-        "final_model",
-        "model-artifact",
-        "model_artifact",
-        "models/",
-        "/models/",
-    )
-    if any(marker in normalized for marker in forbidden):
-        raise PairedComparisonArtifactError(f"{label} is a forbidden asset path.")
-    return resolved
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
