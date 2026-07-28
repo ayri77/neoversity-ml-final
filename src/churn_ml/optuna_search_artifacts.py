@@ -102,6 +102,12 @@ def write_completed_search(
                 "study_identity_sha256": config.study_identity_sha256,
                 "dataset_identity_sha256": canonical_sha256(dataset_identity),
                 "assignment_identity_sha256": canonical_sha256(assignment_identity),
+                "prediction_evidence_identity_sha256": study_summary[
+                    "prediction_evidence_identity_sha256"
+                ],
+                "failure_evidence_identity_sha256": study_summary[
+                    "failure_evidence_identity_sha256"
+                ],
                 "resume_authentication_sha256": resume_authentication[
                     "identity_sha256"
                 ],

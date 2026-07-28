@@ -3,12 +3,14 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
@@ -47,6 +49,12 @@ FAILURE_STAGE_INTERRUPTED_RECOVERY = "interrupted_running_trial_recovery"
 FAILURE_STAGE_CONFIGURATION_AUTHENTICATION = (
     "configuration_source_runtime_authentication"
 )
+FAILURE_RECOVERY_MESSAGE = "Recovered RUNNING trial from an interrupted prior process."
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+CANONICAL_UTC_PATTERN = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$"
+)
 
 FAILURE_CLASS_TO_REASON = {
     "ADAPTER_CONTRACT_OR_FIT_FAILED": "ADAPTER_CONTRACT_OR_FIT_FAILED",
@@ -70,6 +78,104 @@ FAILURE_STAGE_TO_CLASS = {
 
 class OptunaSearchLifecycleError(RuntimeError):
     """Raised when deterministic study or cache lifecycle guarantees fail."""
+
+
+def canonical_float_token(value: Any) -> str:
+    """Return the sole authoritative Optuna Search v1 float token."""
+    if isinstance(value, bool):
+        raise OptunaSearchLifecycleError("Canonical float cannot be boolean.")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise OptunaSearchLifecycleError("Canonical float is malformed.") from error
+    if not math.isfinite(number):
+        raise OptunaSearchLifecycleError("Canonical float must be finite.")
+    return format(number, ".17g")
+
+
+def canonical_utc_timestamp(value: datetime | str) -> str:
+    """Normalize an aware timestamp to the exact microsecond UTC representation."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif type(value) is str:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise OptunaSearchLifecycleError(
+                "Failure timestamp is malformed."
+            ) from error
+    else:
+        raise OptunaSearchLifecycleError("Failure timestamp must be a string.")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise OptunaSearchLifecycleError("Failure timestamp must be timezone-aware.")
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def build_prediction_evidence_identities(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    trial_number: int,
+    adapter_id: str,
+    candidate_identity_sha256: str,
+    assignment_identity_sha256: str,
+    threshold_policy_identity_sha256: str,
+    coverage: Mapping[str, Any],
+) -> tuple[str, str]:
+    """Bind exact persisted prediction tokens and their coverage to one trial."""
+    coverage_body = {
+        "schema_version": 1,
+        "trial_number": trial_number,
+        "adapter_id": adapter_id,
+        "candidate_identity_sha256": candidate_identity_sha256,
+        "assignment_identity_sha256": assignment_identity_sha256,
+        "threshold_policy_identity_sha256": threshold_policy_identity_sha256,
+        "prediction_key_coverage": deepcopy(dict(coverage)),
+    }
+    coverage_identity_sha256 = canonical_sha256(coverage_body)
+    canonical_records: list[dict[str, Any]] = []
+    for item in records:
+        record_trial = int(item["trial_number"])
+        if record_trial != trial_number:
+            raise OptunaSearchLifecycleError(
+                "Prediction identity received another trial number."
+            )
+        probability_token = str(item["probability"])
+        threshold_token = str(item["selected_threshold"])
+        if probability_token != canonical_float_token(
+            probability_token
+        ) or threshold_token != canonical_float_token(threshold_token):
+            raise OptunaSearchLifecycleError(
+                "Prediction identity requires canonical float tokens."
+            )
+        canonical_records.append(
+            {
+                "trial_number": record_trial,
+                "repeat": int(item["repeat"]),
+                "fold": int(item["fold"]),
+                "row_position": int(item["row_position"]),
+                "probability_token": probability_token,
+                "predicted_label": int(item["prediction"]),
+                "selected_threshold_token": threshold_token,
+            }
+        )
+    canonical_records.sort(
+        key=lambda item: (
+            item["trial_number"],
+            item["repeat"],
+            item["fold"],
+            item["row_position"],
+        )
+    )
+    values_body = {
+        "schema_version": 1,
+        "trial_number": trial_number,
+        "adapter_id": adapter_id,
+        "candidate_identity_sha256": candidate_identity_sha256,
+        "threshold_policy_identity_sha256": threshold_policy_identity_sha256,
+        "prediction_coverage_identity_sha256": coverage_identity_sha256,
+        "records": canonical_records,
+    }
+    return coverage_identity_sha256, canonical_sha256(values_body)
 
 
 @dataclass(frozen=True)
@@ -106,6 +212,8 @@ def run_optuna_study(
     if storage_path.parent not in cache_root.parents:
         raise OptunaSearchLifecycleError("Trial cache escapes Optuna storage root.")
     cache_root.mkdir(parents=True, exist_ok=True)
+    assignment_identity_sha256 = canonical_sha256(assignments.identity)
+    threshold_policy_identity_sha256 = canonical_sha256(config.threshold_policy_payload)
     sampler = _make_stateless_sampler(
         optuna,
         seed=int(config.payload["sampler"]["seed"]),
@@ -123,7 +231,7 @@ def run_optuna_study(
         study,
         config,
         dataset_identity_sha256=canonical_sha256(authoritative_dataset_identity),
-        assignment_identity_sha256=canonical_sha256(assignments.identity),
+        assignment_identity_sha256=assignment_identity_sha256,
     )
     recovered = _recover_interrupted_trials(study, TrialState)
     target = int(config.payload["n_trials"])
@@ -141,7 +249,7 @@ def run_optuna_study(
         )
 
     def objective(trial: Any) -> float:
-        started_at_utc = datetime.now(timezone.utc).isoformat()
+        started_at_utc = canonical_utc_timestamp(datetime.now(timezone.utc))
         try:
             tuned = suggest_parameters(trial, config.search_space)
             contract = build_resolved_adapter_contract(
@@ -172,6 +280,9 @@ def run_optuna_study(
                 cache_root,
                 trial_number=int(trial.number),
                 evaluation=result,
+                search_identity_sha256=config.search_identity_sha256,
+                assignment_identity_sha256=assignment_identity_sha256,
+                threshold_policy_identity_sha256=threshold_policy_identity_sha256,
             )
             trial.set_user_attr("resolved_parameters", tuned)
             trial.set_user_attr("adapter_id", config.adapter_id)
@@ -180,6 +291,22 @@ def run_optuna_study(
                 candidate_identity_sha256,
             )
             trial.set_user_attr("prediction_key_coverage", result.coverage)
+            trial.set_user_attr("search_identity_sha256", config.search_identity_sha256)
+            trial.set_user_attr(
+                "assignment_identity_sha256", assignment_identity_sha256
+            )
+            trial.set_user_attr(
+                "threshold_policy_identity_sha256",
+                cache_identity["threshold_policy_identity_sha256"],
+            )
+            trial.set_user_attr(
+                "prediction_coverage_identity_sha256",
+                cache_identity["prediction_coverage_identity_sha256"],
+            )
+            trial.set_user_attr(
+                "prediction_values_identity_sha256",
+                cache_identity["prediction_values_identity_sha256"],
+            )
             trial.set_user_attr("cache_identity", cache_identity)
             trial.set_user_attr("failure_reason_code", None)
             trial.set_user_attr("failure_message", None)
@@ -191,7 +318,7 @@ def run_optuna_study(
                     trial_number=int(trial.number),
                     error=error,
                     started_at_utc=started_at_utc,
-                    failed_at_utc=datetime.now(timezone.utc).isoformat(),
+                    failed_at_utc=canonical_utc_timestamp(datetime.now(timezone.utc)),
                 )
                 trial.set_user_attr(
                     "failure_reason_code",
@@ -199,7 +326,7 @@ def run_optuna_study(
                 )
                 trial.set_user_attr(
                     "failure_message",
-                    f"{type(error).__name__}: {error}",
+                    f"{evidence['exception_type']}: {evidence['failure_message']}",
                 )
                 trial.set_user_attr("failure_evidence", evidence)
             except BaseException:
@@ -229,10 +356,14 @@ def run_optuna_study(
         key=lambda trial: (-_required_trial_value(trial), trial.number),
     )
     best_value = _required_trial_value(best)
-    trial_table = _build_trial_table(trials)
+    trial_table = _build_trial_table(
+        trials,
+        search_identity_sha256=config.search_identity_sha256,
+    )
     trial_metrics, trial_predictions = _load_completed_trial_caches(
         cache_root,
         complete,
+        search_identity_sha256=config.search_identity_sha256,
     )
     resolved_parameters = best.user_attrs.get("resolved_parameters")
     if not isinstance(resolved_parameters, dict):
@@ -252,12 +383,43 @@ def run_optuna_study(
         "candidate_identity_sha256": best.user_attrs["candidate_identity_sha256"],
         "candidate_config_sha256": canonical_sha256(best_candidate),
         "prediction_key_coverage": best.user_attrs["prediction_key_coverage"],
+        "threshold_policy_identity_sha256": best.user_attrs[
+            "threshold_policy_identity_sha256"
+        ],
+        "prediction_coverage_identity_sha256": best.user_attrs[
+            "prediction_coverage_identity_sha256"
+        ],
+        "prediction_values_identity_sha256": best.user_attrs[
+            "prediction_values_identity_sha256"
+        ],
         "evidence_scope": "tuning_only_not_unbiased_final_evidence",
     }
     state_counts = {
         state.name.lower(): sum(trial.state == state for trial in trials)
         for state in TrialState
     }
+    completed_prediction_identities = [
+        {
+            "trial_number": int(trial.number),
+            "prediction_coverage_identity_sha256": trial.user_attrs[
+                "prediction_coverage_identity_sha256"
+            ],
+            "prediction_values_identity_sha256": trial.user_attrs[
+                "prediction_values_identity_sha256"
+            ],
+        }
+        for trial in sorted(complete, key=lambda item: item.number)
+    ]
+    failed_evidence = [
+        trial.user_attrs["failure_evidence"]
+        for trial in sorted(trials, key=lambda item: item.number)
+        if trial.state == TrialState.FAIL
+    ]
+    interrupted_recovery_trial_numbers = [
+        int(trial.number)
+        for trial in sorted(trials, key=lambda item: item.number)
+        if trial.user_attrs.get("failure_reason_code") == "INTERRUPTED_PROCESS_RECOVERY"
+    ]
     study_summary = {
         "schema_version": 1,
         "study_name": config.payload["study_name"],
@@ -266,7 +428,15 @@ def run_optuna_study(
         "search_identity_sha256": config.search_identity_sha256,
         "resume_authentication_sha256": config.resume_authentication["identity_sha256"],
         "dataset_identity_sha256": canonical_sha256(authoritative_dataset_identity),
-        "assignment_identity_sha256": canonical_sha256(assignments.identity),
+        "assignment_identity_sha256": assignment_identity_sha256,
+        "threshold_policy_identity_sha256": threshold_policy_identity_sha256,
+        "prediction_evidence_identity_sha256": canonical_sha256(
+            {"schema_version": 1, "trials": completed_prediction_identities}
+        ),
+        "failure_evidence_identity_sha256": canonical_sha256(
+            {"schema_version": 1, "records": failed_evidence}
+        ),
+        "interrupted_recovery_trial_numbers": interrupted_recovery_trial_numbers,
         "direction": "maximize",
         "metric": "balanced_accuracy",
         "objective_aggregation": "mean_fold_balanced_accuracy_across_repeats",
@@ -383,18 +553,16 @@ def build_trial_failure_evidence(
     interrupted_recovery: bool = False,
 ) -> dict[str, Any]:
     """Persist deterministic structured failure provenance for one trial."""
+    if type(trial_number) is not int or trial_number < 0:
+        raise OptunaSearchLifecycleError("Failure trial number is invalid.")
     if interrupted_recovery:
         failure_class = "INTERRUPTED_PROCESS_RECOVERY"
         exception_type = None
-        exception_message_sha256 = None
+        failure_message = FAILURE_RECOVERY_MESSAGE
         failure_stage = FAILURE_STAGE_INTERRUPTED_RECOVERY
     elif failure_stage == FAILURE_STAGE_CONFIGURATION_AUTHENTICATION:
-        failure_class = "CONFIGURATION_SOURCE_RUNTIME_AUTHENTICATION_FAILED"
-        exception_type = None if error is None else type(error).__name__
-        exception_message_sha256 = (
-            None
-            if error is None
-            else hashlib.sha256(str(error).encode("utf-8")).hexdigest()
+        raise OptunaSearchLifecycleError(
+            "Study authentication refusal cannot become trial failure evidence."
         )
     else:
         if error is None:
@@ -403,26 +571,35 @@ def build_trial_failure_evidence(
             )
         failure_class = _failure_class_for_exception(error)
         exception_type = type(error).__name__
-        exception_message_sha256 = hashlib.sha256(
-            str(error).encode("utf-8")
-        ).hexdigest()
+        failure_message = str(error)
         failure_stage = FAILURE_STAGE_OBJECTIVE_EXECUTION
         interrupted_recovery = False
-    return {
+    evidence = {
         "schema_version": FAILURE_EVIDENCE_SCHEMA_VERSION,
-        "trial_number": int(trial_number),
+        "trial_number": trial_number,
         "failure_stage": failure_stage,
         "failure_class": failure_class,
         "exception_type": exception_type,
-        "exception_message_sha256": exception_message_sha256,
-        "interrupted_recovery": bool(interrupted_recovery),
-        "started_at_utc": started_at_utc,
-        "failed_at_utc": failed_at_utc,
+        "failure_message": failure_message,
+        "failure_message_sha256": hashlib.sha256(
+            failure_message.encode("utf-8")
+        ).hexdigest(),
+        "started_at_utc": canonical_utc_timestamp(started_at_utc),
+        "failed_at_utc": canonical_utc_timestamp(failed_at_utc),
+        "interrupted_recovery": interrupted_recovery,
     }
+    validate_trial_failure_evidence(evidence, trial_state="FAIL")
+    return evidence
 
 
-def derive_failure_reason_code(evidence: Mapping[str, Any]) -> str:
-    """Derive the exact persisted reason code from structured failure evidence."""
+def validate_trial_failure_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    trial_state: str,
+    persisted_failure_message: str | None = None,
+    interrupted_recovery_recorded: bool | None = None,
+) -> str:
+    """Strictly validate and derive one trial failure reason."""
     if not isinstance(evidence, Mapping):
         raise OptunaSearchLifecycleError("Failure evidence must be a mapping.")
     required = {
@@ -431,29 +608,67 @@ def derive_failure_reason_code(evidence: Mapping[str, Any]) -> str:
         "failure_stage",
         "failure_class",
         "exception_type",
-        "exception_message_sha256",
-        "interrupted_recovery",
+        "failure_message",
+        "failure_message_sha256",
         "started_at_utc",
         "failed_at_utc",
+        "interrupted_recovery",
     }
     if set(evidence) != required:
         raise OptunaSearchLifecycleError("Failure evidence schema differs.")
     if (
-        type(evidence["schema_version"]) is not int
+        trial_state != "FAIL"
+        or type(evidence["schema_version"]) is not int
         or evidence["schema_version"] != FAILURE_EVIDENCE_SCHEMA_VERSION
         or type(evidence["trial_number"]) is not int
         or evidence["trial_number"] < 0
         or type(evidence["failure_stage"]) is not str
         or type(evidence["failure_class"]) is not str
+        or (
+            evidence["exception_type"] is not None
+            and type(evidence["exception_type"]) is not str
+        )
+        or type(evidence["failure_message"]) is not str
+        or not evidence["failure_message"]
+        or type(evidence["failure_message_sha256"]) is not str
         or type(evidence["interrupted_recovery"]) is not bool
         or type(evidence["started_at_utc"]) is not str
         or type(evidence["failed_at_utc"]) is not str
-        or not evidence["started_at_utc"]
-        or not evidence["failed_at_utc"]
     ):
         raise OptunaSearchLifecycleError("Failure evidence values are malformed.")
+    if not SHA256_PATTERN.fullmatch(evidence["failure_message_sha256"]):
+        raise OptunaSearchLifecycleError("Failure message digest is malformed.")
+    expected_digest = hashlib.sha256(
+        evidence["failure_message"].encode("utf-8")
+    ).hexdigest()
+    if evidence["failure_message_sha256"] != expected_digest:
+        raise OptunaSearchLifecycleError("Failure message digest differs.")
+    for name in ("started_at_utc", "failed_at_utc"):
+        value = evidence[name]
+        if (
+            not CANONICAL_UTC_PATTERN.fullmatch(value)
+            or canonical_utc_timestamp(value) != value
+        ):
+            raise OptunaSearchLifecycleError("Failure timestamp is not canonical UTC.")
+    started = datetime.strptime(
+        evidence["started_at_utc"], "%Y-%m-%dT%H:%M:%S.%fZ"
+    ).replace(tzinfo=timezone.utc)
+    failed = datetime.strptime(
+        evidence["failed_at_utc"], "%Y-%m-%dT%H:%M:%S.%fZ"
+    ).replace(tzinfo=timezone.utc)
+    if started > failed:
+        raise OptunaSearchLifecycleError("Failure timestamps are reversed.")
+    canonical_round_trip = json.loads(
+        json.dumps(dict(evidence), sort_keys=True, separators=(",", ":"))
+    )
+    if canonical_round_trip != dict(evidence):
+        raise OptunaSearchLifecycleError("Failure evidence is not canonical JSON.")
     stage = evidence["failure_stage"]
     failure_class = evidence["failure_class"]
+    if stage == FAILURE_STAGE_CONFIGURATION_AUTHENTICATION:
+        raise OptunaSearchLifecycleError(
+            "Study authentication refusal cannot be trial failure evidence."
+        )
     if stage not in FAILURE_STAGE_TO_CLASS:
         raise OptunaSearchLifecycleError(f"Unsupported failure stage: {stage}.")
     stage_class = FAILURE_STAGE_TO_CLASS[stage]
@@ -462,29 +677,10 @@ def derive_failure_reason_code(evidence: Mapping[str, Any]) -> str:
             not evidence["interrupted_recovery"]
             or failure_class != "INTERRUPTED_PROCESS_RECOVERY"
             or evidence["exception_type"] is not None
-            or evidence["exception_message_sha256"] is not None
+            or evidence["failure_message"] != FAILURE_RECOVERY_MESSAGE
         ):
             raise OptunaSearchLifecycleError(
                 "Interrupted recovery evidence is inconsistent."
-            )
-    elif stage == FAILURE_STAGE_CONFIGURATION_AUTHENTICATION:
-        if (
-            evidence["interrupted_recovery"]
-            or failure_class != stage_class
-            or (
-                evidence["exception_type"] is not None
-                and type(evidence["exception_type"]) is not str
-            )
-            or (
-                evidence["exception_message_sha256"] is not None
-                and (
-                    type(evidence["exception_message_sha256"]) is not str
-                    or len(evidence["exception_message_sha256"]) != 64
-                )
-            )
-        ):
-            raise OptunaSearchLifecycleError(
-                "Configuration authentication failure evidence is inconsistent."
             )
     else:
         if (
@@ -492,8 +688,6 @@ def derive_failure_reason_code(evidence: Mapping[str, Any]) -> str:
             or stage_class is not None
             or type(evidence["exception_type"]) is not str
             or not evidence["exception_type"]
-            or type(evidence["exception_message_sha256"]) is not str
-            or len(evidence["exception_message_sha256"]) != 64
             or failure_class
             not in {
                 "ADAPTER_CONTRACT_OR_FIT_FAILED",
@@ -510,10 +704,33 @@ def derive_failure_reason_code(evidence: Mapping[str, Any]) -> str:
             raise OptunaSearchLifecycleError(
                 "Failure class does not match exception type."
             )
+    if interrupted_recovery_recorded is not None and (
+        evidence["interrupted_recovery"] is not interrupted_recovery_recorded
+    ):
+        raise OptunaSearchLifecycleError(
+            "Failure evidence differs from recorded recovery lifecycle."
+        )
+    expected_summary_message = (
+        evidence["failure_message"]
+        if evidence["exception_type"] is None
+        else f"{evidence['exception_type']}: {evidence['failure_message']}"
+    )
+    if (
+        persisted_failure_message is not None
+        and persisted_failure_message != expected_summary_message
+    ):
+        raise OptunaSearchLifecycleError(
+            "Failure summary does not match structured exception evidence."
+        )
     reason = FAILURE_CLASS_TO_REASON.get(failure_class)
     if reason is None:
         raise OptunaSearchLifecycleError(f"Unsupported failure class: {failure_class}.")
     return reason
+
+
+def derive_failure_reason_code(evidence: Mapping[str, Any]) -> str:
+    """Derive a reason only after full structured validation."""
+    return validate_trial_failure_evidence(evidence, trial_state="FAIL")
 
 
 def _failure_class_for_exception(error: BaseException) -> str:
@@ -706,12 +923,16 @@ def _current_resume_authentication(config: OptunaSearchConfig) -> dict[str, Any]
 def _recover_interrupted_trials(study: Any, trial_state: Any) -> int:
     recovered = 0
     for trial in study.get_trials(deepcopy=False, states=(trial_state.RUNNING,)):
+        trial_started = trial.datetime_start
+        if trial_started is not None and trial_started.tzinfo is None:
+            # Locked Optuna 4.9.0 records a naive local wall-clock value.
+            trial_started = trial_started.astimezone()
         started = (
-            datetime.now(timezone.utc).isoformat()
-            if trial.datetime_start is None
-            else trial.datetime_start.astimezone(timezone.utc).isoformat()
+            canonical_utc_timestamp(datetime.now(timezone.utc))
+            if trial_started is None
+            else canonical_utc_timestamp(trial_started)
         )
-        failed_at = datetime.now(timezone.utc).isoformat()
+        failed_at = canonical_utc_timestamp(datetime.now(timezone.utc))
         evidence = build_trial_failure_evidence(
             trial_number=int(trial.number),
             error=None,
@@ -727,7 +948,7 @@ def _recover_interrupted_trials(study: Any, trial_state: Any) -> int:
         study._storage.set_trial_user_attr(  # noqa: SLF001
             trial._trial_id,  # noqa: SLF001
             "failure_message",
-            "Recovered RUNNING trial from an interrupted prior process.",
+            FAILURE_RECOVERY_MESSAGE,
         )
         study._storage.set_trial_user_attr(  # noqa: SLF001
             trial._trial_id,  # noqa: SLF001
@@ -748,6 +969,9 @@ def _write_trial_cache(
     *,
     trial_number: int,
     evaluation: TrialEvaluation,
+    search_identity_sha256: str,
+    assignment_identity_sha256: str,
+    threshold_policy_identity_sha256: str,
 ) -> tuple[dict[str, Any], float]:
     directory = cache_root / f"trial_{trial_number:06d}"
     directory.mkdir(exist_ok=False)
@@ -756,24 +980,42 @@ def _write_trial_cache(
         "repeat_metrics": directory / "repeat_metrics.csv",
         "predictions": directory / "predictions.csv",
     }
-    # Persist predictions first, then reload the exact CSV float tokens and bind
-    # metrics/objective to those authoritative prediction floats.
+    # Predictions are written first. Their exact canonical CSV tokens are then
+    # the sole inputs to prediction identity and authoritative metric evidence.
     _write_csv(paths["predictions"], evaluation.predictions)
     with paths["predictions"].open("r", encoding="utf-8", newline="") as handle:
-        persisted_predictions = pd.DataFrame(list(csv.DictReader(handle)))
-    for column in ("probability", "selected_threshold", "target", "prediction"):
-        if column in persisted_predictions.columns:
-            persisted_predictions[column] = [
-                float(value)
-                if column in {"probability", "selected_threshold"}
-                else int(value)
-                for value in persisted_predictions[column].tolist()
-            ]
+        persisted_prediction_records = list(csv.DictReader(handle))
+    persisted_predictions = pd.DataFrame(persisted_prediction_records)
+    for column in ("target", "prediction"):
+        persisted_predictions[column] = [
+            int(value) for value in persisted_predictions[column].tolist()
+        ]
     for column in ("repeat", "fold", "row_position", "repeat_seed", "trial_number"):
-        if column in persisted_predictions.columns:
-            persisted_predictions[column] = [
-                int(value) for value in persisted_predictions[column].tolist()
-            ]
+        persisted_predictions[column] = [
+            int(value) for value in persisted_predictions[column].tolist()
+        ]
+    for column in ("probability", "selected_threshold"):
+        tokens = persisted_predictions[column].tolist()
+        if any(token != canonical_float_token(token) for token in tokens):
+            raise OptunaSearchLifecycleError(
+                f"Trial cache {column} contains a noncanonical float token."
+            )
+        persisted_predictions[column] = [float(token) for token in tokens]
+    adapter_id = str(evaluation.predictions["adapter_id"].iloc[0])
+    candidate_identity_sha256 = str(
+        evaluation.predictions["candidate_identity_sha256"].iloc[0]
+    )
+    prediction_coverage_identity_sha256, prediction_values_identity_sha256 = (
+        build_prediction_evidence_identities(
+            persisted_prediction_records,
+            trial_number=trial_number,
+            adapter_id=adapter_id,
+            candidate_identity_sha256=candidate_identity_sha256,
+            assignment_identity_sha256=assignment_identity_sha256,
+            threshold_policy_identity_sha256=threshold_policy_identity_sha256,
+            coverage=evaluation.coverage,
+        )
+    )
     fold_metrics = evaluation.fold_metrics.copy()
     for index, row in fold_metrics.iterrows():
         scoring = persisted_predictions.loc[
@@ -786,10 +1028,10 @@ def _write_trial_cache(
         ).astype("int8")
         targets = scoring["target"].to_numpy(dtype="int8")
         fold_metrics.at[index, "balanced_accuracy"] = float(
-            format(float(balanced_accuracy_score(targets, labels)), ".17g")
+            canonical_float_token(balanced_accuracy_score(targets, labels))
         )
         fold_metrics.at[index, "selected_threshold"] = float(
-            format(float(scoring["selected_threshold"].iloc[0]), ".17g")
+            canonical_float_token(scoring["selected_threshold"].iloc[0])
         )
     repeat_metrics = (
         fold_metrics.groupby("repeat", sort=True, as_index=False)
@@ -799,36 +1041,92 @@ def _write_trial_cache(
             balanced_accuracy=("balanced_accuracy", "mean"),
         )
         .assign(
-            trial_number=int(evaluation.fold_metrics["trial_number"].iloc[0]),
-            adapter_id=str(evaluation.fold_metrics["adapter_id"].iloc[0]),
-            candidate_identity_sha256=str(
-                evaluation.fold_metrics["candidate_identity_sha256"].iloc[0]
-            ),
+            trial_number=trial_number,
+            adapter_id=adapter_id,
+            candidate_identity_sha256=candidate_identity_sha256,
         )
     )
     repeat_metrics["balanced_accuracy"] = [
-        float(format(float(value), ".17g"))
+        float(canonical_float_token(value))
         for value in repeat_metrics["balanced_accuracy"].tolist()
     ]
-    repeat_metrics = repeat_metrics[
-        [
-            "trial_number",
-            "adapter_id",
-            "candidate_identity_sha256",
-            "repeat",
-            "repeat_seed",
-            "fold_count",
-            "balanced_accuracy",
-        ]
+    binding_values = {
+        "schema_version": 1,
+        "metric_name": "balanced_accuracy",
+        "search_identity_sha256": search_identity_sha256,
+        "assignment_identity_sha256": assignment_identity_sha256,
+        "threshold_policy_identity_sha256": threshold_policy_identity_sha256,
+        "prediction_coverage_identity_sha256": (prediction_coverage_identity_sha256),
+        "prediction_values_identity_sha256": prediction_values_identity_sha256,
+    }
+    for name, value in binding_values.items():
+        fold_metrics[name] = value
+        repeat_metrics[name] = value
+    fold_metrics["metric_value_token"] = [
+        canonical_float_token(value)
+        for value in fold_metrics["balanced_accuracy"].tolist()
     ]
-    _write_csv(paths["fold_metrics"], fold_metrics)
-    _write_csv(paths["repeat_metrics"], repeat_metrics)
+    fold_metrics["selected_threshold_token"] = [
+        canonical_float_token(value)
+        for value in fold_metrics["selected_threshold"].tolist()
+    ]
+    repeat_metrics["metric_value_token"] = [
+        canonical_float_token(value)
+        for value in repeat_metrics["balanced_accuracy"].tolist()
+    ]
+    repeat_metrics["selected_threshold_token"] = "not_applicable"
+    identity_columns = [
+        "schema_version",
+        "trial_number",
+        "metric_name",
+        "metric_value_token",
+        "selected_threshold_token",
+        "adapter_id",
+        "candidate_identity_sha256",
+        "search_identity_sha256",
+        "assignment_identity_sha256",
+        "threshold_policy_identity_sha256",
+        "prediction_coverage_identity_sha256",
+        "prediction_values_identity_sha256",
+    ]
+    fold_columns = identity_columns + [
+        "repeat",
+        "repeat_seed",
+        "fold",
+        "training_rows",
+        "validation_rows",
+        "threshold_selection_rows",
+        "threshold_source_folds",
+        "selected_threshold",
+        "threshold_selection_balanced_accuracy",
+        "threshold_status",
+        "threshold_degenerate",
+        "balanced_accuracy",
+        "true_negative",
+        "false_positive",
+        "false_negative",
+        "true_positive",
+        "comparison",
+    ]
+    repeat_columns = identity_columns + [
+        "repeat",
+        "repeat_seed",
+        "fold_count",
+        "balanced_accuracy",
+    ]
+    _write_csv(paths["fold_metrics"], fold_metrics[fold_columns])
+    _write_csv(paths["repeat_metrics"], repeat_metrics[repeat_columns])
     authoritative_objective = float(
-        format(float(repeat_metrics["balanced_accuracy"].mean()), ".17g")
+        canonical_float_token(repeat_metrics["balanced_accuracy"].mean())
     )
     return (
         {
             "schema_version": 1,
+            "threshold_policy_identity_sha256": threshold_policy_identity_sha256,
+            "prediction_coverage_identity_sha256": (
+                prediction_coverage_identity_sha256
+            ),
+            "prediction_values_identity_sha256": prediction_values_identity_sha256,
             "files": {
                 name: {
                     "path": path.relative_to(cache_root).as_posix(),
@@ -845,6 +1143,8 @@ def _write_trial_cache(
 def _load_completed_trial_caches(
     cache_root: Path,
     complete_trials: list[Any],
+    *,
+    search_identity_sha256: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     metric_frames: list[pd.DataFrame] = []
     prediction_frames: list[pd.DataFrame] = []
@@ -876,6 +1176,11 @@ def _load_completed_trial_caches(
                 raise OptunaSearchLifecycleError(f"Trial cache {name} is empty.")
             frame = pd.DataFrame(rows)
             for column in frame.columns:
+                if column.endswith("_token") or (
+                    name == "predictions"
+                    and column in {"probability", "selected_threshold"}
+                ):
+                    continue
                 sample = next(
                     (
                         value
@@ -911,6 +1216,8 @@ def _load_completed_trial_caches(
             loaded[name] = frame
         fold = loaded["fold_metrics"]
         repeat = loaded["repeat_metrics"].copy()
+        fold["search_identity_sha256"] = search_identity_sha256
+        repeat["search_identity_sha256"] = search_identity_sha256
         repeat["record_type"] = "repeat"
         fold["record_type"] = "fold"
         metric_frames.extend([fold, repeat])
@@ -930,19 +1237,76 @@ def _load_completed_trial_caches(
     for name in nullable_integer_columns:
         if name in metrics.columns:
             metrics[name] = metrics[name].astype("Int64")
+    metric_columns = [
+        "schema_version",
+        "trial_number",
+        "record_type",
+        "repeat",
+        "fold",
+        "metric_name",
+        "metric_value_token",
+        "selected_threshold_token",
+        "adapter_id",
+        "candidate_identity_sha256",
+        "search_identity_sha256",
+        "assignment_identity_sha256",
+        "threshold_policy_identity_sha256",
+        "prediction_coverage_identity_sha256",
+        "prediction_values_identity_sha256",
+        "repeat_seed",
+        "training_rows",
+        "validation_rows",
+        "threshold_selection_rows",
+        "threshold_source_folds",
+        "selected_threshold",
+        "threshold_selection_balanced_accuracy",
+        "threshold_status",
+        "threshold_degenerate",
+        "balanced_accuracy",
+        "true_negative",
+        "false_positive",
+        "false_negative",
+        "true_positive",
+        "comparison",
+        "fold_count",
+    ]
+    metrics = metrics.reindex(columns=metric_columns)
     predictions = pd.concat(prediction_frames, ignore_index=True)
     return metrics, predictions
 
 
-def _build_trial_table(trials: list[Any]) -> pd.DataFrame:
+def _build_trial_table(
+    trials: list[Any],
+    *,
+    search_identity_sha256: str,
+) -> pd.DataFrame:
     records = []
     for trial in sorted(trials, key=lambda item: item.number):
-        duration = (
-            None
-            if trial.datetime_start is None or trial.datetime_complete is None
-            else (trial.datetime_complete - trial.datetime_start).total_seconds()
-        )
         failure_evidence = trial.user_attrs.get("failure_evidence")
+        duration: float | None
+        if isinstance(failure_evidence, dict):
+            started_at_value = failure_evidence["started_at_utc"]
+            finished_at_value = failure_evidence["failed_at_utc"]
+            duration = (
+                datetime.strptime(finished_at_value, "%Y-%m-%dT%H:%M:%S.%fZ")
+                - datetime.strptime(started_at_value, "%Y-%m-%dT%H:%M:%S.%fZ")
+            ).total_seconds()
+        else:
+            started_at_value = (
+                None
+                if trial.datetime_start is None
+                else trial.datetime_start.isoformat()
+            )
+            finished_at_value = (
+                None
+                if trial.datetime_complete is None
+                else trial.datetime_complete.isoformat()
+            )
+            duration = (
+                None
+                if trial.datetime_start is None or trial.datetime_complete is None
+                else (trial.datetime_complete - trial.datetime_start).total_seconds()
+            )
         records.append(
             {
                 "trial_number": int(trial.number),
@@ -951,17 +1315,24 @@ def _build_trial_table(trials: list[Any]) -> pd.DataFrame:
                 "candidate_identity_sha256": trial.user_attrs.get(
                     "candidate_identity_sha256"
                 ),
+                "search_identity_sha256": (
+                    search_identity_sha256 if trial.state.name == "COMPLETE" else None
+                ),
+                "assignment_identity_sha256": trial.user_attrs.get(
+                    "assignment_identity_sha256"
+                ),
+                "threshold_policy_identity_sha256": trial.user_attrs.get(
+                    "threshold_policy_identity_sha256"
+                ),
+                "prediction_coverage_identity_sha256": trial.user_attrs.get(
+                    "prediction_coverage_identity_sha256"
+                ),
+                "prediction_values_identity_sha256": trial.user_attrs.get(
+                    "prediction_values_identity_sha256"
+                ),
                 "objective": None if trial.value is None else float(trial.value),
-                "started_at": (
-                    None
-                    if trial.datetime_start is None
-                    else trial.datetime_start.isoformat()
-                ),
-                "finished_at": (
-                    None
-                    if trial.datetime_complete is None
-                    else trial.datetime_complete.isoformat()
-                ),
+                "started_at": started_at_value,
+                "finished_at": finished_at_value,
                 "duration_seconds": duration,
                 "optuna_parameters_json": json.dumps(
                     trial.params,

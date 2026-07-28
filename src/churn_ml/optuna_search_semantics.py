@@ -5,7 +5,7 @@ import json
 import math
 import re
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping, NoReturn
 
@@ -19,8 +19,9 @@ from src.churn_ml.optuna_search_config import (
     load_search_space,
 )
 from src.churn_ml.optuna_search_lifecycle import (
-    derive_failure_reason_code,
+    build_prediction_evidence_identities,
     reconstruct_authoritative_dataset_identity_from_plan,
+    validate_trial_failure_evidence,
 )
 from src.churn_ml.optuna_search_objective import build_search_assignments
 from src.churn_ml.optuna_search_resume import (
@@ -68,6 +69,11 @@ TRIAL_COLUMNS = [
     "state",
     "adapter_id",
     "candidate_identity_sha256",
+    "search_identity_sha256",
+    "assignment_identity_sha256",
+    "threshold_policy_identity_sha256",
+    "prediction_coverage_identity_sha256",
+    "prediction_values_identity_sha256",
     "objective",
     "started_at",
     "finished_at",
@@ -93,12 +99,22 @@ PREDICTION_COLUMNS = [
     "prediction",
 ]
 METRIC_COLUMNS = [
+    "schema_version",
     "trial_number",
+    "record_type",
+    "repeat",
+    "fold",
+    "metric_name",
+    "metric_value_token",
+    "selected_threshold_token",
     "adapter_id",
     "candidate_identity_sha256",
-    "repeat",
+    "search_identity_sha256",
+    "assignment_identity_sha256",
+    "threshold_policy_identity_sha256",
+    "prediction_coverage_identity_sha256",
+    "prediction_values_identity_sha256",
     "repeat_seed",
-    "fold",
     "training_rows",
     "validation_rows",
     "threshold_selection_rows",
@@ -113,9 +129,9 @@ METRIC_COLUMNS = [
     "false_negative",
     "true_positive",
     "comparison",
-    "record_type",
     "fold_count",
 ]
+
 ASSIGNMENT_COLUMNS = ["repeat", "repeat_seed", "fold", "row_position"]
 MEMBERSHIP_COLUMNS = ["repeat", "scoring_fold", "threshold_source_fold"]
 
@@ -214,6 +230,8 @@ def validate_completed_search_semantics(root: Path, *, project_root: Path) -> No
             "study_identity_sha256",
             "dataset_identity_sha256",
             "assignment_identity_sha256",
+            "prediction_evidence_identity_sha256",
+            "failure_evidence_identity_sha256",
             "resume_authentication_sha256",
         },
         "search identity",
@@ -235,6 +253,14 @@ def validate_completed_search_semantics(root: Path, *, project_root: Path) -> No
     _require_sha256(
         search_identity["assignment_identity_sha256"],
         "assignment_identity_sha256",
+    )
+    _require_sha256(
+        search_identity["prediction_evidence_identity_sha256"],
+        "prediction_evidence_identity_sha256",
+    )
+    _require_sha256(
+        search_identity["failure_evidence_identity_sha256"],
+        "failure_evidence_identity_sha256",
     )
 
     _validate_source_and_environment(
@@ -299,6 +325,8 @@ def validate_completed_search_semantics(root: Path, *, project_root: Path) -> No
         search_space=space.payload,
         adapter_id=adapter_id,
         row_count=len(y),
+        search_identity_sha256=expected_search_sha256,
+        assignment_identity_sha256=search_identity["assignment_identity_sha256"],
     )
     best_number = min(
         reconstructed_objectives,
@@ -335,6 +363,13 @@ def _load_trials(path: Path, *, adapter_id: str) -> list[dict[str, Any]]:
     raw = _read_csv(path, TRIAL_COLUMNS)
     if not raw:
         _fail("Trials artifact must contain at least one row.")
+    identity_fields = (
+        "search_identity_sha256",
+        "assignment_identity_sha256",
+        "threshold_policy_identity_sha256",
+        "prediction_coverage_identity_sha256",
+        "prediction_values_identity_sha256",
+    )
     trials: list[dict[str, Any]] = []
     for item in raw:
         number = _csv_int(item["trial_number"], "trial_number")
@@ -350,14 +385,18 @@ def _load_trials(path: Path, *, adapter_id: str) -> list[dict[str, Any]]:
             item["optuna_parameters_json"],
             "optuna_parameters_json",
         )
+        persisted_identities: dict[str, str | None]
         if state == "COMPLETE":
-            objective = _csv_float(item["objective"], "objective")
+            objective = _csv_canonical_float(item["objective"], "objective")
             if item["adapter_id"] != adapter_id:
                 _fail("Completed trial adapter identity differs.")
             candidate_identity = _require_sha256(
                 item["candidate_identity_sha256"],
                 "candidate_identity_sha256",
             )
+            persisted_identities = {
+                name: _require_sha256(item[name], name) for name in identity_fields
+            }
             resolved_parameters = _csv_json_mapping(
                 item["resolved_parameters_json"],
                 "resolved_parameters_json",
@@ -376,12 +415,14 @@ def _load_trials(path: Path, *, adapter_id: str) -> list[dict[str, Any]]:
         else:
             objective = None
             candidate_identity = None
+            persisted_identities = {name: None for name in identity_fields}
             resolved_parameters = None
             coverage = None
             if (
                 item["objective"]
                 or item["adapter_id"]
                 or item["candidate_identity_sha256"]
+                or any(item[name] for name in identity_fields)
             ):
                 _fail("Failed trial carries completed objective or identity evidence.")
             if (
@@ -403,14 +444,41 @@ def _load_trials(path: Path, *, adapter_id: str) -> list[dict[str, Any]]:
                 ) from error
             if not isinstance(failure_evidence, dict):
                 _fail("Failed trial failure evidence must be a mapping.")
+            canonical_failure_json = json.dumps(
+                failure_evidence, sort_keys=True, separators=(",", ":")
+            )
+            if item["failure_evidence_json"] != canonical_failure_json:
+                _fail("Failed trial failure evidence JSON is not canonical.")
             try:
-                derived = derive_failure_reason_code(failure_evidence)
+                derived = validate_trial_failure_evidence(
+                    failure_evidence,
+                    trial_state=state,
+                    persisted_failure_message=item["failure_message"],
+                    interrupted_recovery_recorded=(
+                        item["failure_reason_code"] == "INTERRUPTED_PROCESS_RECOVERY"
+                    ),
+                )
             except Exception as error:
                 raise OptunaSearchSemanticError(
                     f"Failed trial failure evidence is invalid: {error}"
                 ) from error
-            if failure_evidence.get("trial_number") != number:
+            if failure_evidence["trial_number"] != number:
                 _fail("Failure evidence trial number differs.")
+            summary_started = (
+                _parse_timestamp(item["started_at"], "started_at")
+                .astimezone(timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            )
+            summary_finished = (
+                _parse_timestamp(item["finished_at"], "finished_at")
+                .astimezone(timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            )
+            if (
+                failure_evidence["started_at_utc"] != summary_started
+                or failure_evidence["failed_at_utc"] != summary_finished
+            ):
+                _fail("Failure timestamps differ from trial lifecycle summary.")
             if derived != item["failure_reason_code"]:
                 _fail("Persisted failure reason code differs from derived evidence.")
         trials.append(
@@ -423,6 +491,7 @@ def _load_trials(path: Path, *, adapter_id: str) -> list[dict[str, Any]]:
                 "resolved_parameters": resolved_parameters,
                 "coverage": coverage,
                 "candidate_identity_sha256": candidate_identity,
+                **persisted_identities,
                 "failure_reason_code": item["failure_reason_code"] or None,
                 "failure_evidence": failure_evidence,
                 "started_at": item["started_at"],
@@ -443,6 +512,10 @@ def _load_predictions(path: Path, *, adapter_id: str) -> pd.DataFrame:
     for item in raw:
         if item["adapter_id"] != adapter_id:
             _fail("Prediction adapter identity differs.")
+        probability = _csv_canonical_probability(item["probability"])
+        threshold = _csv_canonical_probability(
+            item["selected_threshold"], label="selected_threshold"
+        )
         records.append(
             {
                 "trial_number": _csv_int(item["trial_number"], "trial_number"),
@@ -456,15 +529,14 @@ def _load_predictions(path: Path, *, adapter_id: str) -> pd.DataFrame:
                 "fold": _csv_int(item["fold"], "fold"),
                 "row_position": _csv_int(item["row_position"], "row_position"),
                 "target": _csv_binary(item["target"], "target"),
-                "probability": _csv_probability(item["probability"]),
-                "selected_threshold": _csv_probability(
-                    item["selected_threshold"],
-                    label="selected_threshold",
-                ),
+                "probability": probability,
+                "probability_token": item["probability"],
+                "selected_threshold": threshold,
+                "selected_threshold_token": item["selected_threshold"],
                 "prediction": _csv_binary(item["prediction"], "prediction"),
             }
         )
-    frame = pd.DataFrame(records, columns=PREDICTION_COLUMNS)
+    frame = pd.DataFrame(records)
     if frame.empty:
         _fail("Completed search predictions must not be empty.")
     keys = ["trial_number", "repeat", "row_position"]
@@ -476,54 +548,72 @@ def _load_predictions(path: Path, *, adapter_id: str) -> pd.DataFrame:
 def _load_metrics(path: Path, *, adapter_id: str) -> pd.DataFrame:
     raw = _read_csv(path, METRIC_COLUMNS)
     records: list[dict[str, Any]] = []
+    identity_fields = (
+        "candidate_identity_sha256",
+        "search_identity_sha256",
+        "assignment_identity_sha256",
+        "threshold_policy_identity_sha256",
+        "prediction_coverage_identity_sha256",
+        "prediction_values_identity_sha256",
+    )
     for item in raw:
+        if _csv_int(item["schema_version"], "metric schema_version") != 1:
+            _fail("Metric schema version differs.")
         if item["adapter_id"] != adapter_id:
             _fail("Metric adapter identity differs.")
         record_type = item["record_type"]
         if record_type not in {"fold", "repeat"}:
             _fail("Metric record_type is invalid.")
+        if item["metric_name"] != REQUIRED_METRIC_NAME:
+            _fail("Metric name is missing or invalid.")
+        metric_value = _csv_canonical_float(
+            item["metric_value_token"], "metric_value_token"
+        )
+        balanced_accuracy = _csv_canonical_float(
+            item["balanced_accuracy"], "balanced_accuracy"
+        )
+        if item["metric_value_token"] != item["balanced_accuracy"]:
+            _fail("Metric value token differs from Balanced Accuracy evidence.")
         common: dict[str, Any] = {
+            "schema_version": 1,
             "trial_number": _csv_int(item["trial_number"], "trial_number"),
             "adapter_id": item["adapter_id"],
-            "candidate_identity_sha256": _require_sha256(
-                item["candidate_identity_sha256"],
-                "candidate_identity_sha256",
-            ),
+            **{name: _require_sha256(item[name], name) for name in identity_fields},
             "repeat": _csv_int(item["repeat"], "repeat"),
             "repeat_seed": _csv_int(item["repeat_seed"], "repeat_seed"),
-            "balanced_accuracy": _csv_float(
-                item["balanced_accuracy"],
-                "balanced_accuracy",
-            ),
+            "balanced_accuracy": balanced_accuracy,
             "balanced_accuracy_token": item["balanced_accuracy"],
+            "metric_value_token": item["metric_value_token"],
             "record_type": record_type,
-            "metric_name": REQUIRED_METRIC_NAME,
+            "metric_name": item["metric_name"],
         }
-        if not 0.0 <= common["balanced_accuracy"] <= 1.0:
-            _fail("Balanced Accuracy must be in [0, 1].")
+        if metric_value != balanced_accuracy or not 0.0 <= balanced_accuracy <= 1.0:
+            _fail("Balanced Accuracy metric evidence is invalid.")
         if record_type == "fold":
-            required_empty = {"fold_count"}
-            if any(item[name] for name in required_empty):
+            if item["fold_count"]:
                 _fail("Fold metric contains repeat-only fields.")
+            selected_threshold = _csv_canonical_probability(
+                item["selected_threshold"], label="selected_threshold"
+            )
+            selected_threshold_token = item["selected_threshold_token"]
+            if (
+                selected_threshold_token != _canonical_float_token(selected_threshold)
+                or selected_threshold_token != item["selected_threshold"]
+            ):
+                _fail("Selected-threshold token is noncanonical or inconsistent.")
             record = {
                 **common,
                 "fold": _csv_int(item["fold"], "fold"),
                 "training_rows": _csv_int(item["training_rows"], "training_rows"),
-                "validation_rows": _csv_int(
-                    item["validation_rows"],
-                    "validation_rows",
-                ),
+                "validation_rows": _csv_int(item["validation_rows"], "validation_rows"),
                 "threshold_selection_rows": _csv_int(
                     item["threshold_selection_rows"],
                     "threshold_selection_rows",
                 ),
                 "threshold_source_folds": item["threshold_source_folds"],
-                "selected_threshold": _csv_probability(
-                    item["selected_threshold"],
-                    label="selected_threshold",
-                ),
-                "selected_threshold_token": item["selected_threshold"],
-                "threshold_selection_balanced_accuracy": _csv_float(
+                "selected_threshold": selected_threshold,
+                "selected_threshold_token": selected_threshold_token,
+                "threshold_selection_balanced_accuracy": _csv_canonical_float(
                     item["threshold_selection_balanced_accuracy"],
                     "threshold_selection_balanced_accuracy",
                 ),
@@ -532,38 +622,40 @@ def _load_metrics(path: Path, *, adapter_id: str) -> pd.DataFrame:
                 ],
                 "threshold_status": item["threshold_status"],
                 "threshold_degenerate": _csv_bool(
-                    item["threshold_degenerate"],
-                    "threshold_degenerate",
+                    item["threshold_degenerate"], "threshold_degenerate"
                 ),
                 "true_negative": _csv_int(item["true_negative"], "true_negative"),
-                "false_positive": _csv_int(
-                    item["false_positive"],
-                    "false_positive",
-                ),
-                "false_negative": _csv_int(
-                    item["false_negative"],
-                    "false_negative",
-                ),
+                "false_positive": _csv_int(item["false_positive"], "false_positive"),
+                "false_negative": _csv_int(item["false_negative"], "false_negative"),
                 "true_positive": _csv_int(item["true_positive"], "true_positive"),
                 "comparison": item["comparison"],
                 "fold_count": None,
             }
         else:
-            fold_only = set(METRIC_COLUMNS) - {
-                "trial_number",
-                "adapter_id",
-                "candidate_identity_sha256",
-                "repeat",
-                "repeat_seed",
-                "balanced_accuracy",
-                "record_type",
-                "fold_count",
+            fold_only = {
+                "fold",
+                "training_rows",
+                "validation_rows",
+                "threshold_selection_rows",
+                "threshold_source_folds",
+                "selected_threshold",
+                "threshold_selection_balanced_accuracy",
+                "threshold_status",
+                "threshold_degenerate",
+                "true_negative",
+                "false_positive",
+                "false_negative",
+                "true_positive",
+                "comparison",
             }
             if any(item[name] for name in fold_only):
                 _fail("Repeat metric contains fold-only fields.")
+            if item["selected_threshold_token"] != "not_applicable":
+                _fail("Repeat metric threshold token must be explicitly inapplicable.")
             record = {
                 **common,
                 "fold": None,
+                "selected_threshold_token": "not_applicable",
                 "fold_count": _csv_int(item["fold_count"], "fold_count"),
             }
         records.append(record)
@@ -648,7 +740,7 @@ def _metric_key_tuple(row: Mapping[str, Any]) -> tuple[int, str, int, int | None
         str(row["record_type"]),
         int(row["repeat"]),
         _optional_fold_key(row["fold"]),
-        REQUIRED_METRIC_NAME,
+        str(row["metric_name"]),
     )
 
 
@@ -708,6 +800,8 @@ def _reconstruct_trials(
     search_space: Mapping[str, Any],
     adapter_id: str,
     row_count: int,
+    search_identity_sha256: str,
+    assignment_identity_sha256: str,
 ) -> dict[int, float]:
     complete = [item for item in trials if item["state"] == "COMPLETE"]
     complete_numbers = {item["trial_number"] for item in complete}
@@ -735,6 +829,7 @@ def _reconstruct_trials(
         "metric": resolved["metric"],
         **resolved["threshold_grid"],
     }
+    threshold_policy_identity_sha256 = canonical_sha256(threshold_policy_identity)
     for trial in complete:
         number = trial["trial_number"]
         expected_parameters, expected_optuna = _expected_parameters(
@@ -755,8 +850,14 @@ def _reconstruct_trials(
                 "resolved_parameters": expected_parameters,
             }
         )
-        if trial["candidate_identity_sha256"] != candidate_identity:
-            _fail(f"Trial {number} candidate identity differs.")
+        if (
+            trial["candidate_identity_sha256"] != candidate_identity
+            or trial["search_identity_sha256"] != search_identity_sha256
+            or trial["assignment_identity_sha256"] != assignment_identity_sha256
+            or trial["threshold_policy_identity_sha256"]
+            != threshold_policy_identity_sha256
+        ):
+            _fail(f"Trial {number} persisted identity bindings differ.")
         trial_predictions = predictions.loc[predictions["trial_number"] == number]
         if (
             len(trial_predictions) != expected_prediction_rows
@@ -799,6 +900,44 @@ def _reconstruct_trials(
         }
         if trial["coverage"] != expected_coverage:
             _fail(f"Trial {number} prediction coverage summary differs.")
+        prediction_identity_records = [
+            {
+                "trial_number": int(item["trial_number"]),
+                "repeat": int(item["repeat"]),
+                "fold": int(item["fold"]),
+                "row_position": int(item["row_position"]),
+                "probability": item["probability_token"],
+                "prediction": int(item["prediction"]),
+                "selected_threshold": item["selected_threshold_token"],
+            }
+            for item in trial_predictions.to_dict("records")
+        ]
+        expected_coverage_identity, expected_values_identity = (
+            build_prediction_evidence_identities(
+                prediction_identity_records,
+                trial_number=number,
+                adapter_id=adapter_id,
+                candidate_identity_sha256=candidate_identity,
+                assignment_identity_sha256=assignment_identity_sha256,
+                threshold_policy_identity_sha256=(threshold_policy_identity_sha256),
+                coverage=expected_coverage,
+            )
+        )
+        if (
+            trial["prediction_coverage_identity_sha256"] != expected_coverage_identity
+            or trial["prediction_values_identity_sha256"] != expected_values_identity
+        ):
+            _fail(f"Trial {number} prediction identities differ.")
+        expected_metric_bindings = {
+            "adapter_id": adapter_id,
+            "candidate_identity_sha256": candidate_identity,
+            "search_identity_sha256": search_identity_sha256,
+            "assignment_identity_sha256": assignment_identity_sha256,
+            "threshold_policy_identity_sha256": (threshold_policy_identity_sha256),
+            "prediction_coverage_identity_sha256": expected_coverage_identity,
+            "prediction_values_identity_sha256": expected_values_identity,
+            "metric_name": REQUIRED_METRIC_NAME,
+        }
         fold_scores: list[dict[str, Any]] = []
         for repeat in range(1, repeats + 1):
             repeat_predictions = trial_predictions.loc[
@@ -858,10 +997,11 @@ def _reconstruct_trials(
                     _fail("Fold metric coverage differs.")
                 item = fold_metric.iloc[0]
                 if (
-                    item["adapter_id"] != adapter_id
-                    or item["candidate_identity_sha256"] != candidate_identity
+                    any(
+                        item[name] != value
+                        for name, value in expected_metric_bindings.items()
+                    )
                     or item["comparison"] != threshold_policy_identity["comparison"]
-                    or item["metric_name"] != REQUIRED_METRIC_NAME
                 ):
                     _fail(f"Trial {number} fold metric identity bindings differ.")
                 expected_values = {
@@ -920,10 +1060,9 @@ def _reconstruct_trials(
             trial_repeat_metrics.iterrows(),
             strict=True,
         ):
-            if (
-                actual["adapter_id"] != adapter_id
-                or actual["candidate_identity_sha256"] != candidate_identity
-                or actual["metric_name"] != REQUIRED_METRIC_NAME
+            if any(
+                actual[name] != value
+                for name, value in expected_metric_bindings.items()
             ):
                 _fail(f"Trial {number} repeat metric identity bindings differ.")
             for name, value in expected.items():
@@ -974,6 +1113,9 @@ def _validate_best_and_candidate(
             "candidate_identity_sha256",
             "candidate_config_sha256",
             "prediction_key_coverage",
+            "threshold_policy_identity_sha256",
+            "prediction_coverage_identity_sha256",
+            "prediction_values_identity_sha256",
             "evidence_scope",
         },
         "best trial",
@@ -990,6 +1132,12 @@ def _validate_best_and_candidate(
         or best["resolved_parameters"] != winner["resolved_parameters"]
         or best["candidate_identity_sha256"] != winner["candidate_identity_sha256"]
         or best["prediction_key_coverage"] != winner["coverage"]
+        or best["threshold_policy_identity_sha256"]
+        != winner["threshold_policy_identity_sha256"]
+        or best["prediction_coverage_identity_sha256"]
+        != winner["prediction_coverage_identity_sha256"]
+        or best["prediction_values_identity_sha256"]
+        != winner["prediction_values_identity_sha256"]
         or best["evidence_scope"] != "tuning_only_not_unbiased_final_evidence"
     ):
         _fail("Best-trial artifact differs from reconstructed winner.")
@@ -1053,6 +1201,10 @@ def _validate_study_summary(
             "resume_authentication_sha256",
             "dataset_identity_sha256",
             "assignment_identity_sha256",
+            "threshold_policy_identity_sha256",
+            "prediction_evidence_identity_sha256",
+            "failure_evidence_identity_sha256",
+            "interrupted_recovery_trial_numbers",
             "direction",
             "metric",
             "objective_aggregation",
@@ -1076,8 +1228,34 @@ def _validate_study_summary(
         "fail": sum(item["state"] == "FAIL" for item in trials),
         "waiting": 0,
     }
-    recovered = sum(
-        item["failure_reason_code"] == "INTERRUPTED_PROCESS_RECOVERY" for item in trials
+    interrupted_recovery_trial_numbers = [
+        item["trial_number"]
+        for item in trials
+        if item["failure_reason_code"] == "INTERRUPTED_PROCESS_RECOVERY"
+    ]
+    recovered = len(interrupted_recovery_trial_numbers)
+    completed_prediction_identities = [
+        {
+            "trial_number": item["trial_number"],
+            "prediction_coverage_identity_sha256": item[
+                "prediction_coverage_identity_sha256"
+            ],
+            "prediction_values_identity_sha256": item[
+                "prediction_values_identity_sha256"
+            ],
+        }
+        for item in trials
+        if item["state"] == "COMPLETE"
+    ]
+    failed_evidence = [
+        item["failure_evidence"] for item in trials if item["state"] == "FAIL"
+    ]
+    threshold_policy_identity_sha256 = canonical_sha256(
+        {
+            "id": resolved["threshold_policy"],
+            "metric": resolved["metric"],
+            **resolved["threshold_grid"],
+        }
     )
     storage = _required_string(study["storage"], "study storage")
     if (
@@ -1090,6 +1268,19 @@ def _validate_study_summary(
         != resume_authentication["identity_sha256"]
         or study["dataset_identity_sha256"] != canonical_sha256(dataset_identity)
         or study["assignment_identity_sha256"] != canonical_sha256(assignment_identity)
+        or study["threshold_policy_identity_sha256"] != threshold_policy_identity_sha256
+        or study["prediction_evidence_identity_sha256"]
+        != canonical_sha256(
+            {"schema_version": 1, "trials": completed_prediction_identities}
+        )
+        or study["prediction_evidence_identity_sha256"]
+        != search_identity["prediction_evidence_identity_sha256"]
+        or study["failure_evidence_identity_sha256"]
+        != canonical_sha256({"schema_version": 1, "records": failed_evidence})
+        or study["failure_evidence_identity_sha256"]
+        != search_identity["failure_evidence_identity_sha256"]
+        or study["interrupted_recovery_trial_numbers"]
+        != interrupted_recovery_trial_numbers
         or study["dataset_identity_sha256"]
         != search_identity["dataset_identity_sha256"]
         or study["assignment_identity_sha256"]
@@ -1406,6 +1597,23 @@ def _csv_float(value: str, label: str) -> float:
 
 def _csv_probability(value: str, label: str = "probability") -> float:
     result = _csv_float(value, label)
+    if not 0.0 <= result <= 1.0:
+        _fail(f"{label} must be in [0, 1].")
+    return result
+
+
+def _csv_canonical_float(value: str, label: str) -> float:
+    result = _csv_float(value, label)
+    if value != _canonical_float_token(result):
+        _fail(f"{label} must use the exact canonical float token.")
+    return result
+
+
+def _csv_canonical_probability(
+    value: str,
+    label: str = "probability",
+) -> float:
+    result = _csv_canonical_float(value, label)
     if not 0.0 <= result <= 1.0:
         _fail(f"{label} must be in [0, 1].")
     return result
