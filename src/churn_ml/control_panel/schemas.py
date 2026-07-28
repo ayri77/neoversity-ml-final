@@ -193,6 +193,7 @@ class PlaceholderSpec:
     choices: tuple[str, ...]
     sensitive: bool
     must_exist: bool
+    external_absolute: bool
 
     @classmethod
     def from_dict(cls, raw: Any, label: str) -> PlaceholderSpec:
@@ -200,7 +201,13 @@ class PlaceholderSpec:
         _exact_keys(
             value,
             required={"type", "role", "required"},
-            optional={"roots", "choices", "sensitive", "must_exist"},
+            optional={
+                "roots",
+                "choices",
+                "sensitive",
+                "must_exist",
+                "external_absolute",
+            },
             label=label,
         )
         kind = _typed(value["type"], str, f"{label}.type")
@@ -213,7 +220,25 @@ class PlaceholderSpec:
         for index, root in enumerate(roots):
             validate_relative_path_text(root, f"{label}.roots[{index}]")
         choices = _string_list(value.get("choices", []), f"{label}.choices")
-        if kind == "path" and not roots:
+        external_absolute = _typed(
+            value.get("external_absolute", False),
+            bool,
+            f"{label}.external_absolute",
+        )
+        if external_absolute:
+            if kind != "path":
+                raise SchemaError(
+                    f"{label}.external_absolute is only valid for path placeholders."
+                )
+            if role != "output":
+                raise SchemaError(
+                    f"{label}.external_absolute is only valid for output paths."
+                )
+            if roots:
+                raise SchemaError(
+                    f"{label}.roots must be empty when external_absolute is true."
+                )
+        elif kind == "path" and not roots:
             raise SchemaError(f"{label}.roots is required for path placeholders.")
         if kind == "enum" and not choices:
             raise SchemaError(f"{label}.choices is required for enum placeholders.")
@@ -233,6 +258,7 @@ class PlaceholderSpec:
                 bool,
                 f"{label}.must_exist",
             ),
+            external_absolute=external_absolute,
         )
 
 

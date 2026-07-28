@@ -5,6 +5,7 @@ approved_public_clis:
   - scripts/compare_research_v2.py
   - scripts/sync_mlflow.py
   - scripts/run_deployment_v1.py
+  - scripts/run_optuna_search.py
 commands:
   - id: experiment_core_v2
     title: Experiment Core v2
@@ -377,3 +378,149 @@ commands:
         competition_test: true
         success_markers: ['"ok": true']
         failure_markers: ['"ok": false']
+
+  - id: optuna_search_v1
+    title: Optuna Search v1
+    description: >
+      Validate, run, resume, inspect, or export train-only Optuna searches.
+      Additional trials after a finalized study require a new study, config, and
+      output ID. This registry does not expose n_trials extension of a finalized study.
+    category: Search
+    argv_prefix: ["$PYTHON", "-u", "scripts/run_optuna_search.py"]
+    allowed_config_globs:
+      - "configs/optuna/*.yaml"
+      - "artifacts/ui_configs/*.yaml"
+      - "artifacts/ui_configs/*.yml"
+      - "artifacts/ui_configs/*.json"
+    allowed_input_roots:
+      - "configs/optuna"
+      - "artifacts/ui_configs"
+      - "artifacts/optuna_searches"
+    allowed_output_roots:
+      - "artifacts/ui_configs"
+      - "configs/research_v2"
+    result_reader_id: optuna_search_v1
+    artifact_url: null
+    environment:
+      - name: CHURN_ML_OPTUNA_LIFECYCLE_AUTHORITY_KEY_FILE
+        required: false
+        sensitive: true
+    actions:
+      - id: authority_init
+        title: Initialize authority key
+        description: >
+          Create a new external lifecycle authority key at an absolute path
+          outside the repository. The key path is never displayed or persisted.
+        argv: ["authority-init", "--output", "{output}"]
+        placeholders:
+          output:
+            type: path
+            role: output
+            required: true
+            external_absolute: true
+            sensitive: true
+            must_exist: false
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ['"status": "authority_initialized"']
+        failure_markers: ['"status": "failed"', "Traceback"]
+      - id: validate
+        title: Validate
+        description: >
+          Validate an Optuna search config and referenced contracts without
+          allocation. Does not require the lifecycle authority key environment variable.
+        argv: ["validate", "--config", "{config}"]
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/optuna", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ['"status": "valid"']
+        failure_markers: ['"status": "failed"', "Traceback"]
+      - id: run
+        title: New study
+        description: >
+          Start a new train-only Optuna study from an approved config. Requires
+          CHURN_ML_OPTUNA_LIFECYCLE_AUTHORITY_KEY_FILE in the process environment.
+          For more trials after finalization, create a new study/config/output ID.
+        argv: ["run", "--config", "{config}"]
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/optuna", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ['"status": "completed"']
+        failure_markers: ['"status": "failed"', "Traceback"]
+      - id: resume
+        title: Resume unfinished study
+        description: >
+          Resume an unfinished train-only Optuna study using the same public run
+          CLI and config. Do not use this to raise n_trials on a finalized study;
+          start a new study instead. Requires the lifecycle authority key environment variable.
+        argv: ["run", "--config", "{config}"]
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/optuna", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ['"status": "completed"']
+        failure_markers: ['"status": "failed"', "Traceback"]
+      - id: inspect
+        title: Inspect
+        description: >
+          Read and validate one immutable completed search report. Requires the
+          lifecycle authority key environment variable.
+        argv: ["inspect", "--search-dir", "{search_dir}"]
+        placeholders:
+          search_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/optuna_searches"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ['"status": "completed"']
+        failure_markers: ['"status": "failed"', "Traceback"]
+      - id: export_best
+        title: Export best candidate
+        description: >
+          Copy the fixed best candidate config without overwriting. Requires the
+          lifecycle authority key environment variable. Additional trials still
+          require a new study rather than extending a finalized report.
+        argv: ["export-best", "--search-dir", "{search_dir}", "--output", "{output}"]
+        placeholders:
+          search_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/optuna_searches"]
+            must_exist: true
+          output:
+            type: path
+            role: output
+            required: true
+            roots: ["artifacts/ui_configs", "configs/research_v2"]
+            must_exist: false
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ['"status": "exported"']
+        failure_markers: ['"status": "failed"', "Traceback"]

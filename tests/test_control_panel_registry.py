@@ -25,12 +25,14 @@ def test_repository_registry_is_strict_and_cross_referenced() -> None:
         "paired_comparison",
         "mlflow_local_index",
         "final_deployment_v1",
+        "optuna_search_v1",
     }
     assert set(loaded.readers) == {
         "research_v2",
         "research_v1",
         "paired_comparison",
         "deployment_v1",
+        "optuna_search_v1",
     }
     assert loaded.commands["final_deployment_v1"].actions["run"].enabled is False
     assert (
@@ -117,6 +119,56 @@ def test_public_cli_entrypoints_have_real_help() -> None:
         )
         assert completed.returncode == 0, completed.stderr
         assert "usage:" in completed.stdout.lower()
+
+
+def test_optuna_registry_matches_public_cli_help_and_omits_candidate() -> None:
+    loaded = load_registry(PROJECT_ROOT)
+    optuna = loaded.commands["optuna_search_v1"]
+    assert optuna.public_cli == "scripts/run_optuna_search.py"
+    assert set(optuna.actions) == {
+        "authority_init",
+        "validate",
+        "run",
+        "resume",
+        "inspect",
+        "export_best",
+    }
+    assert "candidate" not in optuna.actions
+    assert "extend_trials" not in optuna.actions
+    assert "increase_n_trials" not in optuna.actions
+
+    completed = subprocess.run(
+        [sys.executable, "scripts/run_optuna_search.py", "--help"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    help_text = completed.stdout
+    for token in (
+        "authority-init",
+        "validate",
+        "run",
+        "inspect",
+        "export-best",
+    ):
+        assert token in help_text
+    assert "{authority-init,validate,run,inspect,export-best}" in help_text
+    assert "candidate" not in "{authority-init,validate,run,inspect,export-best}"
+
+    authority = optuna.environment["CHURN_ML_OPTUNA_LIFECYCLE_AUTHORITY_KEY_FILE"]
+    assert authority.required is False
+    assert authority.sensitive is True
+    assert optuna.actions["authority_init"].placeholders["output"].external_absolute
+    assert optuna.actions["authority_init"].placeholders["output"].sensitive is True
+    assert optuna.actions["run"].argv == ("run", "--config", "{config}")
+    assert optuna.actions["resume"].argv == ("run", "--config", "{config}")
+    assert "finalized" in optuna.actions["resume"].description.lower()
+    assert loaded.readers["optuna_search_v1"].artifact_roots == (
+        "artifacts/optuna_searches",
+    )
 
 
 @pytest.mark.parametrize(

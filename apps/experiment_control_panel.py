@@ -558,11 +558,20 @@ def _placeholder_widget(
             st.warning("No allowed configuration files were found.")
             return None
         return st.selectbox(label, options, key=widget_key)
+    if spec.type == "path" and spec.external_absolute:
+        path_help = (
+            "Absolute path outside the repository. The value is redacted when marked "
+            "sensitive and is never persisted by the control panel."
+            if spec.sensitive
+            else "Absolute path outside the repository."
+        )
+    elif spec.type == "path":
+        path_help = f"Repository-relative path within: {', '.join(spec.roots)}"
+    else:
+        path_help = "Safe identifier"
     return st.text_input(
         label,
-        help=f"Repository-relative path within: {', '.join(spec.roots)}"
-        if spec.type == "path"
-        else "Safe identifier",
+        help=path_help,
         key=widget_key,
     )
 

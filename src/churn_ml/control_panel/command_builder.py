@@ -142,6 +142,35 @@ def resolve_safe_path(
     return relative, canonical
 
 
+def resolve_external_absolute_path(
+    repository_root: Path,
+    raw: str | Path,
+    *,
+    must_exist: bool,
+) -> tuple[str, Path]:
+    """Resolve an absolute destination that must remain outside the repository."""
+    raw_text = os.fspath(raw).strip()
+    if not raw_text or "\x00" in raw_text:
+        raise CommandBuildError("External absolute path must be a non-empty string.")
+    raw_path = Path(raw_text)
+    if not raw_path.is_absolute():
+        raise CommandBuildError("External path must be absolute.")
+    if any(part == ".." for part in raw_path.parts):
+        raise CommandBuildError("External path must not contain traversal segments.")
+    root = repository_root.resolve(strict=True)
+    try:
+        canonical = raw_path.resolve(strict=must_exist)
+    except OSError as error:
+        raise CommandBuildError(
+            f"External path cannot be resolved: {raw_text}."
+        ) from error
+    if _is_within(canonical, root):
+        raise CommandBuildError("External path must remain outside the repository.")
+    if must_exist and not canonical.exists():
+        raise CommandBuildError(f"Required external path does not exist: {raw_text}.")
+    return os.fspath(canonical), canonical
+
+
 def _render_value(
     root: Path,
     name: str,
@@ -151,6 +180,13 @@ def _render_value(
     if spec.type == "path":
         if not isinstance(value, (str, Path)):
             raise CommandBuildError(f"{name} must be a path string.")
+        if spec.external_absolute:
+            absolute, canonical = resolve_external_absolute_path(
+                root,
+                value,
+                must_exist=spec.must_exist,
+            )
+            return absolute, absolute, canonical
         relative, canonical = resolve_safe_path(
             root,
             value,

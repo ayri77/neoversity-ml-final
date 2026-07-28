@@ -91,19 +91,34 @@ executable or arbitrary command text. A new supported CLI action can therefore b
 added without Python changes by adding a strict action entry and its typed
 placeholders.
 
-The initial registry is derived from actual public `--help` output at the approved
-base:
+The initial registry is derived from actual public `--help` output:
 
 - Experiment Core v2: validate and run;
 - legacy train-only research: validate and run;
 - Paired Comparison v1: validate and run;
 - MLflow local index: validate, dry-run source validation, and sync;
 - Final Deployment v1: validate, synthetic dry-run, inspect, and a real run that is
-  disabled by default.
+  disabled by default;
+- Optuna Search v1: authority-init, validate, new study, resume unfinished study,
+  inspect, and export-best.
 
-This base has no public Optuna lifecycle CLI, MLflow start command, Paired Comparison
-inspect/export command, or standalone result export command. The UI does not guess
-those interfaces. MLflow is opened through its configured URL.
+There is no public Optuna `candidate --validate-only` subcommand, no MLflow start
+command, no Paired Comparison inspect/export command, and no standalone result
+export command outside Optuna `export-best`. The UI does not guess missing
+interfaces. MLflow is opened through its configured URL.
+
+Optuna lifecycle runtime actions pass through the declared environment variable
+`CHURN_ML_OPTUNA_LIFECYCLE_AUTHORITY_KEY_FILE` when present. The variable is
+sensitive and never displayed or persisted. Structural config validation does not
+require it, matching the public CLI. Run, resume, inspect, and export-best fail
+clearly in the child process when the key is absent. The registry does not expose
+an action that raises `n_trials` on a finalized study; additional trials require a
+new study, config, and output ID.
+
+Path placeholders may set `external_absolute: true` only for Optuna
+`authority-init` output. That value must be an absolute filesystem path outside
+the repository; when marked sensitive, the path is redacted from argv displays and
+job metadata.
 
 ### `ui_readers.yaml`
 

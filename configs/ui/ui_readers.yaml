@@ -95,3 +95,30 @@ readers:
       - "Positive rate"
       - "Threshold"
       - "Rows"
+
+  - id: optuna_search_v1
+    title: Optuna Search v1 results
+    artifact_roots: ["artifacts/optuna_searches"]
+    discovery_glob: "*"
+    success_markers: ["_SUCCESS"]
+    failure_markers: ["_FAILED"]
+    summary_files:
+      - path: "study_summary.json"
+        fields:
+          Study name: "study_name"
+          Search ID: "search_id"
+          Best trial: "best_trial_number"
+          Best objective: "best_objective"
+          Requested trials: "requested_trials"
+          Actual trials: "actual_trials"
+      - path: "best_trial.json"
+        fields:
+          Best trial objective: "objective"
+          Best trial number: "trial_number"
+    csv_previews: ["trials.csv", "trial_metrics.csv"]
+    log_files: []
+    compare_fields:
+      - "Best objective"
+      - "Best trial"
+      - "Requested trials"
+      - "Actual trials"
