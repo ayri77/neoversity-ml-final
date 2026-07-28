@@ -99,8 +99,8 @@ The initial registry is derived from actual public `--help` output:
 - MLflow local index: validate, dry-run source validation, and sync;
 - Final Deployment v1: validate, synthetic dry-run, inspect, and a real run that is
   disabled by default;
-- Optuna Search v1: authority-init, validate, new study, resume unfinished study,
-  inspect, and export-best.
+- Optuna Search v1: validate (default), authority-init, new study, resume unfinished
+  study, inspect, and export-best.
 
 There is no public Optuna `candidate --validate-only` subcommand, no MLflow start
 command, no Paired Comparison inspect/export command, and no standalone result
@@ -171,6 +171,7 @@ artifacts/ui_jobs/<job-id>/
 ├── job.json
 ├── command.json
 ├── status.json
+├── terminal.json   # optional durable exit record from the job wrapper
 ├── stdout.log
 └── stderr.log
 ```
@@ -184,6 +185,12 @@ JSON writes use a temporary sibling, flush, filesystem sync, and atomic replace.
 stdout/stderr are append-only. Persisted states are `created`, `running`, `succeeded`,
 `failed`, `stop_requested`, `stopped`, and `orphaned`.
 
+Every UI-launched command runs through a small wrapper process. The wrapper is the
+tracked process; it executes the allowlisted target with `shell=False`, forwards
+stdout/stderr into the job logs, and atomically writes `terminal.json` with
+`terminal_status` (`succeeded` or `failed`), the exit code, and UTC timestamps before
+exiting. The terminal record never stores raw argv, environment values, or secrets.
+
 ### Process identity and orphan behavior
 
 While a job is live, status persists PID, creation time, executable identity, argv
@@ -191,10 +198,12 @@ fingerprint, and process-group/session identity where the platform provides them
 Refresh and stop verify that identity before acting. A process is never signalled
 based only on PID existence, which protects against PID reuse.
 
-Mismatched or unverifiable live jobs become `orphaned`. After an application
-restart, a still-matching process remains `running`; a missing process with no
-recoverable exit code from the local backend becomes `orphaned`. There is no
-database, recursive deletion, artifact cleanup, or automatic retry.
+Refresh prefers a valid `terminal.json` over the in-memory process handle, so a short
+completed job still becomes `succeeded` or `failed` after a Streamlit rerun. Mismatched
+or unverifiable live jobs become `orphaned` only when there is no trustworthy terminal
+record and no verifiable live process. After an application restart, a still-matching
+process remains `running`. There is no database, recursive deletion, artifact cleanup,
+or automatic retry.
 
 ### Minimal child environment
 

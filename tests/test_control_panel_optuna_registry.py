@@ -200,3 +200,10 @@ def test_optuna_public_cli_has_no_candidate_validate_only() -> None:
     )
     assert invalid.returncode != 0
     assert "invalid choice: 'candidate'" in invalid.stdout + invalid.stderr
+
+
+def test_optuna_registry_defaults_to_validate_action() -> None:
+    loaded = load_registry(PROJECT_ROOT)
+    action_ids = list(loaded.commands["optuna_search_v1"].actions)
+    assert action_ids[0] == "validate"
+    assert "authority_init" in action_ids

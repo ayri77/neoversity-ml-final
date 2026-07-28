@@ -406,6 +406,24 @@ commands:
         required: false
         sensitive: true
     actions:
+      - id: validate
+        title: Validate
+        description: >
+          Validate an Optuna search config and referenced contracts without
+          allocation. Does not require the lifecycle authority key environment variable.
+        argv: ["validate", "--config", "{config}"]
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/optuna", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ['"status": "valid"']
+        failure_markers: ['"status": "failed"', "Traceback"]
       - id: authority_init
         title: Initialize authority key
         description: >
@@ -424,24 +442,6 @@ commands:
         enabled: true
         competition_test: false
         success_markers: ['"status": "authority_initialized"']
-        failure_markers: ['"status": "failed"', "Traceback"]
-      - id: validate
-        title: Validate
-        description: >
-          Validate an Optuna search config and referenced contracts without
-          allocation. Does not require the lifecycle authority key environment variable.
-        argv: ["validate", "--config", "{config}"]
-        placeholders:
-          config:
-            type: path
-            role: config
-            required: true
-            roots: ["configs/optuna", "artifacts/ui_configs"]
-            must_exist: true
-        confirmation: none
-        enabled: true
-        competition_test: false
-        success_markers: ['"status": "valid"']
         failure_markers: ['"status": "failed"', "Traceback"]
       - id: run
         title: New study

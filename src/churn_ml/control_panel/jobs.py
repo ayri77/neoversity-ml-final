@@ -4,6 +4,7 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -11,6 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from src.churn_ml.control_panel.job_runner import (
+    TERMINAL_FILE_NAME,
+    TERMINAL_KEYS,
+    TERMINAL_SCHEMA_VERSION,
+)
 from src.churn_ml.control_panel.path_safety import (
     PathSafetyError,
     path_exists_nonfollowing,
@@ -50,9 +56,13 @@ TRANSITIONS = {
     "stopped": set(),
     "orphaned": set(),
 }
-JOB_FILES = frozenset(
+REQUIRED_JOB_FILES = frozenset(
     {"job.json", "command.json", "status.json", "stdout.log", "stderr.log"}
 )
+OPTIONAL_JOB_FILES = frozenset({TERMINAL_FILE_NAME})
+ALLOWED_JOB_FILES = REQUIRED_JOB_FILES | OPTIONAL_JOB_FILES
+JOB_FILES = REQUIRED_JOB_FILES  # backward-compatible alias for required layout
+JOB_RUNNER_PATH = Path(__file__).resolve().parent / "job_runner.py"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 DIAGNOSTIC_LIMIT = 512
 
@@ -189,8 +199,13 @@ class JobManager:
         _create_private_file(root / "stdout.log")
         _create_private_file(root / "stderr.log")
         try:
+            wrapper_argv = _wrapper_argv(
+                job_id=job_id,
+                terminal_path=root / TERMINAL_FILE_NAME,
+                target_argv=argv,
+            )
             spawned = self.backend.spawn(
-                argv,
+                wrapper_argv,
                 cwd=self.working_directory,
                 stdout_path=root / "stdout.log",
                 stderr_path=root / "stderr.log",
@@ -254,10 +269,19 @@ class JobManager:
         try:
             require_safe_directory(self.jobs_root)
             require_safe_directory(root)
-            if {entry.name for entry in os.scandir(root)} != JOB_FILES:
+            names = {
+                entry.name
+                for entry in os.scandir(root)
+                if not entry.name.startswith(".")
+            }
+            if not REQUIRED_JOB_FILES.issubset(names) or not names.issubset(
+                ALLOWED_JOB_FILES
+            ):
                 raise JobError("Job directory has missing or unknown files.")
             for name in ("stdout.log", "stderr.log"):
                 require_regular_file(root / name, reject_hardlinks=True)
+            if TERMINAL_FILE_NAME in names:
+                require_regular_file(root / TERMINAL_FILE_NAME, reject_hardlinks=True)
         except (OSError, PathSafetyError) as error:
             raise JobError(f"Unsafe job directory: {job_id}.") from error
         job = _read_json(root / "job.json")
@@ -274,6 +298,10 @@ class JobManager:
         state = str(status["state"])
         if state in TERMINAL_STATES or state == "created":
             return record
+        terminal_exit = _trusted_terminal_exit_code(record.root, job_id)
+        if terminal_exit is not None:
+            self._finish_from_exit(record.root, status, state, terminal_exit)
+            return self.load(job_id)
         identity = _identity_from_payload(status["process_identity"])
         exit_code = self.backend.poll(identity)
         if exit_code is not None:
@@ -286,16 +314,21 @@ class JobManager:
             status["diagnostic"] = None
             atomic_write_json(record.root / "status.json", status)
         else:
-            raced_exit_code = self.backend.poll(identity)
-            if raced_exit_code is not None:
-                self._finish_from_exit(record.root, status, state, raced_exit_code)
+            raced_terminal_exit = _trusted_terminal_exit_code(record.root, job_id)
+            if raced_terminal_exit is not None:
+                self._finish_from_exit(record.root, status, state, raced_terminal_exit)
             else:
-                self._transition(
-                    record.root,
-                    status,
-                    "orphaned",
-                    diagnostic=check.diagnostic or "Process identity is unverifiable.",
-                )
+                raced_exit_code = self.backend.poll(identity)
+                if raced_exit_code is not None:
+                    self._finish_from_exit(record.root, status, state, raced_exit_code)
+                else:
+                    self._transition(
+                        record.root,
+                        status,
+                        "orphaned",
+                        diagnostic=check.diagnostic
+                        or "Process identity is unverifiable.",
+                    )
         return self.load(job_id)
 
     def request_stop(self, job_id: str) -> JobRecord:
@@ -354,6 +387,71 @@ class JobManager:
             status["finished_at_utc"] = now
             status["exit_code"] = exit_code
         atomic_write_json(root / "status.json", status)
+
+
+def _wrapper_argv(
+    *,
+    job_id: str,
+    terminal_path: Path,
+    target_argv: Sequence[str],
+) -> list[str]:
+    if not JOB_RUNNER_PATH.is_file():
+        raise JobError("Job runner wrapper is missing.")
+    return [
+        sys.executable,
+        str(JOB_RUNNER_PATH),
+        "--job-id",
+        job_id,
+        "--terminal-file",
+        str(terminal_path),
+        "--",
+        *target_argv,
+    ]
+
+
+def _trusted_terminal_exit_code(root: Path, job_id: str) -> int | None:
+    path = root / TERMINAL_FILE_NAME
+    try:
+        if not path_exists_nonfollowing(path):
+            return None
+        require_regular_file(path, reject_hardlinks=True)
+        if path.resolve(strict=True).parent != root.resolve(strict=True):
+            return None
+        payload = _read_json(path)
+    except (OSError, PathSafetyError, JobError, json.JSONDecodeError):
+        return None
+    try:
+        return _validate_terminal_record(payload, job_id)
+    except JobError:
+        return None
+
+
+def _validate_terminal_record(payload: Mapping[str, Any], job_id: str) -> int:
+    _exact_keys(payload, set(TERMINAL_KEYS), TERMINAL_FILE_NAME)
+    _exact_int(
+        payload["schema_version"],
+        f"{TERMINAL_FILE_NAME}.schema_version",
+        expected=TERMINAL_SCHEMA_VERSION,
+    )
+    if payload["job_id"] != job_id:
+        raise JobError("terminal.json job_id does not match its directory.")
+    status = _exact_string(
+        payload["terminal_status"], f"{TERMINAL_FILE_NAME}.terminal_status"
+    )
+    if status not in {"succeeded", "failed"}:
+        raise JobError("terminal.json terminal_status is invalid.")
+    exit_code = _exact_int(payload["exit_code"], f"{TERMINAL_FILE_NAME}.exit_code")
+    if status == "succeeded" and exit_code != 0:
+        raise JobError("terminal.json succeeded status requires exit_code 0.")
+    if status == "failed" and exit_code == 0:
+        raise JobError("terminal.json failed status requires a nonzero exit_code.")
+    _canonical_timestamp(
+        payload["started_at_utc"], f"{TERMINAL_FILE_NAME}.started_at_utc"
+    )
+    _canonical_timestamp(
+        payload["finished_at_utc"], f"{TERMINAL_FILE_NAME}.finished_at_utc"
+    )
+    return exit_code
 
 
 def _create_private_file(path: Path) -> None:

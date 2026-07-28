@@ -132,6 +132,7 @@ def discover_artifacts(
 ) -> list[ArtifactRecord]:
     root = repository_root.resolve(strict=True)
     results: list[ArtifactRecord] = []
+    seen: set[tuple[str, str]] = set()
     for configured_root in reader.artifact_roots:
         try:
             _, artifact_root = resolve_safe_path(
@@ -150,6 +151,10 @@ def discover_artifacts(
                 record = read_artifact(root, reader, canonical)
             except (OSError, ValueError, ArtifactReadError, PathSafetyError):
                 continue
+            identity = (record.reader_id, record.relative_path)
+            if identity in seen:
+                continue
+            seen.add(identity)
             results.append(record)
     return sorted(results, key=lambda item: item.relative_path, reverse=True)
 

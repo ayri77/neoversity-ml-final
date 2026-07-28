@@ -251,3 +251,128 @@ def test_harmless_real_success_failure_stop_and_secret_redaction(
     time.sleep(0.1)
     for path in secret_job.root.iterdir():
         assert secret not in path.read_text(encoding="utf-8", errors="replace")
+
+
+def _wait_terminal_file(root: Path, *, timeout: float = 10.0) -> dict:
+    deadline = time.monotonic() + timeout
+    path = root / "terminal.json"
+    while time.monotonic() < deadline:
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
+        time.sleep(0.02)
+    raise AssertionError("terminal.json was not written in time")
+
+
+def test_terminal_record_recovers_success_after_live_handle_discard(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    record = manager.start(
+        argv=[sys.executable, "-c", "raise SystemExit(0)"],
+        redacted_argv=[sys.executable, "-c", "<harmless>"],
+        command_id=COMMAND_ID,
+        action_id=ACTION_ID,
+        references={},
+    )
+    terminal = _wait_terminal_file(record.root)
+    assert terminal["terminal_status"] == "succeeded"
+    assert terminal["exit_code"] == 0
+    assert manager.load(record.job_id).status["state"] == "running"
+    restarted = _manager(tmp_path)
+    refreshed = restarted.refresh(record.job_id)
+    assert refreshed.status["state"] == "succeeded"
+    assert refreshed.status["exit_code"] == 0
+    assert set(terminal) == {
+        "schema_version",
+        "job_id",
+        "terminal_status",
+        "exit_code",
+        "started_at_utc",
+        "finished_at_utc",
+    }
+
+
+def test_terminal_record_recovers_failure_after_live_handle_discard(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    record = manager.start(
+        argv=[sys.executable, "-c", "raise SystemExit(7)"],
+        redacted_argv=[sys.executable, "-c", "<harmless>"],
+        command_id=COMMAND_ID,
+        action_id=ACTION_ID,
+        references={},
+    )
+    terminal = _wait_terminal_file(record.root)
+    assert terminal["terminal_status"] == "failed"
+    assert terminal["exit_code"] == 7
+    assert manager.load(record.job_id).status["state"] == "running"
+    restarted = _manager(tmp_path)
+    refreshed = restarted.refresh(record.job_id)
+    assert refreshed.status["state"] == "failed"
+    assert refreshed.status["exit_code"] == 7
+
+
+def test_malformed_terminal_record_fails_closed_to_orphaned(tmp_path: Path) -> None:
+    record = _start(_manager(tmp_path, FakeBackend()))
+    (record.root / "terminal.json").write_text("{not-json", encoding="utf-8")
+    restarted = _manager(
+        tmp_path, FakeBackend(ProcessCheck("exited", "Process has exited."))
+    )
+    refreshed = restarted.refresh(record.job_id)
+    assert refreshed.status["state"] == "orphaned"
+
+
+def test_terminal_record_wrong_job_id_is_rejected(tmp_path: Path) -> None:
+    record = _start(_manager(tmp_path, FakeBackend()))
+    payload = {
+        "schema_version": 1,
+        "job_id": str(uuid.uuid4()),
+        "terminal_status": "succeeded",
+        "exit_code": 0,
+        "started_at_utc": "2026-01-01T00:00:00.000000Z",
+        "finished_at_utc": "2026-01-01T00:00:01.000000Z",
+    }
+    (record.root / "terminal.json").write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+    restarted = _manager(
+        tmp_path, FakeBackend(ProcessCheck("exited", "Process has exited."))
+    )
+    assert restarted.refresh(record.job_id).status["state"] == "orphaned"
+
+
+def test_terminal_record_contains_no_canary_secret(tmp_path: Path) -> None:
+    secret = "CANARY_SECRET_terminal_9f2a"
+    manager = _manager(tmp_path)
+    record = manager.start(
+        argv=[sys.executable, "-c", "import sys;print(sys.argv[1])", secret],
+        redacted_argv=[sys.executable, "-c", "<harmless print>", "<redacted>"],
+        command_id=COMMAND_ID,
+        action_id=ACTION_ID,
+        references={"value": secret},
+    )
+    terminal = _wait_terminal_file(record.root)
+    terminal_text = json.dumps(terminal)
+    assert secret not in terminal_text
+    assert "argv" not in terminal
+    assert set(terminal) == {
+        "schema_version",
+        "job_id",
+        "terminal_status",
+        "exit_code",
+        "started_at_utc",
+        "finished_at_utc",
+    }
+
+
+def test_no_terminal_and_vanished_process_remains_orphaned(tmp_path: Path) -> None:
+    record = _start(_manager(tmp_path, FakeBackend()))
+    assert not (record.root / "terminal.json").exists()
+    restarted = _manager(
+        tmp_path, FakeBackend(ProcessCheck("exited", "Process has exited."))
+    )
+    assert restarted.refresh(record.job_id).status["state"] == "orphaned"

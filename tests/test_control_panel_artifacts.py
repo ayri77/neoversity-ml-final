@@ -180,3 +180,38 @@ def test_external_artifact_directory_link_is_not_discovered(tmp_path: Path) -> N
     else:
         linked.symlink_to(external, target_is_directory=True)
     assert discover_artifacts(tmp_path, _reader("artifacts")) == []
+
+
+def test_overlapping_discovery_globs_dedupe_same_artifact(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    artifact = root / "shared"
+    artifact.mkdir(parents=True)
+    (artifact / "_SUCCESS").write_text("", encoding="utf-8")
+    (artifact / "summary.json").write_text(
+        json.dumps({"metrics": {"score": 0.9}, "items": [{"value": 1}]}),
+        encoding="utf-8",
+    )
+    reader = ReaderSpec.from_dict(
+        {
+            "id": "test",
+            "title": "Test reader",
+            "artifact_roots": ["artifacts", "artifacts"],
+            "discovery_glob": "*",
+            "success_markers": ["_SUCCESS"],
+            "failure_markers": ["_FAILED"],
+            "summary_files": [
+                {
+                    "path": "summary.json",
+                    "fields": {"Score": "metrics.score"},
+                }
+            ],
+            "csv_previews": [],
+            "log_files": [],
+            "compare_fields": ["Score"],
+        },
+        "reader",
+    )
+    records = discover_artifacts(tmp_path, reader)
+    assert len(records) == 1
+    assert records[0].relative_path.replace("\\", "/") == "artifacts/shared"
+    assert records[0].reader_id == "test"

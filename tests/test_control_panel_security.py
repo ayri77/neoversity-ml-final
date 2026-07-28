@@ -186,6 +186,16 @@ def test_apptest_legitimate_launch_once_and_replay_is_blocked(
     assert len(spy.calls) == 1
 
 
+def test_apptest_optuna_defaults_to_validate_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spy = StartSpy()
+    at = _run_page(monkeypatch, spy)
+    at = _select(at, "Operation", "optuna_search_v1")
+    action = next(item for item in at.selectbox if item.label == "Action")
+    assert action.value == "validate"
+
+
 def test_authorization_revalidates_current_paths_and_consumes_nonce() -> None:
     loaded = load_registry(PROJECT_ROOT)
     values = {"config": "configs/research_v2/catboost_numeric_v1_smoke.yaml"}
