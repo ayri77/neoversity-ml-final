@@ -1,0 +1,368 @@
+schema_version: 1
+commands:
+  - id: experiment_core_v2
+    title: Experiment Core v2
+    description: Validate or run the approved train-only Experiment Core v2 CLI.
+    category: Research
+    argv_prefix: ["$PYTHON", "-u", "scripts/run_research_v2.py"]
+    allowed_config_globs:
+      - "configs/research_v2/*.yaml"
+      - "artifacts/ui_configs/*.yaml"
+      - "artifacts/ui_configs/*.yml"
+      - "artifacts/ui_configs/*.json"
+    allowed_input_roots: ["configs/research_v2", "artifacts/ui_configs"]
+    allowed_output_roots: []
+    result_reader_id: research_v2
+    artifact_url: null
+    actions:
+      - id: validate
+        title: Validate
+        description: Run the public Experiment Core v2 preflight without fitting.
+        argv: ["--config", "{config}", "--validate-only"]
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/research_v2", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ["Research v2 validation successful."]
+        failure_markers: ["Traceback", "Status: failed"]
+      - id: run
+        title: Run
+        description: Start the approved train-only Experiment Core v2 evaluation.
+        argv: ["--config", "{config}"]
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/research_v2", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ["Status: completed"]
+        failure_markers: ["Status: failed", "Traceback"]
+
+  - id: research_v1
+    title: Research evaluation v1
+    description: Validate or run the approved legacy nested train-only research CLI.
+    category: Research
+    argv_prefix: ["$PYTHON", "-u", "scripts/run_research_evaluation.py"]
+    allowed_config_globs:
+      - "configs/research/*.yaml"
+      - "artifacts/ui_configs/*.yaml"
+      - "artifacts/ui_configs/*.yml"
+      - "artifacts/ui_configs/*.json"
+    allowed_input_roots: ["configs/research", "artifacts/ui_configs"]
+    allowed_output_roots: []
+    result_reader_id: research_v1
+    artifact_url: null
+    actions:
+      - id: validate
+        title: Validate
+        description: Run the public research v1 preflight without fitting.
+        argv: ["--config", "{config}", "--validate-only"]
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/research", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ["Research validation successful."]
+        failure_markers: ["Traceback", "Status: failed"]
+      - id: run
+        title: Run
+        description: Start the approved legacy train-only research evaluation.
+        argv: ["--config", "{config}"]
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/research", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ["Status: completed"]
+        failure_markers: ["Status: failed", "Traceback"]
+
+  - id: paired_comparison
+    title: Paired Comparison v1
+    description: Validate or create an official comparison of two compatible Experiment Core v2 runs.
+    category: Analysis
+    argv_prefix: ["$PYTHON", "-u", "scripts/compare_research_v2.py"]
+    allowed_config_globs: []
+    allowed_input_roots: ["artifacts/research_v2"]
+    allowed_output_roots: ["artifacts/research_v2_comparisons"]
+    result_reader_id: paired_comparison
+    artifact_url: null
+    actions:
+      - id: validate
+        title: Validate
+        description: Validate both runs and their compatibility without allocating output.
+        argv:
+          - "--baseline-run-dir"
+          - "{baseline_run_dir}"
+          - "--candidate-run-dir"
+          - "{candidate_run_dir}"
+          - "--validate-only"
+        placeholders:
+          baseline_run_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/research_v2"]
+            must_exist: true
+          candidate_run_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/research_v2"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ["Compatibility: compatible"]
+        failure_markers: ["Status: failed", "Traceback"]
+      - id: run
+        title: Compare
+        description: Create a non-authoritative paired-comparison artifact.
+        argv:
+          - "--baseline-run-dir"
+          - "{baseline_run_dir}"
+          - "--candidate-run-dir"
+          - "{candidate_run_dir}"
+          - "--comparison-id"
+          - "{comparison_id}"
+          - "--output-root"
+          - "{output_root}"
+        placeholders:
+          baseline_run_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/research_v2"]
+            must_exist: true
+          candidate_run_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/research_v2"]
+            must_exist: true
+          comparison_id:
+            type: string
+            role: value
+            required: true
+          output_root:
+            type: path
+            role: output
+            required: true
+            roots: ["artifacts/research_v2_comparisons"]
+            must_exist: false
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ["Status: completed"]
+        failure_markers: ["Status: failed", "Traceback"]
+
+  - id: mlflow_local_index
+    title: MLflow local index
+    description: Validate or synchronize the optional read-only metadata mirror.
+    category: Tracking
+    argv_prefix: ["$PYTHON", "-u", "scripts/sync_mlflow.py"]
+    allowed_config_globs:
+      - "configs/mlflow/*.yaml"
+      - "artifacts/ui_configs/*.yaml"
+      - "artifacts/ui_configs/*.yml"
+      - "artifacts/ui_configs/*.json"
+    allowed_input_roots: ["configs/mlflow", "artifacts/ui_configs"]
+    allowed_output_roots: []
+    result_reader_id: null
+    artifact_url: "http://127.0.0.1:5000"
+    actions:
+      - id: validate
+        title: Validate
+        description: Validate MLflow local-index configuration without allocating storage.
+        argv: ["validate", "--config", "{config}"]
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/mlflow", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ['"schema_version": 1']
+        failure_markers: ['"error"']
+      - id: sync_dry_run
+        title: Validate sources
+        description: Fully validate configured sources without importing MLflow or allocating storage.
+        argv:
+          - "sync"
+          - "--config"
+          - "{config}"
+          - "--source-type"
+          - "{source_type}"
+          - "--dry-run"
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/mlflow", "artifacts/ui_configs"]
+            must_exist: true
+          source_type:
+            type: enum
+            role: value
+            required: true
+            choices: ["research_v2", "autogluon", "all"]
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ['"dry_run": true']
+        failure_markers: ['"error"']
+      - id: sync
+        title: Synchronize
+        description: Validate and mirror approved filesystem metadata into the local MLflow index.
+        argv:
+          - "sync"
+          - "--config"
+          - "{config}"
+          - "--source-type"
+          - "{source_type}"
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/mlflow", "artifacts/ui_configs"]
+            must_exist: true
+          source_type:
+            type: enum
+            role: value
+            required: true
+            choices: ["research_v2", "autogluon", "all"]
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ['"has_failures": false']
+        failure_markers: ['"error"', '"has_failures": true']
+
+  - id: final_deployment_v1
+    title: Final Deployment v1
+    description: Validate, dry-run, inspect, or explicitly unlock the approved deployment CLI.
+    category: Deployment
+    argv_prefix: ["$PYTHON", "-u", "scripts/run_deployment_v1.py"]
+    allowed_config_globs:
+      - "configs/deployment/*.yaml"
+      - "artifacts/ui_configs/*.yaml"
+      - "artifacts/ui_configs/*.yml"
+      - "artifacts/ui_configs/*.json"
+    allowed_input_roots:
+      - "configs/deployment"
+      - "artifacts/ui_configs"
+      - "artifacts/deployment_fixtures"
+      - "artifacts/deployments"
+    allowed_output_roots: ["artifacts/deployments"]
+    result_reader_id: deployment_v1
+    artifact_url: null
+    actions:
+      - id: validate
+        title: Validate
+        description: Validate approvals and deployment configuration without competition-test access.
+        argv: ["validate", "--config", "{config}"]
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/deployment", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ['"ok": true']
+        failure_markers: ['"ok": false']
+      - id: dry_run
+        title: Synthetic dry run
+        description: Execute against an approved synthetic fixture and a new output directory.
+        argv:
+          - "dry-run"
+          - "--config"
+          - "{config}"
+          - "--fixture-dir"
+          - "{fixture_dir}"
+          - "--output-dir"
+          - "{output_dir}"
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/deployment", "artifacts/ui_configs"]
+            must_exist: true
+          fixture_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/deployment_fixtures"]
+            must_exist: true
+          output_dir:
+            type: path
+            role: output
+            required: true
+            roots: ["artifacts/deployments"]
+            must_exist: false
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ['"ok": true']
+        failure_markers: ['"ok": false']
+      - id: inspect
+        title: Inspect
+        description: Use the public CLI to inspect a completed or failed deployment.
+        argv: ["inspect", "--deployment-dir", "{deployment_dir}"]
+        placeholders:
+          deployment_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/deployments"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ['"ok": true']
+        failure_markers: ['"ok": false']
+      - id: run
+        title: Real deployment run
+        description: Competition-test deployment; intentionally disabled by default in v1.
+        argv:
+          - "run"
+          - "--config"
+          - "{config}"
+          - "--allow-competition-test"
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/deployment", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: acknowledge
+        enabled: false
+        competition_test: true
+        success_markers: ['"ok": true']
+        failure_markers: ['"ok": false']

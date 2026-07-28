@@ -26,6 +26,11 @@ dependencies = [
     "xgboost>=3.3.0",
 ]
 
+[project.optional-dependencies]
+ui = [
+    "streamlit>=1.40,<2",
+]
+
 [dependency-groups]
 dev = [
     "mypy>=2.3.0",

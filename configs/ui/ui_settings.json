@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "working_directory": ".",
+  "jobs_root": "artifacts/ui_jobs",
+  "editable_config_root": "artifacts/ui_configs",
+  "poll_interval_seconds": 3,
+  "log_tail_lines": 300,
+  "allow_process_stop": true,
+  "allow_config_copy_editing": true,
+  "mlflow_url": "http://127.0.0.1:5000"
+}

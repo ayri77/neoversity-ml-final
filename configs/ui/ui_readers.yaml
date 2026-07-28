@@ -1,0 +1,97 @@
+schema_version: 1
+readers:
+  - id: research_v2
+    title: Experiment Core v2 runs
+    artifact_roots: ["artifacts/research_v2"]
+    discovery_glob: "*/*/*"
+    success_markers: ["_SUCCESS"]
+    failure_markers: ["_FAILED"]
+    summary_files:
+      - path: "metrics/aggregate.json"
+        fields:
+          Balanced Accuracy mean: "metrics.balanced_accuracy.mean"
+          Balanced Accuracy minimum: "metrics.balanced_accuracy.minimum"
+          Balanced Accuracy maximum: "metrics.balanced_accuracy.maximum"
+      - path: "thresholds/threshold_summary.json"
+        fields:
+          Threshold median: "median"
+          Threshold IQR: "interquartile_range"
+    csv_previews: ["metrics/repeats.csv", "metrics/outer_folds.csv"]
+    log_files: []
+    compare_fields:
+      - "Balanced Accuracy mean"
+      - "Balanced Accuracy minimum"
+      - "Balanced Accuracy maximum"
+      - "Threshold median"
+      - "Threshold IQR"
+
+  - id: research_v1
+    title: Research evaluation v1 runs
+    artifact_roots: ["artifacts/research"]
+    discovery_glob: "*/*/*"
+    success_markers: ["_SUCCESS"]
+    failure_markers: ["_FAILED"]
+    summary_files:
+      - path: "metrics/aggregate.json"
+        fields:
+          Balanced Accuracy mean: "metrics.balanced_accuracy.mean"
+          Balanced Accuracy minimum: "metrics.balanced_accuracy.minimum"
+          Balanced Accuracy maximum: "metrics.balanced_accuracy.maximum"
+      - path: "thresholds/threshold_summary.json"
+        fields:
+          Threshold median: "median"
+          Threshold IQR: "interquartile_range"
+    csv_previews: ["metrics/repeats.csv", "metrics/outer_folds.csv"]
+    log_files: []
+    compare_fields:
+      - "Balanced Accuracy mean"
+      - "Balanced Accuracy minimum"
+      - "Balanced Accuracy maximum"
+      - "Threshold median"
+
+  - id: paired_comparison
+    title: Paired Comparison v1 results
+    artifact_roots: ["artifacts/research_v2_comparisons"]
+    discovery_glob: "*"
+    success_markers: ["_SUCCESS"]
+    failure_markers: ["_FAILED"]
+    summary_files:
+      - path: "aggregate_summary.json"
+        fields:
+          Balanced Accuracy mean delta: "metrics.balanced_accuracy.candidate_minus_baseline.mean"
+          Balanced Accuracy median delta: "metrics.balanced_accuracy.candidate_minus_baseline.median"
+      - path: "decision_report.json"
+        fields:
+          Decision status: "status"
+          Every repeat improved: "every_repeat_improved"
+    csv_previews: ["repeat_metrics.csv", "fold_metrics.csv"]
+    log_files: []
+    compare_fields:
+      - "Balanced Accuracy mean delta"
+      - "Balanced Accuracy median delta"
+      - "Decision status"
+      - "Every repeat improved"
+
+  - id: deployment_v1
+    title: Final Deployment v1 results
+    artifact_roots: ["artifacts/deployments"]
+    discovery_glob: "*"
+    success_markers: ["_SUCCESS"]
+    failure_markers: ["_FAILED"]
+    summary_files:
+      - path: "prediction_summary.json"
+        fields:
+          Positive count: "positive_count"
+          Rows: "row_count"
+          Positive rate: "positive_rate"
+          Threshold: "threshold"
+      - path: "component_summary.json"
+        fields:
+          Components: "components"
+    csv_previews: []
+    log_files: []
+    compare_fields:
+      - "Positive count"
+      - "Positive rate"
+      - "Threshold"
+      - "Rows"
