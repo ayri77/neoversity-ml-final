@@ -5,6 +5,7 @@ import math
 import shutil
 import struct
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,12 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from src.churn_ml.optuna_search_authority import (
+    LifecycleAuthorityRecorder,
+    canonical_authority_timestamp,
+    load_lifecycle_authority_key,
+    sampler_pruner_identity,
+)
 from src.churn_ml.optuna_search_artifacts import (
     PAYLOAD_FILES,
     _inventory_records,
@@ -19,6 +26,8 @@ from src.churn_ml.optuna_search_artifacts import (
 )
 from src.churn_ml.optuna_search_config import load_optuna_search_config
 from src.churn_ml.optuna_search_lifecycle import (
+    _authoritative_dataset_identity,
+    _verify_or_initialize_study,
     portable_dataset_identity,
     run_optuna_study,
 )
@@ -226,6 +235,118 @@ def run_authorized_completed_search(
     return result.search_dir, operational
 
 
+def run_authorized_interrupted_search() -> tuple[Path, Path]:
+    import optuna
+
+    ensure_train_only_files()
+    token = uuid.uuid4().hex
+    operational = PROJECT_ROOT / "artifacts" / "optuna" / "auth_tests" / token
+    reports = PROJECT_ROOT / "artifacts" / "optuna_searches" / "auth_tests" / token
+    operational.mkdir(parents=True)
+    reports.mkdir(parents=True)
+    space = yaml.safe_load(
+        (
+            PROJECT_ROOT / "configs/optuna/search_spaces/xgboost_numeric_v1.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    assert isinstance(space, dict)
+    shrink_space(space)
+    space_path = operational / "space.yaml"
+    config_path = operational / "config.yaml"
+    space_path.write_text(yaml.safe_dump(space, sort_keys=False), encoding="utf-8")
+    config_path.write_text(
+        yaml.safe_dump(
+            write_search_plan(
+                space_path=space_path,
+                storage_path=operational / "study.db",
+                reports=reports,
+                study_name=f"interrupted_{token}",
+                n_trials=2,
+            ),
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    config = load_optuna_search_config(config_path, project_root=PROJECT_ROOT)
+    data = load_research_v2_training_data(config.base_config)
+    assignments = build_search_assignments(
+        data.y,
+        repeats=1,
+        folds=3,
+        assignment_seed=23,
+    )
+    provided_identity = portable_dataset_identity(
+        data.fingerprints,
+        project_root=PROJECT_ROOT,
+    )
+    authoritative_identity = _authoritative_dataset_identity(
+        data.X,
+        data.y,
+        provided_identity,
+    )
+    study = optuna.create_study(
+        study_name=str(config.payload["study_name"]),
+        storage=f"sqlite:///{config.storage_path.as_posix()}",
+        direction="maximize",
+        load_if_exists=True,
+    )
+    _verify_or_initialize_study(
+        study,
+        config,
+        dataset_identity_sha256=canonical_sha256(authoritative_identity),
+        assignment_identity_sha256=canonical_sha256(assignments.identity),
+    )
+    authority = LifecycleAuthorityRecorder.initialize_or_load(
+        study=study,
+        key=load_lifecycle_authority_key(
+            project_root=PROJECT_ROOT,
+            forbidden_roots=(operational, reports),
+        ),
+        base_search_identity_sha256=config.study_identity_sha256,
+        dataset_identity_sha256=canonical_sha256(authoritative_identity),
+        assignment_identity_sha256=canonical_sha256(assignments.identity),
+        source_closure_identity_sha256=config.resume_authentication["source_closure"][
+            "identity_sha256"
+        ],
+        runtime_identity_sha256=config.resume_authentication["runtime_dependencies"][
+            "identity_sha256"
+        ],
+        sampler_pruner_identity_sha256=sampler_pruner_identity(
+            sampler=config.payload["sampler"],
+            pruner=str(config.payload["pruner"]),
+        ),
+        configured_trial_count=int(config.payload["n_trials"]),
+        allow_initialize=True,
+    )
+    running = study.ask()
+    started = canonical_authority_timestamp(datetime.now(timezone.utc))
+    authority.append_event(
+        event_type="trial_allocated",
+        trial_number=int(running.number),
+        from_state=None,
+        to_state="ALLOCATED",
+        event_at_utc=started,
+    )
+    authority.append_event(
+        event_type="trial_started",
+        trial_number=int(running.number),
+        from_state="ALLOCATED",
+        to_state="RUNNING",
+        started_at_utc=started,
+        event_at_utc=started,
+    )
+    running.set_user_attr("lifecycle_started_at_utc", started)
+    result = run_optuna_study(
+        config,
+        X=data.X,
+        y=data.y,
+        dataset_identity=provided_identity,
+        assignments=assignments,
+        adapter=DeterministicAdapter(),
+    )
+    return result.search_dir, operational
+
+
 def reauthenticate(root: Path) -> None:
     inventory = {
         "schema_version": 1,
@@ -237,12 +358,20 @@ def reauthenticate(root: Path) -> None:
     manifest = {**body, "manifest_sha256": canonical_sha256(body)}
     _write_json(root / "manifest.json", manifest)
     identity = json.loads((root / "search_identity.json").read_text(encoding="utf-8"))
+    ledger = json.loads(
+        (root / "lifecycle_authority_ledger.json").read_text(encoding="utf-8")
+    )["final_ledger"]
     _write_json(
         root / "_SUCCESS",
         {
             "schema_version": 1,
+            "authority_schema_version": 1,
             "search_id": identity["search_id"],
             "manifest_sha256": manifest["manifest_sha256"],
+            "final_lifecycle_payload_identity_sha256": ledger[
+                "payload_identity_sha256"
+            ],
+            "final_lifecycle_signature_sha256": ledger["signature_sha256"],
         },
     )
 

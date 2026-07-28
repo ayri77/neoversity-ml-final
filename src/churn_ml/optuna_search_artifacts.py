@@ -15,6 +15,12 @@ from typing import Any, Mapping
 import pandas as pd
 import yaml
 
+from src.churn_ml.optuna_search_authority import (
+    LifecycleAuthorityRecorder,
+    load_lifecycle_authority_key,
+    metric_prediction_evidence_identity,
+    validate_report_lifecycle_authority,
+)
 from src.churn_ml.optuna_search_config import PLAN_KEYS, OptunaSearchConfig
 from src.churn_ml.research_data import canonical_sha256
 from src.churn_ml.research_v2_config import load_research_v2_config
@@ -42,10 +48,12 @@ PAYLOAD_FILES = {
     "resume_authentication.json",
     "fold_assignments.csv",
     "threshold_selection_membership.csv",
+    "lifecycle_authority.json",
 }
 TERMINAL_FILES = PAYLOAD_FILES | {
     "recursive_inventory.json",
     "manifest.json",
+    "lifecycle_authority_ledger.json",
     "_SUCCESS",
 }
 
@@ -77,6 +85,7 @@ def write_completed_search(
     resume_authentication: Mapping[str, Any],
     fold_assignments: pd.DataFrame,
     threshold_membership: pd.DataFrame,
+    lifecycle_authority: LifecycleAuthorityRecorder,
 ) -> Path:
     artifact_root = config.artifact_root
     target = (artifact_root / config.search_id).resolve()
@@ -91,11 +100,22 @@ def write_completed_search(
         tempfile.mkdtemp(prefix=f".{config.search_id}.", dir=artifact_root)
     ).resolve()
     try:
+        authority_initial = lifecycle_authority.initial_statement["payload"]
         _write_yaml(staging / "resolved_search_config.yaml", config.resolved_payload())
         _write_json(
             staging / "search_identity.json",
             {
                 "schema_version": 1,
+                "authority_schema_version": authority_initial[
+                    "authority_schema_version"
+                ],
+                "authority_key_fingerprint": authority_initial[
+                    "authority_key_fingerprint"
+                ],
+                "authority_bound_study_identity_sha256": authority_initial[
+                    "authority_bound_study_identity_sha256"
+                ],
+                "study_uuid": authority_initial["study_uuid"],
                 "search_id": config.search_id,
                 "sha256": config.search_identity_sha256,
                 "canonical": deepcopy(config.search_identity),
@@ -140,6 +160,10 @@ def write_completed_search(
             staging / "threshold_selection_membership.csv",
             threshold_membership,
         )
+        _write_json(
+            staging / "lifecycle_authority.json",
+            lifecycle_authority.report_payload(),
+        )
         load_research_v2_config(
             staging / "best_candidate_config.yaml",
             project_root=config.project_root,
@@ -157,12 +181,49 @@ def write_completed_search(
         }
         _write_json(staging / "manifest.json", manifest)
         _validate_tree(staging, require_success=False)
+        trial_state_universe = [
+            {
+                "trial_number": int(row.trial_number),
+                "state": str(row.state),
+            }
+            for row in trials.sort_values("trial_number").itertuples(index=False)
+        ]
+        authority_ledger = lifecycle_authority.finalize(
+            trial_state_universe=trial_state_universe,
+            interrupted_recovery_trial_numbers=study_summary[
+                "interrupted_recovery_trial_numbers"
+            ],
+            best_trial_number=int(study_summary["best_trial_number"]),
+            report_search_identity_sha256=config.search_identity_sha256,
+            study_summary_identity_sha256=canonical_sha256(dict(study_summary)),
+            metric_prediction_evidence_identity_sha256=(
+                metric_prediction_evidence_identity(
+                    trial_metrics_bytes=(staging / "trial_metrics.csv").read_bytes(),
+                    trial_predictions_bytes=(
+                        staging / "trial_predictions.csv"
+                    ).read_bytes(),
+                )
+            ),
+            report_manifest_identity_sha256=str(manifest["manifest_sha256"]),
+        )
+        _write_json(
+            staging / "lifecycle_authority_ledger.json",
+            authority_ledger,
+        )
+        final_ledger = authority_ledger["final_ledger"]
         _write_json(
             staging / "_SUCCESS",
             {
                 "schema_version": 1,
+                "authority_schema_version": authority_initial[
+                    "authority_schema_version"
+                ],
                 "search_id": config.search_id,
                 "manifest_sha256": manifest["manifest_sha256"],
+                "final_lifecycle_payload_identity_sha256": final_ledger[
+                    "payload_identity_sha256"
+                ],
+                "final_lifecycle_signature_sha256": final_ledger["signature_sha256"],
             },
         )
         _validate_tree(staging, require_success=True)
@@ -258,7 +319,11 @@ def _validate_tree(root: Path, *, require_success: bool) -> None:
                 "Multiply linked search artifacts are forbidden."
             )
         actual_files.add(item.name)
-    expected = TERMINAL_FILES if require_success else TERMINAL_FILES - {"_SUCCESS"}
+    expected = (
+        TERMINAL_FILES
+        if require_success
+        else TERMINAL_FILES - {"_SUCCESS", "lifecycle_authority_ledger.json"}
+    )
     if actual_files != expected:
         raise OptunaSearchArtifactError(
             f"Artifact files differ; missing={sorted(expected - actual_files)}, "
@@ -289,15 +354,24 @@ def _validate_tree(root: Path, *, require_success: bool) -> None:
     _validate_semantics(root)
     if require_success:
         success = _load_json(root / "_SUCCESS")
-        if set(success) != {"schema_version", "search_id", "manifest_sha256"}:
+        if set(success) != {
+            "schema_version",
+            "authority_schema_version",
+            "search_id",
+            "manifest_sha256",
+            "final_lifecycle_payload_identity_sha256",
+            "final_lifecycle_signature_sha256",
+        }:
             raise OptunaSearchArtifactError("Success marker schema differs.")
         identity = _load_json(root / "search_identity.json")
         if (
             success["schema_version"] != 1
+            or success["authority_schema_version"] != 1
             or success["search_id"] != identity["search_id"]
             or success["manifest_sha256"] != manifest["manifest_sha256"]
         ):
             raise OptunaSearchArtifactError("Success marker identity differs.")
+        _validate_lifecycle_authority(root, manifest=manifest, success=success)
         success_time = (root / "_SUCCESS").stat().st_mtime_ns
         if any(
             item.stat().st_mtime_ns > success_time
@@ -305,6 +379,145 @@ def _validate_tree(root: Path, *, require_success: bool) -> None:
             if item.name != "_SUCCESS"
         ):
             raise OptunaSearchArtifactError("_SUCCESS must be the newest artifact.")
+
+
+def _validate_lifecycle_authority(
+    root: Path,
+    *,
+    manifest: Mapping[str, Any],
+    success: Mapping[str, Any],
+) -> None:
+    project_root = _project_root_for_artifact(root)
+    study_summary = _load_json(root / "study_summary.json")
+    search_identity = _load_json(root / "search_identity.json")
+    authority_report = _load_json(root / "lifecycle_authority.json")
+    authority_ledger = _load_json(root / "lifecycle_authority_ledger.json")
+    final_ledger = authority_ledger.get("final_ledger")
+    if not isinstance(final_ledger, dict):
+        raise OptunaSearchArtifactError("Final lifecycle ledger is malformed.")
+    if success["final_lifecycle_payload_identity_sha256"] != final_ledger.get(
+        "payload_identity_sha256"
+    ) or success["final_lifecycle_signature_sha256"] != final_ledger.get(
+        "signature_sha256"
+    ):
+        raise OptunaSearchArtifactError(
+            "Success marker differs from final lifecycle authority."
+        )
+    storage_value = study_summary.get("storage")
+    if type(storage_value) is not str:
+        raise OptunaSearchArtifactError("Study storage identity is malformed.")
+    database_path = (project_root / storage_value).resolve()
+    if (
+        database_path == project_root
+        or project_root not in database_path.parents
+        or database_path.suffix != ".db"
+    ):
+        raise OptunaSearchArtifactError("Study storage identity is unsafe.")
+    validated_database_path = _validated_optional_sqlite_path(
+        database_path,
+        project_root=project_root,
+    )
+    trials = pd.read_csv(root / "trials.csv", dtype={"state": str})
+    trial_state_universe = [
+        {
+            "trial_number": int(row.trial_number),
+            "state": str(row.state),
+        }
+        for row in trials.sort_values("trial_number").itertuples(index=False)
+    ]
+    completed = [
+        item["trial_number"]
+        for item in trial_state_universe
+        if item["state"] == "COMPLETE"
+    ]
+    failed = [
+        item["trial_number"] for item in trial_state_universe if item["state"] == "FAIL"
+    ]
+    interrupted = study_summary.get("interrupted_recovery_trial_numbers")
+    if not isinstance(interrupted, list):
+        raise OptunaSearchArtifactError(
+            "Interrupted recovery lifecycle summary is malformed."
+        )
+    expected = {
+        "trial_state_universe": trial_state_universe,
+        "completed_trial_numbers": completed,
+        "failed_trial_numbers": failed,
+        "interrupted_trial_numbers": interrupted,
+        "interrupted_recovery_trial_numbers": interrupted,
+        "best_trial_number": study_summary.get("best_trial_number"),
+        "report_search_identity_sha256": search_identity.get("sha256"),
+        "study_summary_identity_sha256": canonical_sha256(study_summary),
+        "metric_prediction_evidence_identity_sha256": (
+            metric_prediction_evidence_identity(
+                trial_metrics_bytes=(root / "trial_metrics.csv").read_bytes(),
+                trial_predictions_bytes=(root / "trial_predictions.csv").read_bytes(),
+            )
+        ),
+        "report_manifest_identity_sha256": manifest["manifest_sha256"],
+    }
+    try:
+        key = load_lifecycle_authority_key(
+            project_root=project_root,
+            forbidden_roots=(root, database_path.parent),
+        )
+        validate_report_lifecycle_authority(
+            authority_report=authority_report,
+            authority_ledger=authority_ledger,
+            key=key,
+            expected=expected,
+            database_path=validated_database_path,
+            study_name=str(study_summary.get("study_name")),
+        )
+    except Exception as error:
+        raise OptunaSearchArtifactError(
+            f"External lifecycle authority validation failed: {error}"
+        ) from error
+    initial = authority_report["initial_statement"]["payload"]
+    for artifact in (search_identity, study_summary):
+        if (
+            artifact.get("authority_schema_version")
+            != initial["authority_schema_version"]
+            or artifact.get("authority_key_fingerprint")
+            != initial["authority_key_fingerprint"]
+            or artifact.get("authority_bound_study_identity_sha256")
+            != initial["authority_bound_study_identity_sha256"]
+            or artifact.get("study_uuid") != initial["study_uuid"]
+        ):
+            raise OptunaSearchArtifactError("Report authority identity fields diverge.")
+
+
+def _validated_optional_sqlite_path(
+    path: Path,
+    *,
+    project_root: Path,
+) -> Path | None:
+    if not path.exists():
+        return None
+    lexical = Path(os.path.abspath(path))
+    current = project_root
+    try:
+        relative = lexical.relative_to(project_root)
+    except ValueError as error:
+        raise OptunaSearchArtifactError(
+            "SQLite study path escapes the project."
+        ) from error
+    for part in relative.parts:
+        current = current / part
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_stat(metadata):
+            raise OptunaSearchArtifactError(
+                "SQLite study path contains a link or reparse point."
+            )
+    metadata = lexical.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or getattr(metadata, "st_nlink", 1) != 1
+        or lexical.resolve() != lexical
+    ):
+        raise OptunaSearchArtifactError(
+            "SQLite study must be an exact repository-contained regular file."
+        )
+    return lexical
 
 
 def _build_inventory(root: Path, names: set[str]) -> dict[str, Any]:

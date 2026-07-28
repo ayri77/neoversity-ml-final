@@ -5,6 +5,8 @@ import hashlib
 import json
 import math
 import re
+import sqlite3
+import stat
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,7 +24,16 @@ from src.churn_ml.experiment_v2_contract import ExperimentV2ContractError
 from src.churn_ml.experiment_v2_numeric_adapter import (
     ExperimentV2AdapterDependencyError,
 )
-from src.churn_ml.optuna_search_artifacts import _write_csv, write_completed_search
+from src.churn_ml.optuna_search_authority import (
+    LifecycleAuthorityRecorder,
+    load_lifecycle_authority_key,
+    sampler_pruner_identity,
+)
+from src.churn_ml.optuna_search_artifacts import (
+    OptunaSearchArtifactError,
+    _write_csv,
+    write_completed_search,
+)
 from src.churn_ml.optuna_search_config import OptunaSearchConfig
 from src.churn_ml.optuna_search_export import build_best_candidate_config
 from src.churn_ml.optuna_search_objective import (
@@ -204,7 +215,19 @@ def run_optuna_study(
         X, y, dataset_identity
     )
     source_provenance = build_source_provenance(config)
+    final_report = config.artifact_root / config.search_id
+    if final_report.exists():
+        raise OptunaSearchArtifactError(
+            f"Immutable search output already exists: {final_report}."
+        )
     storage_path = config.storage_path
+    authority_key = load_lifecycle_authority_key(
+        project_root=config.project_root,
+        forbidden_roots=(
+            config.artifact_root,
+            storage_path.parent,
+        ),
+    )
     storage_path.parent.mkdir(parents=True, exist_ok=True)
     cache_root = (
         storage_path.parent / "trial_cache" / config.study_identity_sha256
@@ -219,6 +242,10 @@ def run_optuna_study(
         seed=int(config.payload["sampler"]["seed"]),
         study_name=str(config.payload["study_name"]),
     )
+    study_preexisting = _sqlite_study_exists(
+        storage_path,
+        study_name=str(config.payload["study_name"]),
+    )
     study = optuna.create_study(
         study_name=str(config.payload["study_name"]),
         storage=f"sqlite:///{storage_path.as_posix()}",
@@ -227,13 +254,33 @@ def run_optuna_study(
         pruner=optuna.pruners.NopPruner(),
         load_if_exists=True,
     )
+    authority = LifecycleAuthorityRecorder.initialize_or_load(
+        study=study,
+        key=authority_key,
+        base_search_identity_sha256=config.study_identity_sha256,
+        dataset_identity_sha256=canonical_sha256(authoritative_dataset_identity),
+        assignment_identity_sha256=assignment_identity_sha256,
+        source_closure_identity_sha256=config.resume_authentication["source_closure"][
+            "identity_sha256"
+        ],
+        runtime_identity_sha256=config.resume_authentication["runtime_dependencies"][
+            "identity_sha256"
+        ],
+        sampler_pruner_identity_sha256=sampler_pruner_identity(
+            sampler=config.payload["sampler"],
+            pruner=str(config.payload["pruner"]),
+        ),
+        configured_trial_count=int(config.payload["n_trials"]),
+        allow_initialize=not study_preexisting,
+    )
     _verify_or_initialize_study(
         study,
         config,
         dataset_identity_sha256=canonical_sha256(authoritative_dataset_identity),
         assignment_identity_sha256=assignment_identity_sha256,
     )
-    recovered = _recover_interrupted_trials(study, TrialState)
+    recovered = _recover_interrupted_trials(study, TrialState, authority)
+    authority.validate_study_trial_states()
     target = int(config.payload["n_trials"])
     previous_target = int(study.user_attrs.get("maximum_requested_n_trials", 0))
     if previous_target and target < previous_target:
@@ -250,6 +297,22 @@ def run_optuna_study(
 
     def objective(trial: Any) -> float:
         started_at_utc = canonical_utc_timestamp(datetime.now(timezone.utc))
+        authority.append_event(
+            event_type="trial_allocated",
+            trial_number=int(trial.number),
+            from_state=None,
+            to_state="ALLOCATED",
+            event_at_utc=started_at_utc,
+        )
+        authority.append_event(
+            event_type="trial_started",
+            trial_number=int(trial.number),
+            from_state="ALLOCATED",
+            to_state="RUNNING",
+            started_at_utc=started_at_utc,
+            event_at_utc=started_at_utc,
+        )
+        trial.set_user_attr("lifecycle_started_at_utc", started_at_utc)
         try:
             tuned = suggest_parameters(trial, config.search_space)
             contract = build_resolved_adapter_contract(
@@ -333,6 +396,53 @@ def run_optuna_study(
                 pass
             raise
 
+    def record_terminal_event(_: Any, frozen_trial: Any) -> None:
+        trial_number = int(frozen_trial.number)
+        started_at_utc = frozen_trial.user_attrs.get("lifecycle_started_at_utc")
+        if type(started_at_utc) is not str:
+            raise OptunaSearchLifecycleError(
+                "Terminal trial lacks signed lifecycle start time."
+            )
+        event_at_utc = canonical_utc_timestamp(datetime.now(timezone.utc))
+        if frozen_trial.state == TrialState.COMPLETE:
+            authority.append_event(
+                event_type="trial_completed",
+                trial_number=trial_number,
+                from_state="RUNNING",
+                to_state="COMPLETE",
+                started_at_utc=started_at_utc,
+                event_at_utc=event_at_utc,
+            )
+        elif frozen_trial.state == TrialState.FAIL:
+            evidence = frozen_trial.user_attrs.get("failure_evidence")
+            if not isinstance(evidence, dict):
+                raise OptunaSearchLifecycleError(
+                    "Failed trial lacks signed failure evidence."
+                )
+            reason = validate_trial_failure_evidence(
+                evidence,
+                trial_state="FAIL",
+                persisted_failure_message=frozen_trial.user_attrs.get(
+                    "failure_message"
+                ),
+                interrupted_recovery_recorded=False,
+            )
+            authority.append_event(
+                event_type="trial_execution_failed",
+                trial_number=trial_number,
+                from_state="RUNNING",
+                to_state="FAIL",
+                failure_stage=str(evidence["failure_stage"]),
+                failure_reason_code=reason,
+                exception_type=str(evidence["exception_type"]),
+                failure_message_sha256=str(evidence["failure_message_sha256"]),
+                started_at_utc=started_at_utc,
+                event_at_utc=event_at_utc,
+            )
+        else:
+            raise OptunaSearchLifecycleError("Unexpected terminal Optuna trial state.")
+        authority.validate_study_trial_states()
+
     remaining = target - existing
     if remaining:
         study.optimize(
@@ -340,9 +450,11 @@ def run_optuna_study(
             n_trials=remaining,
             timeout=float(config.payload["timeout_seconds"]),
             catch=(Exception,),
+            callbacks=(record_terminal_event,),
             gc_after_trial=True,
             show_progress_bar=False,
         )
+    authority.validate_study_trial_states()
     trials = study.get_trials(deepcopy=False)
     if len(trials) != target:
         raise OptunaSearchLifecycleError(
@@ -420,8 +532,22 @@ def run_optuna_study(
         for trial in sorted(trials, key=lambda item: item.number)
         if trial.user_attrs.get("failure_reason_code") == "INTERRUPTED_PROCESS_RECOVERY"
     ]
+    authority.append_event(
+        event_type="study_completed",
+        trial_number=None,
+        from_state="STUDY_CREATED",
+        to_state="STUDY_COMPLETED",
+    )
+    authority.validate_study_trial_states()
+    authority_initial = authority.initial_statement["payload"]
     study_summary = {
         "schema_version": 1,
+        "authority_schema_version": authority_initial["authority_schema_version"],
+        "authority_key_fingerprint": authority_initial["authority_key_fingerprint"],
+        "authority_bound_study_identity_sha256": authority_initial[
+            "authority_bound_study_identity_sha256"
+        ],
+        "study_uuid": authority_initial["study_uuid"],
         "study_name": config.payload["study_name"],
         "search_id": config.search_id,
         "study_identity_sha256": config.study_identity_sha256,
@@ -489,6 +615,7 @@ def run_optuna_study(
         resume_authentication=config.resume_authentication,
         fold_assignments=assignments.folds,
         threshold_membership=assignments.threshold_membership,
+        lifecycle_authority=authority,
     )
     return StudyExecutionResult(
         search_dir=search_dir,
@@ -872,6 +999,33 @@ def _make_stateless_sampler(
     return StatelessRandomSampler()
 
 
+def _sqlite_study_exists(path: Path, *, study_name: str) -> bool:
+    if not path.exists():
+        return False
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+        or getattr(metadata, "st_nlink", 1) != 1
+    ):
+        raise OptunaSearchLifecycleError(
+            "Optuna SQLite storage must be an exact regular file."
+        )
+    uri = f"file:{path.as_posix()}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM studies WHERE study_name = ?",
+                (study_name,),
+            ).fetchone()
+    except sqlite3.Error as error:
+        raise OptunaSearchLifecycleError(
+            "Existing Optuna SQLite storage is invalid."
+        ) from error
+    return row is not None
+
+
 def _verify_or_initialize_study(
     study: Any,
     config: OptunaSearchConfig,
@@ -920,7 +1074,11 @@ def _current_resume_authentication(config: OptunaSearchConfig) -> dict[str, Any]
     )
 
 
-def _recover_interrupted_trials(study: Any, trial_state: Any) -> int:
+def _recover_interrupted_trials(
+    study: Any,
+    trial_state: Any,
+    authority: LifecycleAuthorityRecorder,
+) -> int:
     recovered = 0
     for trial in study.get_trials(deepcopy=False, states=(trial_state.RUNNING,)):
         trial_started = trial.datetime_start
@@ -960,6 +1118,19 @@ def _recover_interrupted_trials(study: Any, trial_state: Any) -> int:
             trial_state.FAIL,
         )
         if changed:
+            authority.append_event(
+                event_type="interrupted_running_trial_recovered",
+                trial_number=int(trial.number),
+                from_state="RUNNING",
+                to_state="FAIL",
+                failure_stage=str(evidence["failure_stage"]),
+                failure_reason_code=derive_failure_reason_code(evidence),
+                exception_type=None,
+                failure_message_sha256=str(evidence["failure_message_sha256"]),
+                started_at_utc=str(evidence["started_at_utc"]),
+                event_at_utc=str(evidence["failed_at_utc"]),
+                interrupted_recovery=True,
+            )
             recovered += 1
     return recovered
 

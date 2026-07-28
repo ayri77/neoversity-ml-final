@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Iterator, Never
 
 from src.churn_ml.experiment_v2 import get_candidate_adapter
+from src.churn_ml.optuna_search_authority import (
+    OptunaLifecycleAuthorityError,
+    initialize_lifecycle_authority_key,
+)
 from src.churn_ml.optuna_search_artifacts import (
     OptunaSearchArtifactError,
     load_optuna_search_result,
@@ -54,6 +58,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Run deterministic train-only Optuna Search v1."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    authority_init = subparsers.add_parser(
+        "authority-init",
+        help="Create a new external lifecycle authority key without overwrite.",
+    )
+    authority_init.add_argument("--output", type=Path, required=True)
+    authority_init.add_argument("--create-parent", action="store_true")
     validate = subparsers.add_parser(
         "validate",
         help="Validate config and referenced contracts without allocation.",
@@ -78,6 +88,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def execute(args: argparse.Namespace) -> int:
     config = None
     try:
+        if args.command == "authority-init":
+            fingerprint = initialize_lifecycle_authority_key(
+                args.output,
+                project_root=PROJECT_ROOT,
+                create_parent=bool(args.create_parent),
+            )
+            _emit(
+                {
+                    "status": "authority_initialized",
+                    "authority_schema_version": 1,
+                    "authority_key_fingerprint": fingerprint,
+                    "key_bytes": 32,
+                    "overwrite": False,
+                    "path_disclosed": False,
+                }
+            )
+            return EXIT_SUCCESS
         if args.command == "validate":
             config = load_optuna_search_config(
                 _project_path(args.config),
@@ -193,7 +220,7 @@ def execute(args: argparse.Namespace) -> int:
     except OptunaSearchArtifactError as error:
         _emit_error("artifact_error", error, EXIT_ARTIFACT)
         return EXIT_ARTIFACT
-    except OptunaSearchLifecycleError as error:
+    except (OptunaSearchLifecycleError, OptunaLifecycleAuthorityError) as error:
         if config is not None:
             _persist_failure(config, error, "STUDY_LIFECYCLE_FAILED")
         _emit_error("study_error", error, EXIT_STUDY)
@@ -265,3 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         _emit_error("usage_error", error, EXIT_CONFIG)
         return EXIT_CONFIG
     return execute(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

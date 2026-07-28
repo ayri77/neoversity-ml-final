@@ -168,6 +168,78 @@ identity, persisted in study attributes and the immutable report, and recomputed
 before every resume. Missing legacy identity or any source/runtime mismatch is
 rejected before another trial can be allocated.
 
+## External lifecycle authority
+
+Every new study is externally authenticated from creation, including studies in
+which every trial succeeds. Runtime lifecycle operations use exactly one key
+provider: `CHURN_ML_OPTUNA_LIFECYCLE_AUTHORITY_KEY_FILE`. The environment value
+must be an absolute, traversal-free path to an exact regular binary file outside
+the repository, artifact/report roots, and study storage roots. Symlinks,
+junctions, reparse points, directories, multiply linked files, and files shorter
+than 32 bytes are rejected. Bytes are read without text normalization. The key
+and its path are never written or printed; reports and SQLite retain only the
+authority schema version, signed payload identities, HMAC-SHA256 signatures, and
+the stable key fingerprint
+`SHA256("churn_ml.optuna.lifecycle.key-identifier.v1\0" || key_bytes)`.
+Configuration and CLI arguments cannot select alternate report-controlled keys.
+
+`authority-init --output <external-path>` creates 32 random bytes with exclusive
+creation and restrictive permissions where supported. It refuses overwrite and
+creates a missing parent only with `--create-parent`. Its JSON result is
+path-independent and contains no secret material.
+
+The signed creation statement binds authority schema 1, key fingerprint, a new
+immutable study UUID, the base study/search identity, the authority-bound study
+identity, dataset and assignment identities, source-closure and runtime
+identities, sampler/pruner identity, creation-time configured trial count, and a
+canonical microsecond UTC creation timestamp. The authority-bound identity is a
+domain-separated SHA-256 over the base identity, authority schema, and key
+fingerprint; unrelated Experiment Core v2 identities are unchanged.
+
+Lifecycle event schema 1 is canonical JSON (sorted keys and fixed separators)
+and contains exact primitive fields:
+`authority_schema_version`, `event_schema_version`, `event_type`, `study_uuid`,
+`base_search_identity_sha256`, `event_sequence`,
+`previous_event_signature_sha256`, `trial_number`, `from_state`, `to_state`,
+`failure_stage`, `failure_reason_code`, `exception_type`,
+`failure_message_sha256`, `started_at_utc`, `event_at_utc`,
+`interrupted_recovery`, and independently recomputed
+`event_payload_identity_sha256`. HMAC uses the explicit
+`churn_ml.optuna.lifecycle.event.v1` domain. Events cover study creation, trial
+allocation/start/completion/execution failure, interrupted RUNNING recovery,
+study completion, and report finalization. Sequences are exact and monotonic;
+each link is SHA-256 of the preceding HMAC signature. Legal transitions are
+reconstructed, and interruption recovery requires an earlier signed RUNNING
+state.
+
+The final ledger schema binds the ordered event signatures and count, exact
+trial-state universe, completed/failed/interrupted sets, recovery list, best
+trial, completed report search identity, study-summary identity, exact
+metric/prediction file identity, pre-terminal manifest identity, and canonical
+completion time. It is stored both in SQLite study attributes and the completed
+report. Terminal signing is deliberately non-circular:
+
+1. write report payloads and pre-terminal signed events;
+2. write inventory and manifest over those payloads;
+3. append and persist the signed `report_finalized` event;
+4. sign/write the final ledger over the manifest and complete event chain;
+5. write `_SUCCESS` last, binding the final ledger payload identity and HMAC.
+
+One shared validator is used before resume/recovery/allocation and for completed
+loading, inspect, export, and finalization. It verifies the external key
+fingerprint, every canonical payload identity/HMAC/link/transition, the final
+ledger, exact report state/evidence, and SQLite/report equality when the database
+is present. The filesystem HMAC remains independently verifiable when operational
+SQLite has been removed. Older unsigned reports/studies fail closed.
+
+Threat model: this protects against coherent mutation and rehashing of report
+fields, exception message/type substitution, execution-failure versus
+interruption-recovery substitution, lifecycle event deletion/insertion/
+reordering/replacement, removal of all failed evidence, and rebuilt inventory,
+manifest, identities, and `_SUCCESS`. It does not protect compromise or
+replacement of the external key, compromise of the host process while the key
+is loaded, or malicious code executing before signing.
+
 ## Completed-report semantic reconstruction
 
 Completed loading does not trust a coherent inventory/manifest alone. After
@@ -213,6 +285,8 @@ import or write to MLflow; the filesystem remains authoritative.
 All relative paths resolve from the repository root.
 
 ```powershell
+.venv\Scripts\python.exe -u scripts\run_optuna_search.py authority-init `
+  --output C:\external-secure\optuna-lifecycle-authority.key
 .venv\Scripts\python.exe -u scripts\run_optuna_search.py validate `
   --config configs/optuna/xgboost_numeric_v1_smoke.yaml
 

@@ -25,6 +25,7 @@ _PACKAGE_MODULE_ROOT = "src.churn_ml"
 
 REQUIRED_OPTUNA_MODULES = (
     "src/churn_ml/optuna_search_artifacts.py",
+    "src/churn_ml/optuna_search_authority.py",
     "src/churn_ml/optuna_search_cli.py",
     "src/churn_ml/optuna_search_config.py",
     "src/churn_ml/optuna_search_export.py",

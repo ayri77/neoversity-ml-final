@@ -224,6 +224,10 @@ def validate_completed_search_semantics(root: Path, *, project_root: Path) -> No
         search_identity,
         {
             "schema_version",
+            "authority_schema_version",
+            "authority_key_fingerprint",
+            "authority_bound_study_identity_sha256",
+            "study_uuid",
             "search_id",
             "sha256",
             "canonical",
@@ -238,6 +242,11 @@ def validate_completed_search_semantics(root: Path, *, project_root: Path) -> No
     )
     if (
         _required_int(search_identity["schema_version"], "schema_version") != 1
+        or _required_int(
+            search_identity["authority_schema_version"],
+            "authority_schema_version",
+        )
+        != 1
         or search_identity["search_id"] != expected_search_id
         or search_identity["sha256"] != expected_search_sha256
         or search_identity["canonical"] != expected_search_identity
@@ -246,6 +255,15 @@ def validate_completed_search_semantics(root: Path, *, project_root: Path) -> No
         != expected_resume["identity_sha256"]
     ):
         _fail("Search identity artifact differs from reconstructed identity.")
+    _require_sha256(
+        search_identity["authority_key_fingerprint"],
+        "authority_key_fingerprint",
+    )
+    _require_sha256(
+        search_identity["authority_bound_study_identity_sha256"],
+        "authority_bound_study_identity_sha256",
+    )
+    _required_string(search_identity["study_uuid"], "study_uuid")
     _require_sha256(
         search_identity["dataset_identity_sha256"],
         "dataset_identity_sha256",
@@ -1194,6 +1212,10 @@ def _validate_study_summary(
         study,
         {
             "schema_version",
+            "authority_schema_version",
+            "authority_key_fingerprint",
+            "authority_bound_study_identity_sha256",
+            "study_uuid",
             "study_name",
             "search_id",
             "study_identity_sha256",
@@ -1260,6 +1282,11 @@ def _validate_study_summary(
     storage = _required_string(study["storage"], "study storage")
     if (
         _required_int(study["schema_version"], "study schema_version") != 1
+        or _required_int(
+            study["authority_schema_version"],
+            "study authority_schema_version",
+        )
+        != 1
         or study["study_name"] != resolved["study_name"]
         or study["search_id"] != resolved["search_id"]
         or study["study_identity_sha256"] != resolved["study_identity_sha256"]

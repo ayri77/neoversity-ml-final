@@ -4,6 +4,7 @@ import json
 import shutil
 import uuid
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,12 @@ import pytest
 import yaml
 
 from src.churn_ml.experiment_v2 import get_candidate_adapter
+from src.churn_ml.optuna_search_authority import (
+    LifecycleAuthorityRecorder,
+    canonical_authority_timestamp,
+    load_lifecycle_authority_key,
+    sampler_pruner_identity,
+)
 from src.churn_ml.optuna_search_artifacts import (
     OptunaSearchArtifactError,
     load_optuna_search_result,
@@ -339,8 +346,47 @@ def test_running_sqlite_trial_is_recovered_after_interruption() -> None:
             dataset_identity_sha256=canonical_sha256(authoritative),
             assignment_identity_sha256=canonical_sha256(assignments.identity),
         )
+        authority = LifecycleAuthorityRecorder.initialize_or_load(
+            study=study,
+            key=load_lifecycle_authority_key(
+                project_root=PROJECT_ROOT,
+                forbidden_roots=(report_root, operational_root),
+            ),
+            base_search_identity_sha256=config.study_identity_sha256,
+            dataset_identity_sha256=canonical_sha256(authoritative),
+            assignment_identity_sha256=canonical_sha256(assignments.identity),
+            source_closure_identity_sha256=config.resume_authentication[
+                "source_closure"
+            ]["identity_sha256"],
+            runtime_identity_sha256=config.resume_authentication[
+                "runtime_dependencies"
+            ]["identity_sha256"],
+            sampler_pruner_identity_sha256=sampler_pruner_identity(
+                sampler=config.payload["sampler"],
+                pruner=str(config.payload["pruner"]),
+            ),
+            configured_trial_count=int(config.payload["n_trials"]),
+            allow_initialize=True,
+        )
         running = study.ask()
         assert running.number == 0
+        started_at_utc = canonical_authority_timestamp(datetime.now(timezone.utc))
+        authority.append_event(
+            event_type="trial_allocated",
+            trial_number=0,
+            from_state=None,
+            to_state="ALLOCATED",
+            event_at_utc=started_at_utc,
+        )
+        authority.append_event(
+            event_type="trial_started",
+            trial_number=0,
+            from_state="ALLOCATED",
+            to_state="RUNNING",
+            started_at_utc=started_at_utc,
+            event_at_utc=started_at_utc,
+        )
+        running.set_user_attr("lifecycle_started_at_utc", started_at_utc)
 
         result = run_optuna_study(
             config,
