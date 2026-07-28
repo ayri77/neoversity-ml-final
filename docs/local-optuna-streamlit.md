@@ -3,6 +3,9 @@
 Concise first-launch guide for this repository on Windows PowerShell. Commands were
 verified against the public CLIs in this branch.
 
+For the full control-panel operator guide, see
+[Experiment Control Panel user guide](experiment-control-panel-user-guide.md).
+
 ## 1. Install the UI extra
 
 From the repository root, using the main project environment (not `.venv-autogluon`):
@@ -84,23 +87,23 @@ Equivalent CLI:
 
 ## 9. Export the best candidate
 
-In the UI: **Run** → Optuna Search v1 → **Export best candidate** → choose the
-completed `search_dir` and a new output path under `artifacts/ui_configs` or
-`configs/research_v2`.
+In the UI: **Run** → Optuna Search v1 → **Export best candidate** → choose a
+completed search from the artifact dropdown (or Advanced manual path) and accept or
+edit the suggested output under `artifacts/optuna_exports`.
 
 Equivalent CLI:
 
 ```powershell
 .\.venv\Scripts\python.exe -u scripts\run_optuna_search.py export-best `
   --search-dir artifacts\optuna_searches\<search-id> `
-  --output artifacts\ui_configs\<candidate>.yaml
+  --output artifacts\optuna_exports\<search-id>_best.yaml
 ```
 
 Validate the exported Experiment Core v2 candidate without fitting:
 
 ```powershell
 .\.venv\Scripts\python.exe -u scripts\run_research_v2.py `
-  --config artifacts\ui_configs\<candidate>.yaml `
+  --config artifacts\optuna_exports\<search-id>_best.yaml `
   --validate-only
 ```
 

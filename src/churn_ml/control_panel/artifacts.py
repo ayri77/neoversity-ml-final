@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 import pandas as pd
@@ -222,6 +222,56 @@ def comparison_rows(
         }
         for field in compare_fields
     ]
+
+
+def artifact_selector_options(
+    repository_root: Path,
+    reader: ReaderSpec,
+    *,
+    roots: tuple[str, ...],
+    statuses: tuple[str, ...],
+) -> list[tuple[str, str]]:
+    """Return unique (relative_path, label) pairs for declarative path selectors."""
+    allowed_states = set(statuses)
+    options: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for artifact in discover_artifacts(repository_root, reader):
+        if allowed_states and artifact.state not in allowed_states:
+            continue
+        if roots and not _relative_within_roots(artifact.relative_path, roots):
+            continue
+        if artifact.relative_path in seen:
+            continue
+        seen.add(artifact.relative_path)
+        options.append((artifact.relative_path, artifact_option_label(artifact)))
+    return options
+
+
+def artifact_option_label(artifact: ArtifactRecord) -> str:
+    name = (
+        artifact.summaries.get("Study name")
+        or artifact.summaries.get("Search ID")
+        or Path(artifact.relative_path).name
+    )
+    parts = [str(name)]
+    objective = artifact.summaries.get("Best objective")
+    if objective is None:
+        objective = artifact.summaries.get("Best trial objective")
+    if objective is not None:
+        parts.append(f"best={objective}")
+    parts.append(artifact.state)
+    return " · ".join(parts)
+
+
+def _relative_within_roots(relative_path: str, roots: tuple[str, ...]) -> bool:
+    path = PurePosixPath(relative_path)
+    for root in roots:
+        try:
+            path.relative_to(PurePosixPath(root))
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def _marker_state(root: Path, reader: ReaderSpec) -> tuple[str, str | None]:

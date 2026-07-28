@@ -13,6 +13,9 @@ metadata and logs, and render configured result files. Files under `artifacts/ui
 are operational records only. The existing filesystem experiment artifacts remain
 authoritative, and the optional MLflow index remains a local searchable mirror.
 
+For day-to-day operator steps (setup, Optuna and MLflow workflows, artifact locations),
+see the [Experiment Control Panel user guide](experiment-control-panel-user-guide.md).
+
 ## Installation and launch
 
 From the repository root:
@@ -208,7 +211,8 @@ or automatic retry.
 ### Minimal child environment
 
 Child processes do not inherit the complete parent environment. The backend builds a
-documented base allowlist (`PATH`, locale, temp, and Windows system roots when
+documented base allowlist (`PATH`, locale, temp, `HOME`, and Windows home/system roots
+`USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `SYSTEMROOT`, `WINDIR`, and `COMSPEC` when
 present) plus only variable names declared on the command registry entry. Required
 declared variables must be present; ambient credentials that are not declared are
 excluded. Sensitive values may exist only transiently in the immediate execution

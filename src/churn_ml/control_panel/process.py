@@ -21,6 +21,8 @@ BASE_ENVIRONMENT_NAMES = frozenset(
     {
         "COMSPEC",
         "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
@@ -29,6 +31,7 @@ BASE_ENVIRONMENT_NAMES = frozenset(
         "TEMP",
         "TMP",
         "TMPDIR",
+        "USERPROFILE",
         "WINDIR",
     }
 )

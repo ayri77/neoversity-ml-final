@@ -399,6 +399,7 @@ commands:
     allowed_output_roots:
       - "artifacts/ui_configs"
       - "configs/research_v2"
+      - "artifacts/optuna_exports"
     result_reader_id: optuna_search_v1
     artifact_url: null
     environment:
@@ -494,6 +495,9 @@ commands:
             required: true
             roots: ["artifacts/optuna_searches"]
             must_exist: true
+            artifact_reader_id: optuna_search_v1
+            artifact_statuses: ["completed"]
+            allow_manual_advanced: true
         confirmation: none
         enabled: true
         competition_test: false
@@ -513,12 +517,19 @@ commands:
             required: true
             roots: ["artifacts/optuna_searches"]
             must_exist: true
+            artifact_reader_id: optuna_search_v1
+            artifact_statuses: ["completed"]
+            allow_manual_advanced: true
           output:
             type: path
             role: output
             required: true
-            roots: ["artifacts/ui_configs", "configs/research_v2"]
+            roots:
+              - "artifacts/optuna_exports"
+              - "artifacts/ui_configs"
+              - "configs/research_v2"
             must_exist: false
+            suggested_value_template: "artifacts/optuna_exports/{search_dir.basename}_best.yaml"
         confirmation: confirm
         enabled: true
         competition_test: false

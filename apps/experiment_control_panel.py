@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import streamlit as st
 
@@ -15,6 +15,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from src.churn_ml.control_panel.artifacts import (  # noqa: E402
     ArtifactRecord,
     ArtifactReadError,
+    artifact_selector_options,
     configured_artifact_file,
     comparison_rows,
     csv_preview,
@@ -40,11 +41,19 @@ from src.churn_ml.control_panel.launch import (  # noqa: E402
 )
 from src.churn_ml.control_panel.formatting import human_duration  # noqa: E402
 from src.churn_ml.control_panel.jobs import JobError, JobManager  # noqa: E402
+from src.churn_ml.control_panel.placeholder_suggestions import (  # noqa: E402
+    SuggestionError,
+    render_suggested_value_template,
+)
 from src.churn_ml.control_panel.registry import (  # noqa: E402
     ControlPanelRegistry,
     load_registry,
 )
-from src.churn_ml.control_panel.schemas import PlaceholderSpec, SchemaError  # noqa: E402
+from src.churn_ml.control_panel.schemas import (  # noqa: E402
+    ActionSpec,
+    PlaceholderSpec,
+    SchemaError,
+)
 
 
 st.set_page_config(
@@ -189,7 +198,12 @@ def run_page() -> None:
     for name, placeholder in action.placeholders.items():
         widget_key = f"value-{command_id}-{action_id}-{name}"
         value = _placeholder_widget(
-            loaded, command.allowed_config_globs, name, placeholder, widget_key
+            loaded,
+            command.allowed_config_globs,
+            name,
+            placeholder,
+            widget_key,
+            values,
         )
         if value not in (None, ""):
             values[name] = value
@@ -396,18 +410,19 @@ def results_page() -> None:
     if len(artifacts) < 2:
         st.info("At least two artifacts are required.")
     else:
+        paths = [item.relative_path for item in artifacts]
+        left_key = f"compare-left-{reader_id}"
+        right_key = f"compare-right-{reader_id}"
+        if left_key not in st.session_state or st.session_state[left_key] not in paths:
+            st.session_state[left_key] = paths[0]
+        if (
+            right_key not in st.session_state
+            or st.session_state[right_key] not in paths
+        ):
+            st.session_state[right_key] = paths[1]
         left, right = st.columns(2)
-        left_path = left.selectbox(
-            "Left",
-            [item.relative_path for item in artifacts],
-            key="compare-left",
-        )
-        right_path = right.selectbox(
-            "Right",
-            [item.relative_path for item in artifacts],
-            index=1,
-            key="compare-right",
-        )
+        left_path = left.selectbox("Left", paths, key=left_key)
+        right_path = right.selectbox("Right", paths, key=right_key)
         left_item = next(item for item in artifacts if item.relative_path == left_path)
         right_item = next(
             item for item in artifacts if item.relative_path == right_path
@@ -475,22 +490,27 @@ def results_page() -> None:
         if command.result_reader_id != reader_id:
             continue
         for action in command.actions.values():
-            if action.id in {"inspect", "run"}:
-                action_rows.append(
-                    {
-                        "command": command.title,
-                        "action": action.title,
-                        "enabled": action.enabled,
-                        "where": "Run page",
-                    }
-                )
+            if not action.enabled:
+                continue
+            action_rows.append(
+                {
+                    "action": action.title,
+                    "enabled": action.enabled,
+                    "where": "Run page",
+                    "additional_input_required": _action_requires_additional_input(
+                        action
+                    ),
+                }
+            )
     if action_rows:
         st.dataframe(action_rows, width="stretch", hide_index=True)
         st.info(
-            "Launch these allowlisted actions from the Run page after reviewing argv."
+            "Launch these allowlisted actions from the Run page after reviewing argv. "
+            "Actions that need an output path or config are listed even when they "
+            "cannot run from Results directly."
         )
     else:
-        st.info("No inspect, export, or paired-comparison action is registered.")
+        st.info("No registry-defined actions are available for this reader.")
 
 
 def configuration_page() -> None:
@@ -546,6 +566,7 @@ def _placeholder_widget(
     name: str,
     spec: PlaceholderSpec,
     widget_key: str,
+    current_values: dict[str, Any],
 ) -> Any:
     label = name.replace("_", " ").title()
     if spec.type == "enum":
@@ -556,8 +577,16 @@ def _placeholder_widget(
         options = _config_options(loaded, config_globs)
         if not options:
             st.warning("No allowed configuration files were found.")
+            st.session_state.pop(widget_key, None)
             return None
+        current = st.session_state.get(widget_key)
+        if current not in options:
+            st.session_state[widget_key] = options[0]
         return st.selectbox(label, options, key=widget_key)
+    if spec.artifact_reader_id is not None:
+        return _artifact_path_widget(loaded, name, spec, widget_key)
+    if spec.suggested_value_template is not None:
+        _apply_suggested_path(spec, widget_key, current_values)
     if spec.type == "path" and spec.external_absolute:
         path_help = (
             "Absolute path outside the repository. The value is redacted when marked "
@@ -574,6 +603,87 @@ def _placeholder_widget(
         help=path_help,
         key=widget_key,
     )
+
+
+def _artifact_path_widget(
+    loaded: ControlPanelRegistry,
+    name: str,
+    spec: PlaceholderSpec,
+    widget_key: str,
+) -> Any:
+    label = name.replace("_", " ").title()
+    reader = loaded.readers[spec.artifact_reader_id or ""]
+    options = artifact_selector_options(
+        REPOSITORY_ROOT,
+        reader,
+        roots=spec.roots,
+        statuses=spec.artifact_statuses,
+    )
+    selected: str | None = None
+    if not options:
+        st.info("No matching completed artifacts were found for this action.")
+        st.session_state.pop(widget_key, None)
+    else:
+        paths = [path for path, _label in options]
+        labels = dict(options)
+        current = st.session_state.get(widget_key)
+        if current not in paths:
+            st.session_state[widget_key] = paths[0]
+        selected = st.selectbox(
+            label,
+            paths,
+            key=widget_key,
+            format_func=lambda value: labels.get(value, value),
+        )
+    if spec.allow_manual_advanced:
+        with st.expander("Advanced / manual path"):
+            manual_toggle = f"{widget_key}__manual_toggle"
+            manual_key = f"{widget_key}__manual_path"
+            use_manual = st.checkbox(
+                "Enter path manually",
+                key=manual_toggle,
+                help=(
+                    "Manual paths still pass root containment, existence, and "
+                    "symlink/junction checks."
+                ),
+            )
+            if use_manual:
+                selected = st.text_input(
+                    f"Manual {label}",
+                    help=f"Repository-relative path within: {', '.join(spec.roots)}",
+                    key=manual_key,
+                )
+    return selected
+
+
+def _apply_suggested_path(
+    spec: PlaceholderSpec,
+    widget_key: str,
+    current_values: Mapping[str, Any],
+) -> None:
+    template = spec.suggested_value_template
+    if template is None:
+        return
+    source_key = f"{widget_key}__suggestion_source"
+    try:
+        suggestion = render_suggested_value_template(template, current_values)
+    except SuggestionError:
+        return
+    fingerprint = tuple(
+        sorted((key, str(current_values.get(key, ""))) for key in current_values)
+    )
+    previous = st.session_state.get(source_key)
+    current = st.session_state.get(widget_key)
+    if previous != fingerprint or current in (None, ""):
+        st.session_state[widget_key] = suggestion
+        st.session_state[source_key] = fingerprint
+
+
+def _action_requires_additional_input(action: ActionSpec) -> bool:
+    required = [spec for spec in action.placeholders.values() if spec.required]
+    if len(required) > 1:
+        return True
+    return any(spec.role in {"output", "config", "value"} for spec in required)
 
 
 def _config_options(loaded: ControlPanelRegistry, globs: tuple[str, ...]) -> list[str]:

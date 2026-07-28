@@ -22,6 +22,7 @@ from src.churn_ml.control_panel.schemas import (
     UISettings,
     parse_commands,
     parse_readers,
+    suggested_template_references,
 )
 
 
@@ -97,6 +98,26 @@ def load_registry(
                         f"{command.id}/{action.id}/{name} uses undeclared roots: "
                         f"{sorted(unknown_roots)}."
                     )
+                if placeholder.artifact_reader_id is not None:
+                    if placeholder.artifact_reader_id not in readers:
+                        raise SchemaError(
+                            f"{command.id}/{action.id}/{name} references unknown "
+                            f"artifact reader {placeholder.artifact_reader_id!r}."
+                        )
+                if placeholder.suggested_value_template is not None:
+                    for reference in suggested_template_references(
+                        placeholder.suggested_value_template
+                    ):
+                        if reference not in action.placeholders:
+                            raise SchemaError(
+                                f"{command.id}/{action.id}/{name} template references "
+                                f"unknown placeholder {reference!r}."
+                            )
+                        if reference == name:
+                            raise SchemaError(
+                                f"{command.id}/{action.id}/{name} template cannot "
+                                "reference itself."
+                            )
     return ControlPanelRegistry(
         repository_root=root,
         settings=settings,

@@ -16,6 +16,9 @@ PlaceholderType = Literal["path", "string", "integer", "enum"]
 PathRole = Literal["config", "input", "output", "value"]
 ENVIRONMENT_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 DOT_PATH_SEGMENT = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*)$")
+PLACEHOLDER_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SUGGESTED_TEMPLATE_REF = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)(?:\.(basename))?\}")
+SAFE_BASENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -109,6 +112,28 @@ def validate_public_cli_path(value: str, label: str) -> str:
     return value
 
 
+def validate_suggested_value_template(value: str, label: str) -> str:
+    if not value or "\\" in value or "\x00" in value:
+        raise SchemaError(f"{label} must be a non-empty POSIX-style path template.")
+    if (
+        ".." in value
+        or "/./" in value
+        or value.startswith("./")
+        or value.endswith("/.")
+    ):
+        raise SchemaError(f"{label} must not contain dot-segment traversal.")
+    refs = list(SUGGESTED_TEMPLATE_REF.finditer(value))
+    if not refs:
+        raise SchemaError(f"{label} must reference at least one placeholder value.")
+    residual = SUGGESTED_TEMPLATE_REF.sub("token", value)
+    validate_relative_path_text(residual, label)
+    return value
+
+
+def suggested_template_references(template: str) -> tuple[str, ...]:
+    return tuple(match.group(1) for match in SUGGESTED_TEMPLATE_REF.finditer(template))
+
+
 @dataclass(frozen=True)
 class UISettings:
     schema_version: int
@@ -194,6 +219,10 @@ class PlaceholderSpec:
     sensitive: bool
     must_exist: bool
     external_absolute: bool
+    artifact_reader_id: str | None
+    artifact_statuses: tuple[str, ...]
+    allow_manual_advanced: bool
+    suggested_value_template: str | None
 
     @classmethod
     def from_dict(cls, raw: Any, label: str) -> PlaceholderSpec:
@@ -207,6 +236,10 @@ class PlaceholderSpec:
                 "sensitive",
                 "must_exist",
                 "external_absolute",
+                "artifact_reader_id",
+                "artifact_statuses",
+                "allow_manual_advanced",
+                "suggested_value_template",
             },
             label=label,
         )
@@ -225,6 +258,40 @@ class PlaceholderSpec:
             bool,
             f"{label}.external_absolute",
         )
+        artifact_reader_id = value.get("artifact_reader_id")
+        if artifact_reader_id is not None:
+            artifact_reader_id = _typed(
+                artifact_reader_id, str, f"{label}.artifact_reader_id"
+            )
+            if (
+                not artifact_reader_id
+                or PLACEHOLDER_NAME.fullmatch(artifact_reader_id) is None
+            ):
+                raise SchemaError(
+                    f"{label}.artifact_reader_id must be a non-empty reader id."
+                )
+        artifact_statuses = _string_list(
+            value.get("artifact_statuses", []), f"{label}.artifact_statuses"
+        )
+        for index, status in enumerate(artifact_statuses):
+            if not status or PLACEHOLDER_NAME.fullmatch(status) is None:
+                raise SchemaError(
+                    f"{label}.artifact_statuses[{index}] must be a status id."
+                )
+        allow_manual_advanced = _typed(
+            value.get("allow_manual_advanced", False),
+            bool,
+            f"{label}.allow_manual_advanced",
+        )
+        suggested_raw = value.get("suggested_value_template")
+        suggested_value_template = None
+        if suggested_raw is not None:
+            suggested_value_template = _typed(
+                suggested_raw, str, f"{label}.suggested_value_template"
+            )
+            validate_suggested_value_template(
+                suggested_value_template, f"{label}.suggested_value_template"
+            )
         if external_absolute:
             if kind != "path":
                 raise SchemaError(
@@ -246,6 +313,32 @@ class PlaceholderSpec:
             raise SchemaError(f"{label}.roots is only valid for path placeholders.")
         if kind != "enum" and choices:
             raise SchemaError(f"{label}.choices is only valid for enum placeholders.")
+        if artifact_reader_id is not None:
+            if kind != "path" or role != "input":
+                raise SchemaError(
+                    f"{label}.artifact_reader_id is only valid for input path "
+                    "placeholders."
+                )
+            if external_absolute:
+                raise SchemaError(
+                    f"{label}.artifact_reader_id cannot combine with external_absolute."
+                )
+        elif artifact_statuses or allow_manual_advanced:
+            raise SchemaError(
+                f"{label}.artifact_statuses and allow_manual_advanced require "
+                "artifact_reader_id."
+            )
+        if suggested_value_template is not None:
+            if kind != "path" or role != "output":
+                raise SchemaError(
+                    f"{label}.suggested_value_template is only valid for output path "
+                    "placeholders."
+                )
+            if external_absolute:
+                raise SchemaError(
+                    f"{label}.suggested_value_template cannot combine with "
+                    "external_absolute."
+                )
         return cls(
             type=kind,  # type: ignore[arg-type]
             role=role,  # type: ignore[arg-type]
@@ -259,6 +352,10 @@ class PlaceholderSpec:
                 f"{label}.must_exist",
             ),
             external_absolute=external_absolute,
+            artifact_reader_id=artifact_reader_id,
+            artifact_statuses=artifact_statuses,
+            allow_manual_advanced=allow_manual_advanced,
+            suggested_value_template=suggested_value_template,
         )
 
 

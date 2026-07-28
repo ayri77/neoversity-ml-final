@@ -146,7 +146,7 @@ def test_optuna_export_and_inspect_actions_build() -> None:
             "export_best",
             {
                 "search_dir": "artifacts/optuna_searches/example_search",
-                "output": "artifacts/ui_configs/optuna_best_candidate.yaml",
+                "output": "artifacts/optuna_exports/example_search_best.yaml",
             },
             repository_root=PROJECT_ROOT,
             python_executable="python-safe",
@@ -156,14 +156,16 @@ def test_optuna_export_and_inspect_actions_build() -> None:
             "--search-dir",
             "artifacts/optuna_searches/example_search",
             "--output",
-            "artifacts/ui_configs/optuna_best_candidate.yaml",
+            "artifacts/optuna_exports/example_search_best.yaml",
         )
     finally:
         if search_dir.exists():
             search_dir.rmdir()
         parent = search_dir.parent
-        if parent.exists() and not any(parent.iterdir()):
-            parent.rmdir()
+        export_root = PROJECT_ROOT / "artifacts" / "optuna_exports"
+        for path in (export_root, parent):
+            if path.exists() and not any(path.iterdir()):
+                path.rmdir()
 
 
 def test_optuna_external_absolute_schema_rejects_roots() -> None:
