@@ -10,6 +10,10 @@ from src.churn_ml.control_panel.command_builder import (
     CommandBuildError,
     resolve_safe_path,
 )
+from src.churn_ml.control_panel.path_safety import (
+    PathSafetyError,
+    require_regular_file,
+)
 
 from src.churn_ml.control_panel.schemas import (
     CommandSpec,
@@ -54,6 +58,19 @@ def load_registry(
     _validate_settings_paths(root, settings)
     commands = dict(parse_commands(_load_yaml(sources.commands)))
     readers = dict(parse_readers(_load_yaml(sources.readers)))
+    for public_cli in sorted({command.public_cli for command in commands.values()}):
+        try:
+            _, cli_path = resolve_safe_path(
+                root,
+                public_cli,
+                allowed_roots=("scripts",),
+                must_exist=True,
+            )
+            require_regular_file(cli_path, reject_hardlinks=True)
+        except (CommandBuildError, PathSafetyError) as error:
+            raise SchemaError(
+                f"Invalid approved public CLI {public_cli}: {error}"
+            ) from error
     unknown_readers = sorted(
         {
             command.result_reader_id

@@ -1,4 +1,10 @@
 schema_version: 1
+approved_public_clis:
+  - scripts/run_research_v2.py
+  - scripts/run_research_evaluation.py
+  - scripts/compare_research_v2.py
+  - scripts/sync_mlflow.py
+  - scripts/run_deployment_v1.py
 commands:
   - id: experiment_core_v2
     title: Experiment Core v2
@@ -14,6 +20,7 @@ commands:
     allowed_output_roots: []
     result_reader_id: research_v2
     artifact_url: null
+    environment: []
     actions:
       - id: validate
         title: Validate
@@ -61,6 +68,7 @@ commands:
     allowed_input_roots: ["configs/research", "artifacts/ui_configs"]
     allowed_output_roots: []
     result_reader_id: research_v1
+    environment: []
     artifact_url: null
     actions:
       - id: validate
@@ -106,6 +114,7 @@ commands:
     allowed_output_roots: ["artifacts/research_v2_comparisons"]
     result_reader_id: paired_comparison
     artifact_url: null
+    environment: []
     actions:
       - id: validate
         title: Validate
@@ -189,6 +198,7 @@ commands:
     allowed_output_roots: []
     result_reader_id: null
     artifact_url: "http://127.0.0.1:5000"
+    environment: []
     actions:
       - id: validate
         title: Validate
@@ -278,6 +288,7 @@ commands:
     allowed_output_roots: ["artifacts/deployments"]
     result_reader_id: deployment_v1
     artifact_url: null
+    environment: []
     actions:
       - id: validate
         title: Validate

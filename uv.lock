@@ -2303,6 +2303,7 @@ dependencies = [
 
 [package.optional-dependencies]
 ui = [
+    { name = "psutil" },
     { name = "streamlit" },
 ]
 
@@ -2327,6 +2328,7 @@ requires-dist = [
     { name = "optuna", specifier = ">=4.9.0" },
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "plotly", specifier = ">=6.9.0" },
+    { name = "psutil", marker = "extra == 'ui'", specifier = ">=7.2.2" },
     { name = "pyarrow", specifier = ">=24.0.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "scikit-learn", specifier = ">=1.9.0" },

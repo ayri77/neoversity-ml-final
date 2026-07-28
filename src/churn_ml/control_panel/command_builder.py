@@ -78,7 +78,7 @@ def build_command(
             )
         rendered[name] = text
         redacted[name] = "<redacted>" if spec.sensitive else text
-        references[name] = reference
+        references[name] = "<redacted>" if spec.sensitive else reference
         if canonical is not None:
             if spec.role == "output":
                 outputs.append(canonical)

@@ -3,10 +3,21 @@ from __future__ import annotations
 import os
 import secrets
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
 from src.churn_ml.optuna_search_authority import AUTHORITY_KEY_FILE_ENV
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SAFE_TMP = _REPO_ROOT / ".tmp" / "control-panel-tests"
+_SAFE_TMP.mkdir(parents=True, exist_ok=True)
+
+# Prefer a repository-local temp root when the platform default temp ACLs
+# interfere with Streamlit AppTest and subprocess job probes.
+os.environ.setdefault("TMP", str(_SAFE_TMP))
+os.environ.setdefault("TEMP", str(_SAFE_TMP))
+os.environ.setdefault("TMPDIR", str(_SAFE_TMP))
 
 
 @pytest.fixture(scope="session", autouse=True)

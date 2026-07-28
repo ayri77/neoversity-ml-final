@@ -32,6 +32,12 @@ from src.churn_ml.control_panel.config_editor import (  # noqa: E402
     read_config,
     save_config_copy,
 )
+from src.churn_ml.control_panel.launch import (  # noqa: E402
+    LaunchAuthorizationError,
+    RenderedLaunch,
+    authorize_launch,
+    rendered_launch,
+)
 from src.churn_ml.control_panel.formatting import human_duration  # noqa: E402
 from src.churn_ml.control_panel.jobs import JobError, JobManager  # noqa: E402
 from src.churn_ml.control_panel.registry import (  # noqa: E402
@@ -57,6 +63,7 @@ def job_manager(loaded: ControlPanelRegistry) -> JobManager:
     return JobManager(
         REPOSITORY_ROOT / loaded.settings.jobs_root,
         working_directory=REPOSITORY_ROOT / loaded.settings.working_directory,
+        commands=loaded.commands,
     )
 
 
@@ -211,6 +218,21 @@ def run_page() -> None:
     except CommandBuildError as error:
         st.error(str(error))
 
+    consumed = st.session_state.setdefault("_consumed_launch_nonces", set())
+    if not isinstance(consumed, set):
+        consumed = set()
+        st.session_state["_consumed_launch_nonces"] = consumed
+    rendered: RenderedLaunch | None = None
+    if built is not None:
+        previous = st.session_state.get("_rendered_launch")
+        rendered = rendered_launch(
+            built,
+            previous if isinstance(previous, RenderedLaunch) else None,
+            consumed_nonces=consumed,
+        )
+        st.session_state["_rendered_launch"] = rendered
+    else:
+        st.session_state["_rendered_launch"] = None
     confirmed = True
     if action.confirmation in {"confirm", "acknowledge"}:
         confirmed = st.checkbox(
@@ -227,16 +249,30 @@ def run_page() -> None:
         "Start background job",
         type="primary",
         disabled=built is None or not confirmed or not acknowledged,
+        key="start-background-job",
     ):
-        assert built is not None
-        record = job_manager(loaded).start(
-            argv=built.argv,
-            redacted_argv=built.redacted_argv,
-            command_id=command_id,
-            action_id=action_id,
-            references=built.references,
-        )
-        st.success(f"Started job {record.job_id}.")
+        try:
+            authorized = authorize_launch(
+                loaded.commands,
+                command_id=command_id,
+                action_id=action_id,
+                values=values,
+                repository_root=REPOSITORY_ROOT,
+                confirmed=confirmed,
+                high_risk_acknowledged=acknowledged,
+                rendered=rendered,
+                consumed_nonces=consumed,
+            )
+            record = job_manager(loaded).start(
+                argv=authorized.argv,
+                redacted_argv=authorized.redacted_argv,
+                command_id=command_id,
+                action_id=action_id,
+                references=authorized.references,
+            )
+            st.success(f"Started job {record.job_id}.")
+        except (LaunchAuthorizationError, JobError) as error:
+            st.error(str(error))
 
 
 def jobs_page() -> None:
@@ -267,6 +303,8 @@ def jobs_page() -> None:
         status.get("exit_code") if status.get("exit_code") is not None else "—",
     )
     st.json(dict(record.job), expanded=False)
+    if status.get("diagnostic"):
+        st.warning(str(status["diagnostic"]))
     st.code(display_argv(tuple(record.command["argv"])), language="python")
     stdout, stderr = st.tabs(["stdout", "stderr"])
     with stdout:
@@ -318,6 +356,8 @@ def results_page() -> None:
     )
     selected = next(item for item in artifacts if item.relative_path == selected_path)
     st.write(f"Status: `{selected.state}`")
+    if selected.diagnostic:
+        st.warning(selected.diagnostic)
     if selected.summaries:
         st.dataframe(
             [
@@ -388,7 +428,13 @@ def results_page() -> None:
             "New comparison ID",
             value="ui-paired-comparison",
         )
-        if st.button("Prepare Paired Comparison action"):
+        comparison_ready = (
+            left_item.state == "completed" and right_item.state == "completed"
+        )
+        if (
+            st.button("Prepare Paired Comparison action", disabled=not comparison_ready)
+            and comparison_ready
+        ):
             st.session_state["run-command"] = "paired_comparison"
             st.session_state["run-action-paired_comparison"] = "run"
             st.session_state["run_prefill"] = {
@@ -405,7 +451,13 @@ def results_page() -> None:
                 "Prepared the allowlisted action. Open Run to review argv and confirm."
             )
     if reader_id == "deployment_v1":
-        if st.button("Prepare deployment Inspect action"):
+        deployment_valid = selected.state != "invalid"
+        if (
+            st.button(
+                "Prepare deployment Inspect action", disabled=not deployment_valid
+            )
+            and deployment_valid
+        ):
             st.session_state["run-command"] = "final_deployment_v1"
             st.session_state["run-action-final_deployment_v1"] = "inspect"
             st.session_state["run_prefill"] = {

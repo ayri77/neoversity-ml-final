@@ -13,6 +13,11 @@ from src.churn_ml.control_panel.command_builder import (
     CommandBuildError,
     resolve_safe_path,
 )
+from src.churn_ml.control_panel.path_safety import (
+    PathSafetyError,
+    require_safe_directory,
+    require_safe_existing_ancestors,
+)
 
 
 class ConfigEditError(ValueError):
@@ -92,13 +97,16 @@ def save_config_copy(
         )
     except CommandBuildError as error:
         raise ConfigEditError(str(error)) from error
-    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        require_safe_directory(directory)
+    except (OSError, PathSafetyError) as error:
+        raise ConfigEditError("Editable configuration directory is unsafe.") from error
     target = directory / name.name
-    if target.exists():
-        raise ConfigEditError(f"Configuration copy already exists: {target.name}.")
     descriptor, temporary = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=directory
     )
+    os.chmod(temporary, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
@@ -106,7 +114,7 @@ def save_config_copy(
                 handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, target)
+        _publish_new_file(Path(temporary), target)
     except BaseException:
         try:
             os.unlink(temporary)
@@ -114,6 +122,39 @@ def save_config_copy(
             pass
         raise
     return target
+
+
+def _publish_new_file(temporary: Path, target: Path) -> None:
+    """Atomically publish a validated copy only when the target is absent."""
+    claimed = False
+    try:
+        require_safe_existing_ancestors(target)
+        require_safe_directory(target.parent)
+        if os.name == "nt":
+            # Exclusive create claims the name; replace then publishes content.
+            # Concurrent writers: only one O_EXCL claim succeeds.
+            claim = os.open(
+                target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_BINARY, 0o600
+            )
+            os.close(claim)
+            claimed = True
+            os.replace(temporary, target)
+        else:
+            os.link(temporary, target)
+            temporary.unlink()
+    except FileExistsError as error:
+        raise ConfigEditError(
+            f"Configuration copy already exists: {target.name}."
+        ) from error
+    except PathSafetyError as error:
+        raise ConfigEditError("Editable configuration directory is unsafe.") from error
+    except BaseException:
+        if claimed:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def _validate_primitive_tree(value: Any, path: str) -> None:

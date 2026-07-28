@@ -9,11 +9,16 @@ from typing import Any
 
 import pytest
 
+import src.churn_ml.control_panel.process as process_module
 from src.churn_ml.control_panel.command_builder import (
     CommandBuildError,
     build_command,
 )
-from src.churn_ml.control_panel.process import LocalProcessBackend
+from src.churn_ml.control_panel.process import (
+    LocalProcessBackend,
+    ProcessIdentity,
+    build_child_environment,
+)
 from src.churn_ml.control_panel.registry import load_registry
 
 
@@ -85,23 +90,24 @@ def test_injection_text_remains_one_inert_argv_value(tmp_path: Path) -> None:
     stdout_path = tmp_path / "stdout.log"
     stderr_path = tmp_path / "stderr.log"
     injected = "value; Write-Output INJECTION"
-    with (
-        stdout_path.open("ab", buffering=0) as stdout,
-        stderr_path.open("ab", buffering=0) as stderr,
-    ):
-        spawned = backend.spawn(
-            [
-                sys.executable,
-                "-c",
-                "import sys; print(repr(sys.argv[1]))",
-                injected,
-            ],
-            cwd=tmp_path,
-            stdout=stdout,
-            stderr=stderr,
-        )
+    environment, _ = build_child_environment({})
+    spawned = backend.spawn(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print(repr(sys.argv[1]))",
+            injected,
+        ],
+        cwd=tmp_path,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        environment=environment,
+        redactions=(),
+    )
     process = backend._processes[spawned.pid]
     assert process.wait(timeout=10) == 0
+    for thread in backend._log_threads:
+        thread.join(timeout=5)
     assert stdout_path.read_text(encoding="utf-8").strip() == repr(injected)
     assert not (tmp_path / "INJECTION").exists()
 
@@ -113,17 +119,32 @@ def test_process_backend_hard_codes_shell_false(
 
     class DummyPopen:
         pid = 123
+        stdout = object()
+        stderr = object()
 
         def __init__(self, **kwargs: object) -> None:
             captured.update(kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", DummyPopen)
     backend = LocalProcessBackend()
-    with (
-        (tmp_path / "out").open("ab") as stdout,
-        (tmp_path / "err").open("ab") as stderr,
-    ):
-        backend.spawn(["safe"], cwd=tmp_path, stdout=stdout, stderr=stderr)
+    identity = ProcessIdentity(
+        pid=123,
+        creation_time_utc="2026-01-01T00:00:00.000000Z",
+        executable_path=str(Path(sys.executable).resolve()),
+        argv_sha256="0" * 64,
+        process_group=None,
+        session_id=None,
+    )
+    monkeypatch.setattr(process_module, "_capture_identity", lambda *args: identity)
+    monkeypatch.setattr(backend, "_start_log_drain", lambda *args: None)
+    backend.spawn(
+        ["safe"],
+        cwd=tmp_path,
+        stdout_path=tmp_path / "out",
+        stderr_path=tmp_path / "err",
+        environment={},
+        redactions=(),
+    )
     assert captured["shell"] is False
 
 

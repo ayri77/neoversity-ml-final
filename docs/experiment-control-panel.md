@@ -21,8 +21,8 @@ From the repository root:
 uv run --extra ui streamlit run apps/experiment_control_panel.py
 ```
 
-Streamlit is isolated in the `ui` optional dependency extra. The application uses the
-main project environment, not `.venv-autogluon`.
+Streamlit and `psutil` are isolated in the `ui` optional dependency extra. The
+application uses the main project environment, not `.venv-autogluon`.
 
 ## Pages
 
@@ -65,7 +65,8 @@ traversal are rejected with readable errors.
 
 Schema version 1 defines command groups and actions. A group declares a stable ID,
 title, description, category, fixed Python argv prefix, allowed configuration globs,
-input/output roots, optional result reader, and optional URL. Each action declares:
+input/output roots, optional result reader, optional URL, and an explicit child
+environment allowlist. Each action declares:
 
 - a stable ID and description;
 - a fixed argv token list;
@@ -75,10 +76,20 @@ input/output roots, optional result reader, and optional URL. Each action declar
 - enabled/disabled state;
 - stdout success/failure markers.
 
+#### Approved executable-prefix contract
+
 Every executable prefix begins with the registry sentinel `$PYTHON`, which resolves
-only to the running UI interpreter. Widgets never accept executable or arbitrary
-command text. A new supported CLI action can therefore be added without Python changes
-by adding a strict action entry and its typed placeholders.
+only to the running UI interpreter. The only accepted shapes are:
+
+- `["$PYTHON", "scripts/<public-cli>.py"]`
+- `["$PYTHON", "-u", "scripts/<public-cli>.py"]`
+
+Rejected at registry load: `$PYTHON -c`, `$PYTHON -m`, stdin (`-`), arbitrary
+interpreter flags, external or absolute scripts, traversal, linked scripts, and any
+path that is not an exact approved `scripts/*.py` public CLI. Widgets never accept
+executable or arbitrary command text. A new supported CLI action can therefore be
+added without Python changes by adding a strict action entry and its typed
+placeholders.
 
 The initial registry is derived from actual public `--help` output at the approved
 base:
@@ -100,15 +111,41 @@ Schema version 1 declares artifact roots, discovery globs, terminal markers, sum
 JSON files, labeled dot-path fields, bounded CSV preview files, log files, and
 side-by-side compare fields. Python contains no model-specific result parser.
 
-Dot paths traverse mapping keys and numeric list indexes only. They do not execute
+Marker paths must be safe POSIX-style relative paths at registry load. Traversal,
+absolute, drive-qualified, UNC-like, empty, `.`, and `..` segments are rejected.
+Marker reads stay inside the artifact directory and reject symlinks, junctions,
+reparse ancestors, hard-linked markers, and external targets.
+
+Dot paths traverse mapping keys and canonical numeric list indexes only. Malformed
+reader fields such as `metrics..score`, leading/trailing dots, wildcards, or
+zero-padded indexes are rejected at registry load. Dot paths do not execute
 expressions.
+
+If both success and failure markers exist for an artifact, the reader returns an
+explicit `invalid` state with a diagnostic. It does not report success.
+
+## Fail-closed launch authorization
+
+Disabled Streamlit widgets are not a security boundary. Immediately before
+`JobManager.start()`, the Run page rechecks:
+
+- action `enabled`;
+- current command build success against the live selection;
+- required confirmation;
+- high-risk / competition-test acknowledgement when declared;
+- a one-time launch token bound to the current command, action, and argv fingerprint.
+
+A consumed token cannot be replayed. Streamlit AppTest coverage includes forged
+session state and replayed tokens. Changing the live selection mints a new token.
 
 ## Configuration copy editing
 
 Canonical configurations are displayed read-only. The Advanced editor validates a
 primitive-only YAML or JSON mapping and writes only a new, safely named file beneath
-`artifacts/ui_configs`. Existing copies are not overwritten. Registry and settings
-files cannot be edited in the application.
+`artifacts/ui_configs`. Publication uses create-if-absent semantics: an existing
+target is never overwritten, exactly one concurrent writer succeeds, and temporary
+siblings are cleaned up on failure. Registry and settings files cannot be edited in
+the application.
 
 ## Jobs and logs
 
@@ -123,12 +160,36 @@ artifacts/ui_jobs/<job-id>/
 └── stderr.log
 ```
 
+Job directories are loaded non-followingly. `jobs_root`, UUID directory names,
+ancestors, metadata files, and logs are validated; symlink/junction/reparse paths
+and external targets are rejected. Persisted schemas are strict, and the directory
+name must equal `job_id`.
+
 JSON writes use a temporary sibling, flush, filesystem sync, and atomic replace.
 stdout/stderr are append-only. Persisted states are `created`, `running`, `succeeded`,
-`failed`, `stop_requested`, `stopped`, and `orphaned`. After an application restart, a
-still-live PID remains running; a missing process with no recoverable exit code becomes
-orphaned. There is no database, recursive deletion, artifact cleanup, or automatic
-retry.
+`failed`, `stop_requested`, `stopped`, and `orphaned`.
+
+### Process identity and orphan behavior
+
+While a job is live, status persists PID, creation time, executable identity, argv
+fingerprint, and process-group/session identity where the platform provides them.
+Refresh and stop verify that identity before acting. A process is never signalled
+based only on PID existence, which protects against PID reuse.
+
+Mismatched or unverifiable live jobs become `orphaned`. After an application
+restart, a still-matching process remains `running`; a missing process with no
+recoverable exit code from the local backend becomes `orphaned`. There is no
+database, recursive deletion, artifact cleanup, or automatic retry.
+
+### Minimal child environment
+
+Child processes do not inherit the complete parent environment. The backend builds a
+documented base allowlist (`PATH`, locale, temp, and Windows system roots when
+present) plus only variable names declared on the command registry entry. Required
+declared variables must be present; ambient credentials that are not declared are
+excluded. Sensitive values may exist only transiently in the immediate execution
+argv or child environment and are redacted from references, job JSON, command JSON,
+status, logs, diagnostics, and UI output.
 
 ## Safety model
 
@@ -147,7 +208,8 @@ retry.
 - Any competition-test/deployment action requires an additional acknowledgement.
 - The real deployment action is disabled by default even though its exact public argv
   is recorded in the registry.
-- Environment variables and secrets are neither collected nor persisted.
+- Launch authorization is fail-closed and tokenized; widget disabled state is not
+  trusted.
 
 ## MLflow integration
 
@@ -156,14 +218,24 @@ existing optional local metadata index through `scripts/sync_mlflow.py`. The UI 
 not start an MLflow server because the approved CLI has no start subcommand. Use the
 documented launch command in [MLflow Local Index](mlflow-local-index.md) when needed.
 
-## Windows behavior
+## Windows behavior and limitations
 
 Windows jobs start with `CREATE_NEW_PROCESS_GROUP`; POSIX jobs start in a new session.
-Stopping targets the process group. Windows first sends `CTRL_BREAK_EVENT` to a process
-started by the current application and uses the platform `taskkill` argv fallback for
-a persisted live PID after restart. POSIX sends `SIGTERM` to the process group.
-Stopping is best-effort and never recursively deletes either job or experiment
-artifacts.
+Stopping targets the process group. Windows first sends `CTRL_BREAK_EVENT` to a
+process started by the current application and uses a minimal-environment `taskkill`
+argv fallback for a persisted live PID after restart, only after identity
+verification. POSIX sends `SIGTERM` to the process group. Stopping is best-effort and
+never recursively deletes either job or experiment artifacts.
+
+Windows-specific limits:
+
+- Process group and session identity fields are unavailable and stored as null;
+  verification relies on PID, creation time, executable path, and argv fingerprint.
+- Junction and reparse-point rejection depends on filesystem attribute inspection.
+- Hard-link publication for config copies uses an exclusive create-then-replace claim
+  on Windows; POSIX uses create-if-absent hard links.
+- Some restricted environments may deny junction creation in tests; those cases are
+  skipped rather than weakening path safety.
 
 ## Limitations
 

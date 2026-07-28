@@ -11,6 +11,13 @@ from src.churn_ml.control_panel.command_builder import (
     CommandBuildError,
     resolve_safe_path,
 )
+from src.churn_ml.control_panel.path_safety import (
+    PathSafetyError,
+    path_exists_nonfollowing,
+    require_regular_file,
+    require_safe_directory,
+    require_safe_existing_ancestors,
+)
 from src.churn_ml.control_panel.schemas import ReaderSpec
 
 
@@ -26,6 +33,7 @@ class ArtifactRecord:
     state: str
     summaries: Mapping[str, Any]
     json_payloads: Mapping[str, Any]
+    diagnostic: str | None
 
 
 def configured_artifact_file(
@@ -44,6 +52,10 @@ def configured_artifact_file(
         raise ArtifactReadError(str(error)) from error
     if not path.is_file():
         raise ArtifactReadError(f"Configured artifact file is not regular: {path}.")
+    try:
+        require_regular_file(path, reject_hardlinks=True)
+    except PathSafetyError as error:
+        raise ArtifactReadError(str(error)) from error
     return path
 
 
@@ -131,13 +143,12 @@ def discover_artifacts(
         except CommandBuildError:
             continue
         for candidate in artifact_root.glob(reader.discovery_glob):
-            if not candidate.is_dir() or candidate.is_symlink():
-                continue
             try:
+                require_safe_directory(candidate)
                 canonical = candidate.resolve(strict=True)
                 canonical.relative_to(artifact_root)
                 record = read_artifact(root, reader, canonical)
-            except (OSError, ValueError, ArtifactReadError):
+            except (OSError, ValueError, ArtifactReadError, PathSafetyError):
                 continue
             results.append(record)
     return sorted(results, key=lambda item: item.relative_path, reverse=True)
@@ -150,8 +161,7 @@ def read_artifact(
 ) -> ArtifactRecord:
     root = repository_root.resolve(strict=True)
     canonical = artifact_root.resolve(strict=True)
-    if canonical.is_symlink() or not canonical.is_dir():
-        raise ArtifactReadError("Artifact root must be a regular directory.")
+    require_safe_directory(canonical)
     allowed_roots = tuple(reader.artifact_roots)
     try:
         relative, validated = resolve_safe_path(
@@ -162,7 +172,9 @@ def read_artifact(
         )
     except (CommandBuildError, ValueError) as error:
         raise ArtifactReadError(str(error)) from error
-    state = _marker_state(validated, reader)
+    state, diagnostic = _marker_state(validated, reader)
+    if state == "invalid":
+        return ArtifactRecord(reader.id, validated, relative, state, {}, {}, diagnostic)
     summaries: dict[str, Any] = {}
     payloads: dict[str, Any] = {}
     for summary in reader.summary_files:
@@ -188,6 +200,7 @@ def read_artifact(
         state=state,
         summaries=summaries,
         json_payloads=payloads,
+        diagnostic=diagnostic,
     )
 
 
@@ -206,14 +219,36 @@ def comparison_rows(
     ]
 
 
-def _marker_state(root: Path, reader: ReaderSpec) -> str:
-    if any((root / marker).is_file() for marker in reader.success_markers):
-        return "completed"
-    if any((root / marker).is_file() for marker in reader.failure_markers):
-        return "failed"
-    return "running"
+def _marker_state(root: Path, reader: ReaderSpec) -> tuple[str, str | None]:
+    try:
+        success = any(
+            _safe_marker_exists(root, marker) for marker in reader.success_markers
+        )
+        failure = any(
+            _safe_marker_exists(root, marker) for marker in reader.failure_markers
+        )
+    except (PathSafetyError, OSError):
+        return "invalid", "A configured marker path is unsafe."
+    if success and failure:
+        return "invalid", "Conflicting success and failure markers are present."
+    if success:
+        return "completed", None
+    if failure:
+        return "failed", None
+    return "running", None
+
+
+def _safe_marker_exists(root: Path, relative: str) -> bool:
+    path = root.joinpath(*relative.split("/"))
+    require_safe_existing_ancestors(path)
+    if not path_exists_nonfollowing(path):
+        return False
+    require_regular_file(path, reject_hardlinks=True)
+    return True
 
 
 def _require_regular_file(path: Path) -> None:
-    if path.is_symlink() or not path.is_file():
-        raise ArtifactReadError(f"Expected a regular non-link file: {path}.")
+    try:
+        require_regular_file(path, reject_hardlinks=True)
+    except PathSafetyError as error:
+        raise ArtifactReadError(str(error)) from error

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Mapping
@@ -13,6 +14,8 @@ Primitive = str | int | float | bool | None
 Confirmation = Literal["none", "confirm", "acknowledge"]
 PlaceholderType = Literal["path", "string", "integer", "enum"]
 PathRole = Literal["config", "input", "output", "value"]
+ENVIRONMENT_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+DOT_PATH_SEGMENT = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*)$")
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -62,13 +65,47 @@ def _string_list(
 
 
 def validate_relative_path_text(value: str, label: str) -> str:
-    if not value or "\\" in value:
+    if (
+        not value
+        or value in {".", ".."}
+        or "\x00" in value
+        or "\\" in value
+        or value.startswith("/")
+        or value.endswith("/")
+        or "//" in value
+    ):
         raise SchemaError(f"{label} must be a non-empty POSIX-style relative path.")
     path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts or "." in path.parts:
+    if (
+        not path.parts
+        or path.is_absolute()
+        or ".." in path.parts
+        or "." in path.parts
+        or path.as_posix() != value
+    ):
         raise SchemaError(f"{label} must be a safe repository-relative path.")
-    if path.parts and ":" in path.parts[0]:
+    if ":" in path.parts[0]:
         raise SchemaError(f"{label} must not be drive-qualified.")
+    return value
+
+
+def validate_dot_path(value: str, label: str) -> str:
+    if not value or value.startswith(".") or value.endswith("."):
+        raise SchemaError(f"{label} must be a non-empty dot path.")
+    segments = value.split(".")
+    if any(DOT_PATH_SEGMENT.fullmatch(segment) is None for segment in segments):
+        raise SchemaError(
+            f"{label} must contain only mapping-key or canonical numeric-index "
+            "segments separated by single dots."
+        )
+    return value
+
+
+def validate_public_cli_path(value: str, label: str) -> str:
+    validate_relative_path_text(value, label)
+    path = PurePosixPath(value)
+    if len(path.parts) != 2 or path.parts[0] != "scripts" or path.suffix != ".py":
+        raise SchemaError(f"{label} must have the form scripts/<public-cli>.py.")
     return value
 
 
@@ -200,6 +237,30 @@ class PlaceholderSpec:
 
 
 @dataclass(frozen=True)
+class EnvironmentVariableSpec:
+    name: str
+    required: bool
+    sensitive: bool
+
+    @classmethod
+    def from_dict(cls, raw: Any, label: str) -> EnvironmentVariableSpec:
+        value = _mapping(raw, label)
+        _exact_keys(
+            value,
+            required={"name", "required", "sensitive"},
+            label=label,
+        )
+        name = _typed(value["name"], str, f"{label}.name")
+        if ENVIRONMENT_NAME.fullmatch(name) is None:
+            raise SchemaError(f"{label}.name must match {ENVIRONMENT_NAME.pattern}.")
+        return cls(
+            name=name,
+            required=_typed(value["required"], bool, f"{label}.required"),
+            sensitive=_typed(value["sensitive"], bool, f"{label}.sensitive"),
+        )
+
+
+@dataclass(frozen=True)
 class ActionSpec:
     id: str
     title: str
@@ -287,9 +348,17 @@ class CommandSpec:
     allowed_output_roots: tuple[str, ...]
     result_reader_id: str | None
     artifact_url: str | None
+    public_cli: str
+    environment: Mapping[str, EnvironmentVariableSpec]
 
     @classmethod
-    def from_dict(cls, raw: Any, label: str) -> CommandSpec:
+    def from_dict(
+        cls,
+        raw: Any,
+        label: str,
+        *,
+        approved_public_clis: frozenset[str],
+    ) -> CommandSpec:
         value = _mapping(raw, label)
         _exact_keys(
             value,
@@ -305,14 +374,27 @@ class CommandSpec:
                 "allowed_output_roots",
                 "result_reader_id",
                 "artifact_url",
+                "environment",
             },
             label=label,
         )
         prefix = _string_list(
             value["argv_prefix"], f"{label}.argv_prefix", allow_empty=False
         )
-        if prefix[0] != "$PYTHON":
-            raise SchemaError(f"{label}.argv_prefix must start with $PYTHON.")
+        if len(prefix) not in {2, 3} or prefix[0] != "$PYTHON":
+            raise SchemaError(
+                f"{label}.argv_prefix must be $PYTHON, optional -u, and one "
+                "approved scripts/<public-cli>.py path."
+            )
+        if len(prefix) == 3 and prefix[1] != "-u":
+            raise SchemaError(f"{label}.argv_prefix permits only the -u flag.")
+        public_cli = prefix[-1]
+        validate_public_cli_path(public_cli, f"{label}.argv_prefix script")
+        if public_cli not in approved_public_clis:
+            raise SchemaError(
+                f"{label}.argv_prefix script is not an approved public CLI: "
+                f"{public_cli}."
+            )
         actions_raw = value["actions"]
         if not isinstance(actions_raw, list) or not actions_raw:
             raise SchemaError(f"{label}.actions must be a non-empty list.")
@@ -339,6 +421,14 @@ class CommandSpec:
         artifact_url = value["artifact_url"]
         if artifact_url is not None and not isinstance(artifact_url, str):
             raise SchemaError(f"{label}.artifact_url must be a string or null.")
+        environment_raw = value["environment"]
+        if not isinstance(environment_raw, list):
+            raise SchemaError(f"{label}.environment must be a list.")
+        environment_items = [
+            EnvironmentVariableSpec.from_dict(item, f"{label}.environment[{index}]")
+            for index, item in enumerate(environment_raw)
+        ]
+        environment = _unique_by_name(environment_items, f"{label}.environment")
         return cls(
             id=_typed(value["id"], str, f"{label}.id"),
             title=_typed(value["title"], str, f"{label}.title"),
@@ -353,6 +443,8 @@ class CommandSpec:
             allowed_output_roots=outputs,
             result_reader_id=reader,
             artifact_url=artifact_url,
+            public_cli=public_cli,
+            environment=environment,
         )
 
 
@@ -371,9 +463,11 @@ class SummaryFileSpec:
         fields_raw = _mapping(value["fields"], f"{label}.fields")
         fields: dict[str, str] = {}
         for field_label, dot_path in fields_raw.items():
-            if not isinstance(dot_path, str) or not dot_path:
+            if not isinstance(dot_path, str):
                 raise SchemaError(f"{label}.fields values must be non-empty strings.")
-            fields[field_label] = dot_path
+            fields[field_label] = validate_dot_path(
+                dot_path, f"{label}.fields.{field_label}"
+            )
         return cls(path=path, fields=fields)
 
 
@@ -422,17 +516,19 @@ class ReaderSpec:
             SummaryFileSpec.from_dict(item, f"{label}.summary_files[{index}]")
             for index, item in enumerate(summaries_raw)
         )
+        success_markers = _safe_relative_list(
+            value["success_markers"], f"{label}.success_markers"
+        )
+        failure_markers = _safe_relative_list(
+            value["failure_markers"], f"{label}.failure_markers"
+        )
         return cls(
             id=_typed(value["id"], str, f"{label}.id"),
             title=_typed(value["title"], str, f"{label}.title"),
             artifact_roots=roots,
             discovery_glob=glob,
-            success_markers=_string_list(
-                value["success_markers"], f"{label}.success_markers"
-            ),
-            failure_markers=_string_list(
-                value["failure_markers"], f"{label}.failure_markers"
-            ),
+            success_markers=success_markers,
+            failure_markers=failure_markers,
             summary_files=summaries,
             csv_previews=_safe_relative_list(
                 value["csv_previews"], f"{label}.csv_previews"
@@ -447,7 +543,9 @@ class ReaderSpec:
 def parse_commands(raw: Any) -> Mapping[str, CommandSpec]:
     value = _mapping(raw, "command registry")
     _exact_keys(
-        value, required={"schema_version", "commands"}, label="command registry"
+        value,
+        required={"schema_version", "approved_public_clis", "commands"},
+        label="command registry",
     )
     version = _typed(value["schema_version"], int, "command registry.schema_version")
     if version != 1:
@@ -455,9 +553,29 @@ def parse_commands(raw: Any) -> Mapping[str, CommandSpec]:
     commands_raw = value["commands"]
     if not isinstance(commands_raw, list) or not commands_raw:
         raise SchemaError("command registry.commands must be a non-empty list.")
+    approved_values = _string_list(
+        value["approved_public_clis"],
+        "command registry.approved_public_clis",
+        allow_empty=False,
+    )
+    approved_public_clis: set[str] = set()
+    for index, public_cli in enumerate(approved_values):
+        validate_public_cli_path(
+            public_cli, f"command registry.approved_public_clis[{index}]"
+        )
+        if public_cli in approved_public_clis:
+            raise SchemaError(
+                "command registry.approved_public_clis contains duplicate path: "
+                f"{public_cli}."
+            )
+        approved_public_clis.add(public_cli)
     return _unique_by_id(
         [
-            CommandSpec.from_dict(item, f"command registry.commands[{index}]")
+            CommandSpec.from_dict(
+                item,
+                f"command registry.commands[{index}]",
+                approved_public_clis=frozenset(approved_public_clis),
+            )
             for index, item in enumerate(commands_raw)
         ],
         "command registry.commands",
@@ -488,6 +606,15 @@ def _unique_by_id(items: list[Any], label: str) -> Mapping[str, Any]:
         if item.id in result:
             raise SchemaError(f"{label} contains duplicate id: {item.id}.")
         result[item.id] = item
+    return result
+
+
+def _unique_by_name(items: list[Any], label: str) -> Mapping[str, Any]:
+    result: dict[str, Any] = {}
+    for item in items:
+        if item.name in result:
+            raise SchemaError(f"{label} contains duplicate name: {item.name}.")
+        result[item.name] = item
     return result
 
 
