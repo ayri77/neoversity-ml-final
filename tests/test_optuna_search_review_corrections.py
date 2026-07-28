@@ -29,10 +29,13 @@ from src.churn_ml.optuna_search_export import export_best_candidate
 from src.churn_ml.optuna_search_lifecycle import (
     _authoritative_dataset_identity,
     _verify_or_initialize_study,
+    portable_dataset_identity,
     run_optuna_study,
 )
 from src.churn_ml.optuna_search_objective import build_search_assignments
 from src.churn_ml.research_data import canonical_sha256
+from src.churn_ml.research_v2_data import load_research_v2_training_data
+from tests.optuna_auth_support import ensure_train_only_files
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +83,7 @@ class _DeterministicAdapter:
 @pytest.fixture(scope="module")
 def completed_search() -> Iterator[tuple[Path, Path]]:
     pytest.importorskip("optuna")
+    ensure_train_only_files()
     token = uuid.uuid4().hex
     operational = PROJECT_ROOT / "artifacts" / "optuna" / "review_tests" / token
     reports = PROJECT_ROOT / "artifacts" / "optuna_searches" / "review_tests" / token
@@ -112,14 +116,17 @@ def completed_search() -> Iterator[tuple[Path, Path]]:
             encoding="utf-8",
         )
         config = load_optuna_search_config(config_path, project_root=PROJECT_ROOT)
-        X, y = _synthetic_data()
+        data = load_research_v2_training_data(config.base_config)
         result = run_optuna_study(
             config,
-            X=X,
-            y=y,
-            dataset_identity={"schema_version": 1, "synthetic": True},
+            X=data.X,
+            y=data.y,
+            dataset_identity=portable_dataset_identity(
+                data.fingerprints,
+                project_root=PROJECT_ROOT,
+            ),
             assignments=build_search_assignments(
-                y,
+                data.y,
                 repeats=1,
                 folds=3,
                 assignment_seed=23,
@@ -472,9 +479,8 @@ def _mutate(root: Path, case: str) -> None:
         trials.loc[trials["state"] == "COMPLETE", "trial_number"].iloc[-1]
     )
     if case == "changed_probability":
-        predictions.loc[0, "probability"] = min(
-            1.0,
-            float(predictions.loc[0, "probability"]) + 0.1,
+        predictions.loc[0, "probability"] = (
+            0.0 if float(predictions.loc[0, "probability"]) > 0.5 else 1.0
         )
         predictions.to_csv(predictions_path, index=False)
     elif case == "duplicate_prediction":

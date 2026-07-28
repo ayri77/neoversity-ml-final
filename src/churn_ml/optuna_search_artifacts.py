@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import stat
 import tempfile
@@ -341,7 +342,16 @@ def _write_yaml(path: Path, payload: Mapping[str, Any]) -> None:
 
 def _write_csv(path: Path, frame: pd.DataFrame) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    frame.to_csv(temporary, index=False, lineterminator="\n")
+    serialized = frame.copy()
+    for name in serialized.columns:
+        if pd.api.types.is_float_dtype(serialized[name]):
+            serialized[name] = [
+                ""
+                if value is None or (isinstance(value, float) and math.isnan(value))
+                else format(float(value), ".17g")
+                for value in serialized[name].tolist()
+            ]
+    serialized.to_csv(temporary, index=False, lineterminator="\n")
     temporary.replace(path)
 
 

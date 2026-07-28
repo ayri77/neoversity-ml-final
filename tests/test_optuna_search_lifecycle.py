@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import uuid
 from copy import deepcopy
@@ -24,10 +25,13 @@ from src.churn_ml.optuna_search_export import (
 from src.churn_ml.optuna_search_lifecycle import (
     _authoritative_dataset_identity,
     _verify_or_initialize_study,
+    portable_dataset_identity,
     run_optuna_study,
 )
 from src.churn_ml.optuna_search_objective import build_search_assignments
 from src.churn_ml.research_data import canonical_sha256
+from src.churn_ml.research_v2_data import load_research_v2_training_data
+from tests.optuna_auth_support import ensure_train_only_files
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -124,23 +128,28 @@ def test_tiny_real_study_resume_artifacts_and_tamper_detection(
         increased = deepcopy(base_plan)
         increased["n_trials"] = 2
         _write_yaml(second_path, increased)
-        X, y = _synthetic_data()
+        ensure_train_only_files()
+        first_config = load_optuna_search_config(
+            first_path,
+            project_root=PROJECT_ROOT,
+        )
+        data = load_research_v2_training_data(first_config.base_config)
+        dataset_identity = portable_dataset_identity(
+            data.fingerprints,
+            project_root=PROJECT_ROOT,
+        )
         assignments = build_search_assignments(
-            y,
+            data.y,
             repeats=1,
             folds=3,
             assignment_seed=23,
         )
         adapter = get_candidate_adapter(adapter_id)
-        first_config = load_optuna_search_config(
-            first_path,
-            project_root=PROJECT_ROOT,
-        )
         first = run_optuna_study(
             first_config,
-            X=X,
-            y=y,
-            dataset_identity={"schema_version": 1, "synthetic": True},
+            X=data.X,
+            y=data.y,
+            dataset_identity=dataset_identity,
             assignments=assignments,
             adapter=adapter,
         )
@@ -155,9 +164,9 @@ def test_tiny_real_study_resume_artifacts_and_tamper_detection(
         with pytest.raises(OptunaSearchArtifactError, match="already exists"):
             run_optuna_study(
                 first_config,
-                X=X,
-                y=y,
-                dataset_identity={"schema_version": 1, "synthetic": True},
+                X=data.X,
+                y=data.y,
+                dataset_identity=dataset_identity,
                 assignments=assignments,
                 adapter=adapter,
             )
@@ -170,9 +179,9 @@ def test_tiny_real_study_resume_artifacts_and_tamper_detection(
         assert second_config.search_id != first_config.search_id
         second = run_optuna_study(
             second_config,
-            X=X,
-            y=y,
-            dataset_identity={"schema_version": 1, "synthetic": True},
+            X=data.X,
+            y=data.y,
+            dataset_identity=dataset_identity,
             assignments=assignments,
             adapter=adapter,
         )
@@ -243,14 +252,18 @@ def test_failed_trial_reason_is_persisted_and_later_trial_completes() -> None:
         )
         _write_yaml(config_path, payload)
         config = load_optuna_search_config(config_path, project_root=PROJECT_ROOT)
-        X, y = _synthetic_data()
+        ensure_train_only_files()
+        data = load_research_v2_training_data(config.base_config)
         result = run_optuna_study(
             config,
-            X=X,
-            y=y,
-            dataset_identity={"schema_version": 1, "synthetic": True},
+            X=data.X,
+            y=data.y,
+            dataset_identity=portable_dataset_identity(
+                data.fingerprints,
+                project_root=PROJECT_ROOT,
+            ),
             assignments=build_search_assignments(
-                y,
+                data.y,
                 repeats=1,
                 folds=3,
                 assignment_seed=23,
@@ -260,6 +273,9 @@ def test_failed_trial_reason_is_persisted_and_later_trial_completes() -> None:
         trials = pd.read_csv(result.search_dir / "trials.csv")
         assert trials["state"].tolist() == ["FAIL", "COMPLETE"]
         assert trials.loc[0, "failure_reason_code"] == "TRIAL_EXECUTION_FAILED"
+        evidence = json.loads(trials.loc[0, "failure_evidence_json"])
+        assert evidence["failure_class"] == "TRIAL_EXECUTION_FAILED"
+        assert evidence["failure_stage"] == "objective_execution"
         assert result.study_summary["state_counts"]["fail"] == 1
         assert result.study_summary["state_counts"]["complete"] == 1
     finally:
@@ -300,14 +316,19 @@ def test_running_sqlite_trial_is_recovered_after_interruption() -> None:
             direction="maximize",
             load_if_exists=True,
         )
-        X, y = _synthetic_data()
-        dataset_identity = _authoritative_dataset_identity(
-            X,
-            y,
-            {"schema_version": 1, "synthetic": True},
+        ensure_train_only_files()
+        data = load_research_v2_training_data(config.base_config)
+        dataset_identity = portable_dataset_identity(
+            data.fingerprints,
+            project_root=PROJECT_ROOT,
+        )
+        authoritative = _authoritative_dataset_identity(
+            data.X,
+            data.y,
+            dataset_identity,
         )
         assignments = build_search_assignments(
-            y,
+            data.y,
             repeats=1,
             folds=3,
             assignment_seed=23,
@@ -315,7 +336,7 @@ def test_running_sqlite_trial_is_recovered_after_interruption() -> None:
         _verify_or_initialize_study(
             study,
             config,
-            dataset_identity_sha256=canonical_sha256(dataset_identity),
+            dataset_identity_sha256=canonical_sha256(authoritative),
             assignment_identity_sha256=canonical_sha256(assignments.identity),
         )
         running = study.ask()
@@ -323,9 +344,9 @@ def test_running_sqlite_trial_is_recovered_after_interruption() -> None:
 
         result = run_optuna_study(
             config,
-            X=X,
-            y=y,
-            dataset_identity={"schema_version": 1, "synthetic": True},
+            X=data.X,
+            y=data.y,
+            dataset_identity=dataset_identity,
             assignments=assignments,
             adapter=_DeterministicAdapter(),
         )
@@ -333,6 +354,9 @@ def test_running_sqlite_trial_is_recovered_after_interruption() -> None:
         assert trials["trial_number"].tolist() == [0, 1]
         assert trials["state"].tolist() == ["FAIL", "COMPLETE"]
         assert trials.loc[0, "failure_reason_code"] == ("INTERRUPTED_PROCESS_RECOVERY")
+        evidence = json.loads(trials.loc[0, "failure_evidence_json"])
+        assert evidence["interrupted_recovery"] is True
+        assert evidence["failure_class"] == "INTERRUPTED_PROCESS_RECOVERY"
         assert result.study_summary["recovered_interrupted_trials"] == 1
     finally:
         shutil.rmtree(operational_root, ignore_errors=True)

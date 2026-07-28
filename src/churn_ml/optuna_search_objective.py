@@ -20,6 +20,14 @@ class OptunaSearchObjectiveError(RuntimeError):
 FitPredict = Callable[..., np.ndarray]
 
 
+def _canonical_float(value: float) -> float:
+    """Round-trip a finite float through the Optuna Search v1 CSV token."""
+    number = float(value)
+    if not np.isfinite(number):
+        raise OptunaSearchObjectiveError("Canonical float requires a finite value.")
+    return float(format(number, ".17g"))
+
+
 @dataclass(frozen=True)
 class SearchAssignments:
     folds: pd.DataFrame
@@ -236,6 +244,11 @@ def evaluate_trial(
         ["repeat", "row_position"],
         ignore_index=True,
     )
+    # Canonicalize probabilities before threshold/metric derivation so persisted
+    # CSV evidence round-trips to the exact floats used for authoritative metrics.
+    predictions["probability"] = [
+        _canonical_float(value) for value in predictions["probability"].tolist()
+    ]
     _validate_prediction_coverage(predictions, len(y), len(repeats), trial_number)
     fold_records: list[dict[str, Any]] = []
     for repeat in repeats:
@@ -266,11 +279,12 @@ def evaluate_trial(
                 selection["probability"].to_numpy(),
                 threshold_policy,
             )
-            labels = (scoring["probability"].to_numpy() >= threshold.threshold).astype(
+            selected_threshold = _canonical_float(threshold.threshold)
+            labels = (scoring["probability"].to_numpy() >= selected_threshold).astype(
                 "int8"
             )
             targets = scoring["target"].to_numpy(dtype="int8")
-            score = float(balanced_accuracy_score(targets, labels))
+            score = _canonical_float(float(balanced_accuracy_score(targets, labels)))
             true_negative = int(((targets == 0) & (labels == 0)).sum())
             false_positive = int(((targets == 0) & (labels == 1)).sum())
             false_negative = int(((targets == 1) & (labels == 0)).sum())
@@ -289,8 +303,8 @@ def evaluate_trial(
                     "threshold_source_folds": ",".join(
                         str(value) for value in sorted(allowed_sources)
                     ),
-                    "selected_threshold": threshold.threshold,
-                    "threshold_selection_balanced_accuracy": (
+                    "selected_threshold": selected_threshold,
+                    "threshold_selection_balanced_accuracy": _canonical_float(
                         threshold.balanced_accuracy
                     ),
                     "threshold_status": threshold.status,
@@ -303,7 +317,7 @@ def evaluate_trial(
                     "comparison": "greater_than_or_equal",
                 }
             )
-            predictions.loc[scoring.index, "selected_threshold"] = threshold.threshold
+            predictions.loc[scoring.index, "selected_threshold"] = selected_threshold
             predictions.loc[scoring.index, "prediction"] = labels
     predictions["prediction"] = predictions["prediction"].astype("int8")
     fold_metrics = pd.DataFrame(fold_records).sort_values(
@@ -323,6 +337,10 @@ def evaluate_trial(
             candidate_identity_sha256=candidate_identity_sha256,
         )
     )
+    repeat_metrics["balanced_accuracy"] = [
+        _canonical_float(value)
+        for value in repeat_metrics["balanced_accuracy"].tolist()
+    ]
     repeat_metrics = repeat_metrics[
         [
             "trial_number",
@@ -334,7 +352,7 @@ def evaluate_trial(
             "balanced_accuracy",
         ]
     ]
-    objective = float(repeat_metrics["balanced_accuracy"].mean())
+    objective = _canonical_float(float(repeat_metrics["balanced_accuracy"].mean()))
     coverage = {
         "schema_version": 1,
         "key_columns": ["trial_number", "repeat", "row_position"],

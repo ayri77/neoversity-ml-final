@@ -18,6 +18,10 @@ from src.churn_ml.optuna_search_config import (
     PLAN_KEYS,
     load_search_space,
 )
+from src.churn_ml.optuna_search_lifecycle import (
+    derive_failure_reason_code,
+    reconstruct_authoritative_dataset_identity_from_plan,
+)
 from src.churn_ml.optuna_search_objective import build_search_assignments
 from src.churn_ml.optuna_search_resume import (
     OptunaSearchResumeIdentityError,
@@ -42,11 +46,13 @@ INTEGER_PATTERN = re.compile(r"^(0|[1-9][0-9]*)$")
 TRIAL_STATES = {"COMPLETE", "FAIL"}
 FAILURE_REASON_CODES = {
     "ADAPTER_CONTRACT_OR_FIT_FAILED",
+    "CONFIGURATION_SOURCE_RUNTIME_AUTHENTICATION_FAILED",
     "INTERRUPTED_BY_USER",
     "INTERRUPTED_PROCESS_RECOVERY",
     "LEAKAGE_OR_OBJECTIVE_CONTRACT_FAILED",
     "TRIAL_EXECUTION_FAILED",
 }
+REQUIRED_METRIC_NAME = "balanced_accuracy"
 FORBIDDEN_TEXT = (
     "x_test",
     "sample_submission",
@@ -71,6 +77,7 @@ TRIAL_COLUMNS = [
     "prediction_key_coverage_json",
     "failure_reason_code",
     "failure_message",
+    "failure_evidence_json",
 ]
 PREDICTION_COLUMNS = [
     "trial_number",
@@ -253,8 +260,9 @@ def validate_completed_search_semantics(root: Path, *, project_root: Path) -> No
     )
     dataset_identity, y = _validate_dataset_identity(
         root / "dataset_identity.json",
-        predictions,
-        trials,
+        predictions=predictions,
+        base_config=base,
+        project_root=project_root,
     )
     if canonical_sha256(dataset_identity) != search_identity["dataset_identity_sha256"]:
         _fail("Dataset identity is not linked to the search identity.")
@@ -358,8 +366,13 @@ def _load_trials(path: Path, *, adapter_id: str) -> list[dict[str, Any]]:
                 item["prediction_key_coverage_json"],
                 "prediction_key_coverage_json",
             )
-            if item["failure_reason_code"] or item["failure_message"]:
+            if (
+                item["failure_reason_code"]
+                or item["failure_message"]
+                or item["failure_evidence_json"] not in {"", "null"}
+            ):
                 _fail("Completed trial carries failure evidence.")
+            failure_evidence = None
         else:
             objective = None
             candidate_identity = None
@@ -380,16 +393,40 @@ def _load_trials(path: Path, *, adapter_id: str) -> list[dict[str, Any]]:
                 _fail("Failed trial reason code is invalid.")
             if not item["failure_message"]:
                 _fail("Failed trial must carry an exact failure message.")
+            if item["failure_evidence_json"] in {"", "null"}:
+                _fail("Failed trial must carry structured failure evidence.")
+            try:
+                failure_evidence = json.loads(item["failure_evidence_json"])
+            except json.JSONDecodeError as error:
+                raise OptunaSearchSemanticError(
+                    "Failed trial failure evidence is malformed."
+                ) from error
+            if not isinstance(failure_evidence, dict):
+                _fail("Failed trial failure evidence must be a mapping.")
+            try:
+                derived = derive_failure_reason_code(failure_evidence)
+            except Exception as error:
+                raise OptunaSearchSemanticError(
+                    f"Failed trial failure evidence is invalid: {error}"
+                ) from error
+            if failure_evidence.get("trial_number") != number:
+                _fail("Failure evidence trial number differs.")
+            if derived != item["failure_reason_code"]:
+                _fail("Persisted failure reason code differs from derived evidence.")
         trials.append(
             {
                 "trial_number": number,
                 "state": state,
                 "objective": objective,
+                "objective_token": item["objective"] if state == "COMPLETE" else None,
                 "optuna_parameters": optuna_parameters,
                 "resolved_parameters": resolved_parameters,
                 "coverage": coverage,
                 "candidate_identity_sha256": candidate_identity,
                 "failure_reason_code": item["failure_reason_code"] or None,
+                "failure_evidence": failure_evidence,
+                "started_at": item["started_at"],
+                "finished_at": item["finished_at"],
             }
         )
     numbers = [item["trial_number"] for item in trials]
@@ -458,7 +495,9 @@ def _load_metrics(path: Path, *, adapter_id: str) -> pd.DataFrame:
                 item["balanced_accuracy"],
                 "balanced_accuracy",
             ),
+            "balanced_accuracy_token": item["balanced_accuracy"],
             "record_type": record_type,
+            "metric_name": REQUIRED_METRIC_NAME,
         }
         if not 0.0 <= common["balanced_accuracy"] <= 1.0:
             _fail("Balanced Accuracy must be in [0, 1].")
@@ -483,10 +522,14 @@ def _load_metrics(path: Path, *, adapter_id: str) -> pd.DataFrame:
                     item["selected_threshold"],
                     label="selected_threshold",
                 ),
+                "selected_threshold_token": item["selected_threshold"],
                 "threshold_selection_balanced_accuracy": _csv_float(
                     item["threshold_selection_balanced_accuracy"],
                     "threshold_selection_balanced_accuracy",
                 ),
+                "threshold_selection_balanced_accuracy_token": item[
+                    "threshold_selection_balanced_accuracy"
+                ],
                 "threshold_status": item["threshold_status"],
                 "threshold_degenerate": _csv_bool(
                     item["threshold_degenerate"],
@@ -520,99 +563,41 @@ def _load_metrics(path: Path, *, adapter_id: str) -> pd.DataFrame:
                 _fail("Repeat metric contains fold-only fields.")
             record = {
                 **common,
+                "fold": None,
                 "fold_count": _csv_int(item["fold_count"], "fold_count"),
             }
         records.append(record)
     frame = pd.DataFrame(records)
-    if (
-        frame.empty
-        or frame.duplicated(
-            ["trial_number", "record_type", "repeat", "fold"],
-            keep=False,
-        ).any()
-    ):
-        _fail("Metric evidence is empty or contains duplicate keys.")
+    if frame.empty:
+        _fail("Metric evidence is empty.")
+    key_columns = ["trial_number", "record_type", "repeat", "fold", "metric_name"]
+    if frame.duplicated(key_columns, keep=False).any():
+        _fail("Metric evidence contains duplicate keys.")
     return frame
 
 
 def _validate_dataset_identity(
     path: Path,
+    *,
     predictions: pd.DataFrame,
-    trials: list[dict[str, Any]],
+    base_config: Any,
+    project_root: Path,
 ) -> tuple[dict[str, Any], pd.Series]:
     identity = _load_json(path)
-    _exact_keys(
-        identity,
-        {
-            "schema_version",
-            "provided_identity",
-            "provided_identity_sha256",
-            "training_data",
-            "identity_sha256",
-        },
-        "dataset identity",
+    expected_identity, trusted_y, _trusted_x = (
+        reconstruct_authoritative_dataset_identity_from_plan(
+            base_config,
+            project_root=project_root,
+        )
     )
-    if _required_int(identity["schema_version"], "schema_version") != 1:
-        _fail("Dataset identity schema version differs.")
-    provided = identity["provided_identity"]
+    if identity != expected_identity:
+        _fail("Persisted dataset identity differs from plan/train-only reconstruction.")
+    _reject_forbidden_paths(identity["provided_identity"])
     training = identity["training_data"]
-    if not isinstance(provided, dict) or not isinstance(training, dict):
-        _fail("Dataset identity components must be mappings.")
-    _reject_forbidden_paths(provided)
-    if identity["provided_identity_sha256"] != canonical_sha256(provided) or identity[
-        "identity_sha256"
-    ] != canonical_sha256(
-        {
-            "schema_version": 1,
-            "provided_identity": provided,
-            "provided_identity_sha256": identity["provided_identity_sha256"],
-            "training_data": training,
-        }
-    ):
-        _fail("Dataset identity hash differs.")
-    _exact_keys(
-        training,
-        {
-            "row_count",
-            "row_position_identity_sha256",
-            "feature_schema",
-            "target",
-        },
-        "training data identity",
-    )
     row_count = _required_int(training["row_count"], "row_count")
-    if row_count <= 0:
-        _fail("Training row count must be positive.")
-    if training["row_position_identity_sha256"] != canonical_sha256(
-        list(range(row_count))
-    ):
-        _fail("Training row-position identity differs.")
-    target = training["target"]
-    _exact_keys(
-        target,
-        {
-            "name",
-            "dtype",
-            "negative_count",
-            "positive_count",
-            "values_sha256",
-        },
-        "target identity",
-    )
-    if target["name"] is not None and type(target["name"]) is not str:
-        _fail("Target name must be null or a string.")
-    dtype = _required_string(target["dtype"], "target dtype")
-    complete_number = next(
-        item["trial_number"] for item in trials if item["state"] == "COMPLETE"
-    )
-    source = predictions.loc[
-        (predictions["trial_number"] == complete_number) & (predictions["repeat"] == 1)
-    ].sort_values("row_position")
-    if len(source) != row_count or source["row_position"].tolist() != list(
-        range(row_count)
-    ):
-        _fail("Predictions cannot reconstruct the authorized target row universe.")
-    targets = source["target"].astype("int64").tolist()
+    if len(trusted_y) != row_count:
+        _fail("Trusted target length differs from training row count.")
+    targets = [int(value) for value in trusted_y.tolist()]
     for _, repeat_frame in predictions.groupby(
         ["trial_number", "repeat"],
         sort=True,
@@ -622,25 +607,94 @@ def _validate_dataset_identity(
             ordered["row_position"].tolist() != list(range(row_count))
             or ordered["target"].astype("int64").tolist() != targets
         ):
-            _fail("Target identity differs across prediction evidence.")
-    if (
-        _required_int(target["negative_count"], "negative_count") != targets.count(0)
-        or _required_int(target["positive_count"], "positive_count") != targets.count(1)
-        or target["values_sha256"]
-        != canonical_sha256(
-            {
-                "name": target["name"],
-                "dtype": dtype,
-                "values": targets,
-            }
-        )
-    ):
-        _fail("Persisted target identity differs from prediction targets.")
+            _fail("Prediction targets differ from trusted train-only target identity.")
+    return identity, trusted_y.copy()
+
+
+def _expected_metric_key_universe(
+    *,
+    complete_numbers: set[int],
+    repeats: int,
+    folds: int,
+) -> set[tuple[int, str, int, int | None, str]]:
+    keys: set[tuple[int, str, int, int | None, str]] = set()
+    for trial_number in complete_numbers:
+        for repeat in range(1, repeats + 1):
+            keys.add(
+                (
+                    trial_number,
+                    "repeat",
+                    repeat,
+                    None,
+                    REQUIRED_METRIC_NAME,
+                )
+            )
+            for fold in range(1, folds + 1):
+                keys.add(
+                    (
+                        trial_number,
+                        "fold",
+                        repeat,
+                        fold,
+                        REQUIRED_METRIC_NAME,
+                    )
+                )
+    return keys
+
+
+def _metric_key_tuple(row: Mapping[str, Any]) -> tuple[int, str, int, int | None, str]:
+    return (
+        int(row["trial_number"]),
+        str(row["record_type"]),
+        int(row["repeat"]),
+        _optional_fold_key(row["fold"]),
+        REQUIRED_METRIC_NAME,
+    )
+
+
+def _optional_fold_key(fold: Any) -> int | None:
+    if fold is None or fold is pd.NA:
+        return None
     try:
-        y = pd.Series(targets, name=target["name"], dtype=dtype)
-    except (TypeError, ValueError) as error:
-        raise OptunaSearchSemanticError("Target dtype is invalid.") from error
-    return identity, y
+        if bool(pd.isna(fold)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(fold, bool):
+        _fail("Metric fold key is invalid.")
+    if isinstance(fold, (int, np.integer)):
+        value = int(fold)
+    elif isinstance(fold, (float, np.floating)):
+        number = float(fold)
+        if math.isnan(number):
+            return None
+        if not number.is_integer():
+            _fail("Metric fold key is invalid.")
+        value = int(number)
+    else:
+        _fail("Metric fold key is invalid.")
+    if value < 0:
+        _fail("Metric fold key is invalid.")
+    return value
+
+
+def _assert_exact_metric_universe(
+    metrics: pd.DataFrame,
+    *,
+    complete_numbers: set[int],
+    repeats: int,
+    folds: int,
+) -> None:
+    expected = _expected_metric_key_universe(
+        complete_numbers=complete_numbers,
+        repeats=repeats,
+        folds=folds,
+    )
+    actual = {_metric_key_tuple(row) for row in metrics.to_dict("records")}
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        _fail(f"Metric key universe differs; missing={missing[:5]}, extra={extra[:5]}.")
 
 
 def _reconstruct_trials(
@@ -666,8 +720,21 @@ def _reconstruct_trials(
         )
     repeats = _required_int(resolved["repeats"], "repeats")
     folds = _required_int(resolved["folds"], "folds")
+    if resolved["metric"] != REQUIRED_METRIC_NAME:
+        _fail("Resolved metric schema is not the v1 Balanced Accuracy contract.")
+    _assert_exact_metric_universe(
+        metrics,
+        complete_numbers=complete_numbers,
+        repeats=repeats,
+        folds=folds,
+    )
     expected_prediction_rows = row_count * repeats
     objectives: dict[int, float] = {}
+    threshold_policy_identity = {
+        "id": resolved["threshold_policy"],
+        "metric": resolved["metric"],
+        **resolved["threshold_grid"],
+    }
     for trial in complete:
         number = trial["trial_number"]
         expected_parameters, expected_optuna = _expected_parameters(
@@ -758,13 +825,16 @@ def _reconstruct_trials(
                         **resolved["threshold_grid"],
                     },
                 )
+                selected_threshold = _canonical_csv_float(threshold.threshold)
                 labels = (
-                    scoring["probability"].to_numpy(dtype=float) >= threshold.threshold
+                    scoring["probability"].to_numpy(dtype=float) >= selected_threshold
                 ).astype("int8")
                 targets = scoring["target"].to_numpy(dtype="int8")
-                score = float(balanced_accuracy_score(targets, labels))
+                score = _canonical_csv_float(
+                    float(balanced_accuracy_score(targets, labels))
+                )
                 expected_prediction = scoring.assign(
-                    expected_threshold=threshold.threshold,
+                    expected_threshold=selected_threshold,
                     expected_prediction=labels,
                 )
                 if (
@@ -787,6 +857,13 @@ def _reconstruct_trials(
                 if len(fold_metric) != 1:
                     _fail("Fold metric coverage differs.")
                 item = fold_metric.iloc[0]
+                if (
+                    item["adapter_id"] != adapter_id
+                    or item["candidate_identity_sha256"] != candidate_identity
+                    or item["comparison"] != threshold_policy_identity["comparison"]
+                    or item["metric_name"] != REQUIRED_METRIC_NAME
+                ):
+                    _fail(f"Trial {number} fold metric identity bindings differ.")
                 expected_values = {
                     "repeat_seed": int(scoring["repeat_seed"].iloc[0]),
                     "training_rows": row_count - len(scoring),
@@ -795,8 +872,8 @@ def _reconstruct_trials(
                     "threshold_source_folds": ",".join(
                         str(value) for value in sorted(allowed_sources)
                     ),
-                    "selected_threshold": threshold.threshold,
-                    "threshold_selection_balanced_accuracy": (
+                    "selected_threshold": selected_threshold,
+                    "threshold_selection_balanced_accuracy": _canonical_csv_float(
                         threshold.balanced_accuracy
                     ),
                     "threshold_status": threshold.status,
@@ -809,7 +886,9 @@ def _reconstruct_trials(
                     "comparison": "greater_than_or_equal",
                 }
                 for name, value in expected_values.items():
-                    if not _semantic_equal(item[name], value):
+                    if not _exact_persisted_equal(
+                        item[name], value, row=item, field=name
+                    ):
                         _fail(
                             f"Trial {number} fold {repeat}/{fold} metric {name} differs: "
                             f"persisted={item[name]!r}, reconstructed={value!r}."
@@ -827,6 +906,10 @@ def _reconstruct_trials(
             fold_count=("balanced_accuracy", "count"),
             balanced_accuracy=("balanced_accuracy", "mean"),
         )
+        repeat_frame["balanced_accuracy"] = [
+            _canonical_csv_float(value)
+            for value in repeat_frame["balanced_accuracy"].tolist()
+        ]
         trial_repeat_metrics = metrics.loc[
             (metrics["trial_number"] == number) & (metrics["record_type"] == "repeat")
         ].sort_values("repeat")
@@ -837,11 +920,28 @@ def _reconstruct_trials(
             trial_repeat_metrics.iterrows(),
             strict=True,
         ):
+            if (
+                actual["adapter_id"] != adapter_id
+                or actual["candidate_identity_sha256"] != candidate_identity
+                or actual["metric_name"] != REQUIRED_METRIC_NAME
+            ):
+                _fail(f"Trial {number} repeat metric identity bindings differ.")
             for name, value in expected.items():
-                if not _semantic_equal(actual[name], value):
+                if not _exact_persisted_equal(
+                    actual[name],
+                    value,
+                    row=actual,
+                    field=name,
+                ):
                     _fail(f"Trial {number} repeat aggregate {name} differs.")
-        objective = float(repeat_frame["balanced_accuracy"].mean())
-        if not _semantic_equal(trial["objective"], objective):
+        objective = _canonical_csv_float(
+            float(repeat_frame["balanced_accuracy"].mean())
+        )
+        if not _exact_persisted_equal(
+            trial["objective"],
+            objective,
+            token=trial.get("objective_token"),
+        ):
             _fail(f"Trial {number} final objective differs.")
         objectives[number] = objective
     return objectives
@@ -884,7 +984,7 @@ def _validate_best_and_candidate(
         or best["trial_number"] != best_number
         or type(best["objective"]) is not float
         or not math.isfinite(best["objective"])
-        or not _semantic_equal(best["objective"], best_objective)
+        or not _exact_persisted_equal(best["objective"], best_objective)
         or best["direction"] != "maximize"
         or best["tie_break"] != "lowest_trial_number"
         or best["resolved_parameters"] != winner["resolved_parameters"]
@@ -1004,7 +1104,7 @@ def _validate_study_summary(
         or study["recovered_interrupted_trials"] != recovered
         or study["best_trial_number"] != best_number
         or type(study["best_objective"]) is not float
-        or not _semantic_equal(study["best_objective"], best_objective)
+        or not _exact_persisted_equal(study["best_objective"], best_objective)
         or not _safe_storage_path(storage)
         or study["filesystem_report_authoritative"] is not True
         or study["optuna_storage_role"] != "resumable_operational_state_only"
@@ -1414,18 +1514,47 @@ def _required_int(value: Any, label: str) -> int:
     return value
 
 
-def _semantic_equal(actual: Any, expected: Any) -> bool:
-    if isinstance(actual, (float, np.floating)) and isinstance(
+def _exact_persisted_equal(
+    actual: Any,
+    expected: Any,
+    *,
+    row: Mapping[str, Any] | None = None,
+    field: str | None = None,
+    token: str | None = None,
+) -> bool:
+    if isinstance(actual, (float, np.floating)) or isinstance(
         expected,
         (float, np.floating),
     ):
-        return math.isclose(
-            float(actual),
-            float(expected),
-            rel_tol=0.0,
-            abs_tol=1.0e-15,
-        )
+        expected_canonical = _canonical_csv_float(float(expected))
+        if token is not None:
+            return token == format(expected_canonical, ".17g")
+        if row is not None and field is not None:
+            token_field = f"{field}_token"
+            if token_field in row and row[token_field] is not None:
+                return str(row[token_field]) == format(expected_canonical, ".17g")
+        return _canonical_csv_float(float(actual)) == expected_canonical
+    if isinstance(actual, (np.integer,)):
+        actual = int(actual)
+    if isinstance(expected, (np.integer,)):
+        expected = int(expected)
+    if isinstance(actual, (np.bool_,)):
+        actual = bool(actual)
+    if isinstance(expected, (np.bool_,)):
+        expected = bool(expected)
     return actual == expected
+
+
+def _canonical_csv_float(value: float) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        _fail("Canonical float token requires a finite value.")
+    return float(format(number, ".17g"))
+
+
+def _canonical_float_token(value: float) -> str:
+    """Exact Optuna Search v1 CSV float token."""
+    return format(_canonical_csv_float(value), ".17g")
 
 
 def _required_string(value: Any, label: str) -> str:
