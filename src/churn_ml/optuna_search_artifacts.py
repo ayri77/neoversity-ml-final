@@ -205,12 +205,13 @@ def write_completed_search(
                 )
             ),
             report_manifest_identity_sha256=str(manifest["manifest_sha256"]),
+            persist_epochs=False,
         )
         _write_json(
             staging / "lifecycle_authority_ledger.json",
             authority_ledger,
         )
-        final_ledger = authority_ledger["final_ledger"]
+        epoch_ledger = authority_ledger["epoch_ledger"]
         _write_json(
             staging / "_SUCCESS",
             {
@@ -220,12 +221,14 @@ def write_completed_search(
                 ],
                 "search_id": config.search_id,
                 "manifest_sha256": manifest["manifest_sha256"],
-                "final_lifecycle_payload_identity_sha256": final_ledger[
+                "final_lifecycle_payload_identity_sha256": epoch_ledger[
                     "payload_identity_sha256"
                 ],
-                "final_lifecycle_signature_sha256": final_ledger["signature_sha256"],
+                "final_lifecycle_signature_sha256": epoch_ledger["signature_sha256"],
+                "epoch_number": authority_ledger["epoch_number"],
             },
         )
+        lifecycle_authority.persist_epoch_history()
         _validate_tree(staging, require_success=True)
         staging.rename(target)
         return target
@@ -361,6 +364,7 @@ def _validate_tree(root: Path, *, require_success: bool) -> None:
             "manifest_sha256",
             "final_lifecycle_payload_identity_sha256",
             "final_lifecycle_signature_sha256",
+            "epoch_number",
         }:
             raise OptunaSearchArtifactError("Success marker schema differs.")
         identity = _load_json(root / "search_identity.json")
@@ -369,6 +373,8 @@ def _validate_tree(root: Path, *, require_success: bool) -> None:
             or success["authority_schema_version"] != 1
             or success["search_id"] != identity["search_id"]
             or success["manifest_sha256"] != manifest["manifest_sha256"]
+            or type(success["epoch_number"]) is not int
+            or success["epoch_number"] < 0
         ):
             raise OptunaSearchArtifactError("Success marker identity differs.")
         _validate_lifecycle_authority(root, manifest=manifest, success=success)
@@ -392,16 +398,20 @@ def _validate_lifecycle_authority(
     search_identity = _load_json(root / "search_identity.json")
     authority_report = _load_json(root / "lifecycle_authority.json")
     authority_ledger = _load_json(root / "lifecycle_authority_ledger.json")
-    final_ledger = authority_ledger.get("final_ledger")
-    if not isinstance(final_ledger, dict):
+    epoch_ledger = authority_ledger.get("epoch_ledger")
+    if not isinstance(epoch_ledger, dict):
         raise OptunaSearchArtifactError("Final lifecycle ledger is malformed.")
-    if success["final_lifecycle_payload_identity_sha256"] != final_ledger.get(
+    if success["final_lifecycle_payload_identity_sha256"] != epoch_ledger.get(
         "payload_identity_sha256"
-    ) or success["final_lifecycle_signature_sha256"] != final_ledger.get(
+    ) or success["final_lifecycle_signature_sha256"] != epoch_ledger.get(
         "signature_sha256"
     ):
         raise OptunaSearchArtifactError(
             "Success marker differs from final lifecycle authority."
+        )
+    if success.get("epoch_number") != authority_ledger.get("epoch_number"):
+        raise OptunaSearchArtifactError(
+            "Success marker epoch differs from lifecycle authority."
         )
     storage_value = study_summary.get("storage")
     if type(storage_value) is not str:
@@ -430,21 +440,14 @@ def _validate_lifecycle_authority(
         for item in trial_state_universe
         if item["state"] == "COMPLETE"
     ]
-    failed = [
-        item["trial_number"] for item in trial_state_universe if item["state"] == "FAIL"
-    ]
+    del completed
     interrupted = study_summary.get("interrupted_recovery_trial_numbers")
     if not isinstance(interrupted, list):
         raise OptunaSearchArtifactError(
             "Interrupted recovery lifecycle summary is malformed."
         )
     expected = {
-        "trial_state_universe": trial_state_universe,
-        "completed_trial_numbers": completed,
-        "failed_trial_numbers": failed,
-        "interrupted_trial_numbers": interrupted,
-        "interrupted_recovery_trial_numbers": interrupted,
-        "best_trial_number": study_summary.get("best_trial_number"),
+        "ending_trial_universe": trial_state_universe,
         "report_search_identity_sha256": search_identity.get("sha256"),
         "study_summary_identity_sha256": canonical_sha256(study_summary),
         "metric_prediction_evidence_identity_sha256": (
@@ -453,7 +456,7 @@ def _validate_lifecycle_authority(
                 trial_predictions_bytes=(root / "trial_predictions.csv").read_bytes(),
             )
         ),
-        "report_manifest_identity_sha256": manifest["manifest_sha256"],
+        "pre_terminal_manifest_identity_sha256": manifest["manifest_sha256"],
     }
     try:
         key = load_lifecycle_authority_key(

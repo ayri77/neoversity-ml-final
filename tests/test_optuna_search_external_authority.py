@@ -20,14 +20,16 @@ import pytest
 from src.churn_ml.optuna_search_artifacts import load_optuna_search_result
 from src.churn_ml.optuna_search_authority import (
     AUTHORITY_KEY_FILE_ENV,
+    EPOCH_DOMAIN,
+    EPOCHS_ATTR,
     EVENT_DOMAIN,
     EVENT_PAYLOAD_KEYS,
     INITIAL_DOMAIN,
-    LEDGER_DOMAIN,
     KEY_IDENTIFIER_DOMAIN,
     LifecycleAuthorityKey,
     LifecycleAuthorityRecorder,
     OptunaLifecycleAuthorityError,
+    _epoch_payload_identity,
     _event_payload_identity,
     _signed_statement,
     authority_bound_study_identity,
@@ -382,15 +384,11 @@ def test_delete_failure_and_claim_all_completed_is_rejected() -> None:
         )
         ledger_path = report / "lifecycle_authority_ledger.json"
         ledger_artifact = json.loads(ledger_path.read_text(encoding="utf-8"))
-        ledger = ledger_artifact["final_ledger"]["payload"]
-        ledger["trial_state_universe"] = [
+        ledger = ledger_artifact["epoch_ledger"]["payload"]
+        ledger["ending_trial_universe"] = [
             {"trial_number": int(row["trial_number"]), "state": "COMPLETE"}
             for row in rows
         ]
-        ledger["completed_trial_numbers"] = [int(row["trial_number"]) for row in rows]
-        ledger["failed_trial_numbers"] = []
-        ledger["interrupted_trial_numbers"] = []
-        ledger["interrupted_recovery_trial_numbers"] = []
         ledger_path.write_text(
             json.dumps(ledger_artifact, indent=2) + "\n",
             encoding="utf-8",
@@ -407,7 +405,7 @@ def test_delete_failure_and_claim_all_completed_is_rejected() -> None:
             )
             connection.execute(
                 "UPDATE study_user_attributes SET value_json = ? WHERE key = ?",
-                (json.dumps(ledger_artifact), "lifecycle_authority_final_ledger"),
+                (json.dumps([ledger_artifact["epoch_ledger"]]), EPOCHS_ATTR),
             )
             connection.commit()
         reauthenticate(report)
@@ -430,7 +428,7 @@ def test_final_statement_or_fingerprint_replacement_is_rejected(
     if case == "replace_final_ledger":
         path = corrupted / "lifecycle_authority_ledger.json"
         ledger = json.loads(path.read_text(encoding="utf-8"))
-        ledger["final_ledger"]["payload"]["best_trial_number"] = None
+        ledger["epoch_ledger"]["payload"]["configured_trial_target"] = 99
         path.write_text(json.dumps(ledger, indent=2) + "\n", encoding="utf-8")
     else:
         path = corrupted / "lifecycle_authority.json"
@@ -491,18 +489,16 @@ def _attacker_resign(root: Path, attacker_key: LifecycleAuthorityKey) -> None:
     report["events"] = resigned_events[:-1]
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     ledger_artifact["report_finalized_event"] = resigned_events[-1]
-    ledger_payload = ledger_artifact["final_ledger"]["payload"]
-    ledger_payload["authority_key_fingerprint"] = attacker_key.fingerprint
-    ledger_payload["authority_bound_study_identity_sha256"] = initial_payload[
-        "authority_bound_study_identity_sha256"
-    ]
-    ledger_payload["ordered_event_signatures"] = [
-        event["signature_sha256"] for event in resigned_events
-    ]
-    ledger_artifact["final_ledger"] = _signed_statement(
+    ledger_payload = ledger_artifact["epoch_ledger"]["payload"]
+    ledger_payload["event_signature_end_count"] = len(resigned_events)
+    ledger_payload["epoch_close_event_sequence"] = len(resigned_events)
+    ledger_payload["epoch_payload_identity_sha256"] = _epoch_payload_identity(
+        ledger_payload
+    )
+    ledger_artifact["epoch_ledger"] = _signed_statement(
         ledger_payload,
         key=attacker_key,
-        domain=LEDGER_DOMAIN,
+        domain=EPOCH_DOMAIN,
     )
     ledger_path.write_text(
         json.dumps(ledger_artifact, indent=2) + "\n",

@@ -360,7 +360,7 @@ def reauthenticate(root: Path) -> None:
     identity = json.loads((root / "search_identity.json").read_text(encoding="utf-8"))
     ledger = json.loads(
         (root / "lifecycle_authority_ledger.json").read_text(encoding="utf-8")
-    )["final_ledger"]
+    )["epoch_ledger"]
     _write_json(
         root / "_SUCCESS",
         {
@@ -372,6 +372,9 @@ def reauthenticate(root: Path) -> None:
                 "payload_identity_sha256"
             ],
             "final_lifecycle_signature_sha256": ledger["signature_sha256"],
+            "epoch_number": json.loads(
+                (root / "lifecycle_authority_ledger.json").read_text(encoding="utf-8")
+            )["epoch_number"],
         },
     )
 

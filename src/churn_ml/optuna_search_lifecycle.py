@@ -288,6 +288,14 @@ def run_optuna_study(
             "Requested n_trials is below the study's previous explicit target."
         )
     if target > previous_target:
+        if (
+            previous_target
+            and authority.events
+            and authority.events[-1]["payload"]["event_type"] == "report_finalized"
+        ):
+            authority.extend_configured_trial_target(target)
+        study.set_user_attr("maximum_requested_n_trials", target)
+    elif previous_target == 0:
         study.set_user_attr("maximum_requested_n_trials", target)
     existing = len(study.get_trials(deepcopy=False))
     if existing > target:
@@ -532,12 +540,16 @@ def run_optuna_study(
         for trial in sorted(trials, key=lambda item: item.number)
         if trial.user_attrs.get("failure_reason_code") == "INTERRUPTED_PROCESS_RECOVERY"
     ]
-    authority.append_event(
-        event_type="study_completed",
-        trial_number=None,
-        from_state="STUDY_CREATED",
-        to_state="STUDY_COMPLETED",
+    last_event_type = (
+        authority.events[-1]["payload"]["event_type"] if authority.events else None
     )
+    if last_event_type not in {"study_completed", "report_finalized"}:
+        authority.append_event(
+            event_type="study_completed",
+            trial_number=None,
+            from_state="STUDY_CREATED",
+            to_state="STUDY_COMPLETED",
+        )
     authority.validate_study_trial_states()
     authority_initial = authority.initial_statement["payload"]
     study_summary = {
@@ -1118,10 +1130,18 @@ def _recover_interrupted_trials(
             trial_state.FAIL,
         )
         if changed:
+            signed_states = {
+                int(event["payload"]["trial_number"]): str(event["payload"]["to_state"])
+                for event in authority.events
+                if event["payload"]["trial_number"] is not None
+            }
+            from_state = signed_states.get(int(trial.number), "RUNNING")
+            if from_state not in {"RUNNING", "ALLOCATED"}:
+                from_state = "RUNNING"
             authority.append_event(
                 event_type="interrupted_running_trial_recovered",
                 trial_number=int(trial.number),
-                from_state="RUNNING",
+                from_state=from_state,
                 to_state="FAIL",
                 failure_stage=str(evidence["failure_stage"]),
                 failure_reason_code=derive_failure_reason_code(evidence),

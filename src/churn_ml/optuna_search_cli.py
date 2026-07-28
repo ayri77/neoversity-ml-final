@@ -10,6 +10,7 @@ from typing import Any, Iterator, Never
 
 from src.churn_ml.experiment_v2 import get_candidate_adapter
 from src.churn_ml.optuna_search_authority import (
+    AuthorityKeyInitError,
     OptunaLifecycleAuthorityError,
     initialize_lifecycle_authority_key,
 )
@@ -89,11 +90,15 @@ def execute(args: argparse.Namespace) -> int:
     config = None
     try:
         if args.command == "authority-init":
-            fingerprint = initialize_lifecycle_authority_key(
-                args.output,
-                project_root=PROJECT_ROOT,
-                create_parent=bool(args.create_parent),
-            )
+            try:
+                fingerprint = initialize_lifecycle_authority_key(
+                    args.output,
+                    project_root=PROJECT_ROOT,
+                    create_parent=bool(args.create_parent),
+                )
+            except AuthorityKeyInitError as error:
+                _emit_authority_init_error(error)
+                return EXIT_STUDY
             _emit(
                 {
                     "status": "authority_initialized",
@@ -221,6 +226,9 @@ def execute(args: argparse.Namespace) -> int:
         _emit_error("artifact_error", error, EXIT_ARTIFACT)
         return EXIT_ARTIFACT
     except (OptunaSearchLifecycleError, OptunaLifecycleAuthorityError) as error:
+        if isinstance(error, AuthorityKeyInitError):
+            _emit_authority_init_error(error)
+            return EXIT_STUDY
         if config is not None:
             _persist_failure(config, error, "STUDY_LIFECYCLE_FAILED")
         _emit_error("study_error", error, EXIT_STUDY)
@@ -250,7 +258,27 @@ def _emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str))
 
 
+def _emit_authority_init_error(error: AuthorityKeyInitError) -> None:
+    print(
+        json.dumps(
+            {
+                "status": "failed",
+                "error_kind": "authority_key_init_error",
+                "error_code": error.code,
+                "message": error.message,
+                "exit_code": EXIT_STUDY,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        ),
+        file=sys.stderr,
+    )
+
+
 def _emit_error(kind: str, error: BaseException, exit_code: int) -> None:
+    if isinstance(error, AuthorityKeyInitError):
+        _emit_authority_init_error(error)
+        return
     print(
         json.dumps(
             {

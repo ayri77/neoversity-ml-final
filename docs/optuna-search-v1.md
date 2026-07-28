@@ -184,9 +184,13 @@ the stable key fingerprint
 Configuration and CLI arguments cannot select alternate report-controlled keys.
 
 `authority-init --output <external-path>` creates 32 random bytes with exclusive
-creation and restrictive permissions where supported. It refuses overwrite and
-creates a missing parent only with `--create-parent`. Its JSON result is
-path-independent and contains no secret material.
+temporary creation, restrictive permissions where supported, and create-if-absent
+publication (hard-link when available). It refuses overwrite, never deletes a
+file it did not create, and creates a missing parent only with `--create-parent`.
+Failures use stable path-independent codes such as
+`AUTHORITY_KEY_INIT_INVALID_DESTINATION` and `AUTHORITY_KEY_INIT_ALREADY_EXISTS`.
+JSON success and failure output is path-independent and contains no secret
+material.
 
 The signed creation statement binds authority schema 1, key fingerprint, a new
 immutable study UUID, the base study/search identity, the authority-bound study
@@ -203,41 +207,53 @@ and contains exact primitive fields:
 `previous_event_signature_sha256`, `trial_number`, `from_state`, `to_state`,
 `failure_stage`, `failure_reason_code`, `exception_type`,
 `failure_message_sha256`, `started_at_utc`, `event_at_utc`,
-`interrupted_recovery`, and independently recomputed
+`interrupted_recovery`, target-extension bindings
+(`configured_trial_target_before` / `after`, `previous_epoch_number`,
+`opened_epoch_number`), and independently recomputed
 `event_payload_identity_sha256`. HMAC uses the explicit
 `churn_ml.optuna.lifecycle.event.v1` domain. Events cover study creation, trial
-allocation/start/completion/execution failure, interrupted RUNNING recovery,
-study completion, and report finalization. Sequences are exact and monotonic;
+allocation/start/completion/execution failure, interrupted RUNNING/ALLOCATED
+recovery, study completion, report finalization, and authenticated
+`study_target_extended` epoch openings. Sequences are exact and monotonic;
 each link is SHA-256 of the preceding HMAC signature. Legal transitions are
-reconstructed, and interruption recovery requires an earlier signed RUNNING
-state.
+reconstructed, and interruption recovery requires an earlier signed RUNNING or
+ALLOCATED state.
 
-The final ledger schema binds the ordered event signatures and count, exact
-trial-state universe, completed/failed/interrupted sets, recovery list, best
-trial, completed report search identity, study-summary identity, exact
-metric/prediction file identity, pre-terminal manifest identity, and canonical
-completion time. It is stored both in SQLite study attributes and the completed
-report. Terminal signing is deliberately non-circular:
+Finalization epochs are immutable authenticated ledgers. Epoch 0 opens at study
+creation. Closing an epoch signs an epoch ledger over the exact event prefix,
+trial universes, report identities, and completion time. Finalized studies may
+later raise `n_trials` only by appending a signed `study_target_extended` event
+and opening epoch N+1 chained to the previous epoch ledger signature. Prior
+completed filesystem reports remain valid against their exact epoch even when
+SQLite later contains additional epochs or a signed open suffix. At most one
+open epoch may exist, and only as the latest entry, during an interrupted
+extension. The singleton `lifecycle_authority_final_ledger` schema fails closed
+with no silent migration. Unsigned legacy reports/studies still fail closed.
+
+Terminal signing is deliberately non-circular:
 
 1. write report payloads and pre-terminal signed events;
 2. write inventory and manifest over those payloads;
 3. append and persist the signed `report_finalized` event;
-4. sign/write the final ledger over the manifest and complete event chain;
-5. write `_SUCCESS` last, binding the final ledger payload identity and HMAC.
+4. sign the current epoch ledger over the manifest and epoch event prefix;
+5. write `_SUCCESS` last, binding that epoch ledger payload identity, HMAC, and
+   epoch number;
+6. persist the ordered epoch history in SQLite.
 
 One shared validator is used before resume/recovery/allocation and for completed
 loading, inspect, export, and finalization. It verifies the external key
-fingerprint, every canonical payload identity/HMAC/link/transition, the final
-ledger, exact report state/evidence, and SQLite/report equality when the database
-is present. The filesystem HMAC remains independently verifiable when operational
-SQLite has been removed. Older unsigned reports/studies fail closed.
+fingerprint, every canonical payload identity/HMAC/link/transition, the report's
+exact epoch ledger, exact report state/evidence, and SQLite/report equality for
+that historical epoch when the database is present. The filesystem HMAC remains
+independently verifiable when operational SQLite has been removed.
 
 Threat model: this protects against coherent mutation and rehashing of report
 fields, exception message/type substitution, execution-failure versus
 interruption-recovery substitution, lifecycle event deletion/insertion/
-reordering/replacement, removal of all failed evidence, and rebuilt inventory,
-manifest, identities, and `_SUCCESS`. It does not protect compromise or
-replacement of the external key, compromise of the host process while the key
+reordering/replacement, removal of all failed evidence, epoch history
+mutation/reordering, moving an old report onto a newer epoch, and rebuilt
+inventory, manifest, identities, and `_SUCCESS`. It does not protect compromise
+or replacement of the external key, compromise of the host process while the key
 is loaded, or malicious code executing before signing.
 
 ## Completed-report semantic reconstruction
@@ -263,7 +279,8 @@ SQLite under `artifacts/optuna/optuna.db` is resumable operational state only.
 Orphaned `RUNNING` trials are recovered as failed with
 `INTERRUPTED_PROCESS_RECOVERY`; their trial numbers are not reused. A completed
 target is not silently extended. More trials are added only when a configuration
-explicitly raises `n_trials`; lowering a previous target is refused.
+explicitly raises `n_trials` through an authenticated finalization epoch;
+lowering a previous target is refused. Prior epoch reports remain valid.
 
 Completed reports under `artifacts/optuna_searches/<search-id>/` are the
 authoritative immutable record. They contain the resolved configuration,

@@ -20,13 +20,26 @@ AUTHORITY_KEY_FILE_ENV = "CHURN_ML_OPTUNA_LIFECYCLE_AUTHORITY_KEY_FILE"
 AUTHORITY_SCHEMA_VERSION = 1
 EVENT_SCHEMA_VERSION = 1
 LEDGER_SCHEMA_VERSION = 1
+EPOCH_SCHEMA_VERSION = 1
 INITIAL_DOMAIN = b"churn_ml.optuna.lifecycle.initial.v1\x00"
 EVENT_DOMAIN = b"churn_ml.optuna.lifecycle.event.v1\x00"
 EVENT_PAYLOAD_DOMAIN = b"churn_ml.optuna.lifecycle.event-payload.v1\x00"
 LEDGER_DOMAIN = b"churn_ml.optuna.lifecycle.ledger.v1\x00"
+EPOCH_DOMAIN = b"churn_ml.optuna.lifecycle.epoch.v1\x00"
 KEY_IDENTIFIER_DOMAIN = b"churn_ml.optuna.lifecycle.key-identifier.v1\x00"
 BOUND_IDENTITY_DOMAIN = b"churn_ml.optuna.lifecycle.bound-identity.v1\x00"
 EVIDENCE_DOMAIN = b"churn_ml.optuna.lifecycle.metric-prediction.v1\x00"
+EPOCHS_ATTR = "lifecycle_authority_epochs"
+LEGACY_FINAL_LEDGER_ATTR = "lifecycle_authority_final_ledger"
+AUTHORITY_KEY_INIT_INVALID_DESTINATION = "AUTHORITY_KEY_INIT_INVALID_DESTINATION"
+AUTHORITY_KEY_INIT_PARENT_CREATE_FAILED = "AUTHORITY_KEY_INIT_PARENT_CREATE_FAILED"
+AUTHORITY_KEY_INIT_ALREADY_EXISTS = "AUTHORITY_KEY_INIT_ALREADY_EXISTS"
+AUTHORITY_KEY_INIT_CREATE_FAILED = "AUTHORITY_KEY_INIT_CREATE_FAILED"
+AUTHORITY_KEY_INIT_WRITE_FAILED = "AUTHORITY_KEY_INIT_WRITE_FAILED"
+AUTHORITY_KEY_INIT_FLUSH_FAILED = "AUTHORITY_KEY_INIT_FLUSH_FAILED"
+AUTHORITY_KEY_INIT_PERMISSION_FAILED = "AUTHORITY_KEY_INIT_PERMISSION_FAILED"
+AUTHORITY_KEY_INIT_VERIFY_FAILED = "AUTHORITY_KEY_INIT_VERIFY_FAILED"
+AUTHORITY_KEY_INIT_CLEANUP_FAILED = "AUTHORITY_KEY_INIT_CLEANUP_FAILED"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 UTC_PATTERN = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
@@ -64,27 +77,30 @@ EVENT_PAYLOAD_KEYS = {
     "started_at_utc",
     "event_at_utc",
     "interrupted_recovery",
+    "configured_trial_target_before",
+    "configured_trial_target_after",
+    "previous_epoch_number",
+    "opened_epoch_number",
 }
-LEDGER_PAYLOAD_KEYS = {
+EPOCH_PAYLOAD_KEYS = {
     "authority_schema_version",
-    "ledger_schema_version",
-    "authority_key_fingerprint",
+    "epoch_schema_version",
     "study_uuid",
-    "base_search_identity_sha256",
-    "authority_bound_study_identity_sha256",
-    "ordered_event_signatures",
-    "event_count",
-    "trial_state_universe",
-    "completed_trial_numbers",
-    "failed_trial_numbers",
-    "interrupted_trial_numbers",
-    "interrupted_recovery_trial_numbers",
-    "best_trial_number",
+    "epoch_number",
+    "previous_epoch_ledger_signature_sha256",
+    "epoch_open_event_sequence",
+    "epoch_close_event_sequence",
+    "configured_trial_target",
+    "starting_trial_universe",
+    "ending_trial_universe",
+    "event_signature_prefix_count",
+    "event_signature_end_count",
     "report_search_identity_sha256",
     "study_summary_identity_sha256",
     "metric_prediction_evidence_identity_sha256",
-    "report_manifest_identity_sha256",
+    "pre_terminal_manifest_identity_sha256",
     "completed_at_utc",
+    "epoch_payload_identity_sha256",
 }
 EVENT_TRANSITIONS = {
     "study_created": (None, "STUDY_CREATED"),
@@ -95,11 +111,27 @@ EVENT_TRANSITIONS = {
     "interrupted_running_trial_recovered": ("RUNNING", "FAIL"),
     "study_completed": ("STUDY_CREATED", "STUDY_COMPLETED"),
     "report_finalized": ("STUDY_COMPLETED", "REPORT_FINALIZED"),
+    "study_target_extended": ("REPORT_FINALIZED", "STUDY_CREATED"),
 }
 
 
 class OptunaLifecycleAuthorityError(RuntimeError):
     """Raised when external lifecycle authority is absent or inconsistent."""
+
+
+class AuthorityKeyInitError(OptunaLifecycleAuthorityError):
+    """Stable, path-independent authority-key initialization failure."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"AuthorityKeyInitError(code={self.code!r}, message={self.message!r})"
 
 
 @dataclass(frozen=True)
@@ -222,29 +254,165 @@ def initialize_lifecycle_authority_key(
     *,
     project_root: Path,
     create_parent: bool,
+    forbidden_roots: Sequence[Path] = (),
+) -> str:
+    try:
+        return _initialize_lifecycle_authority_key(
+            output,
+            project_root=project_root,
+            create_parent=create_parent,
+            forbidden_roots=forbidden_roots,
+        )
+    except AuthorityKeyInitError:
+        raise
+    except OptunaLifecycleAuthorityError:
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_INVALID_DESTINATION,
+            "Authority initialization destination is invalid.",
+        ) from None
+    except OSError:
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_CREATE_FAILED,
+            "Authority initialization could not create the key file.",
+        ) from None
+
+
+def _initialize_lifecycle_authority_key(
+    output: Path,
+    *,
+    project_root: Path,
+    create_parent: bool,
+    forbidden_roots: Sequence[Path],
 ) -> str:
     if not output.is_absolute() or any(part in {".", ".."} for part in output.parts):
-        raise OptunaLifecycleAuthorityError(
-            "Authority initialization output path is unsafe."
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_INVALID_DESTINATION,
+            "Authority initialization destination is invalid.",
         )
     target = Path(os.path.abspath(output))
     root = project_root.resolve()
-    if target == root or root in target.parents:
-        raise OptunaLifecycleAuthorityError(
-            "Authority initialization output must be outside the repository."
+    forbidden = [root, *(Path(item).resolve() for item in forbidden_roots)]
+    if any(target == item or item in target.parents for item in forbidden):
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_INVALID_DESTINATION,
+            "Authority initialization destination is invalid.",
         )
     parent = target.parent
     if not parent.exists():
         if not create_parent:
-            raise OptunaLifecycleAuthorityError(
-                "Authority initialization parent is missing."
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_INVALID_DESTINATION,
+                "Authority initialization parent is missing.",
             )
-        _create_real_parent_chain(parent)
-    _reject_linked_components(parent)
+        try:
+            _create_real_parent_chain(parent)
+        except AuthorityKeyInitError:
+            raise
+        except OptunaLifecycleAuthorityError:
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_PARENT_CREATE_FAILED,
+                "Authority initialization parent could not be created.",
+            ) from None
+        except OSError:
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_PARENT_CREATE_FAILED,
+                "Authority initialization parent could not be created.",
+            ) from None
+    try:
+        _reject_linked_components(parent)
+    except OptunaLifecycleAuthorityError:
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_INVALID_DESTINATION,
+            "Authority initialization destination is invalid.",
+        ) from None
     if target.exists() or target.is_symlink():
-        raise OptunaLifecycleAuthorityError(
-            "Authority initialization refuses overwrite."
+        if target.is_dir() and not target.is_symlink():
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_INVALID_DESTINATION,
+                "Authority initialization destination is invalid.",
+            )
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_ALREADY_EXISTS,
+            "Authority initialization refuses overwrite.",
         )
+
+    material = secrets.token_bytes(32)
+    temp_path = parent / f".churn-ml-authority-{secrets.token_hex(16)}.tmp"
+    temp_identity: tuple[int, int] | None = None
+    published_identity: tuple[int, int] | None = None
+    try:
+        temp_identity = _exclusive_write_key_file(temp_path, material)
+        _publish_authority_key(temp_path, target, material)
+        try:
+            published_meta = target.lstat()
+            published_identity = (published_meta.st_dev, published_meta.st_ino)
+        except OSError:
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_VERIFY_FAILED,
+                "Authority initialization could not verify the published key.",
+            ) from None
+        try:
+            current_temp = temp_path.lstat()
+            if (current_temp.st_dev, current_temp.st_ino) == temp_identity:
+                temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_CLEANUP_FAILED,
+                "Authority initialization could not clean up its temporary file.",
+            ) from None
+        temp_identity = None
+        try:
+            loaded = load_lifecycle_authority_key_from_path(
+                target,
+                project_root=root,
+            )
+            final_meta = target.lstat()
+        except (OSError, OptunaLifecycleAuthorityError):
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_VERIFY_FAILED,
+                "Authority initialization could not verify the published key.",
+            ) from None
+        if (
+            not stat.S_ISREG(final_meta.st_mode)
+            or stat.S_ISLNK(final_meta.st_mode)
+            or _is_reparse_stat(final_meta)
+            or getattr(final_meta, "st_nlink", 1) != 1
+            or final_meta.st_size != 32
+            or (final_meta.st_dev, final_meta.st_ino) != published_identity
+            or loaded.fingerprint
+            != hashlib.sha256(KEY_IDENTIFIER_DOMAIN + material).hexdigest()
+        ):
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_VERIFY_FAILED,
+                "Authority initialization could not verify the published key.",
+            )
+        return loaded.fingerprint
+    except AuthorityKeyInitError:
+        _cleanup_authority_init_artifacts(
+            temp_path=temp_path if temp_identity is not None else None,
+            temp_identity=temp_identity,
+            target=None,
+            target_identity=None,
+            published=published_identity is not None,
+        )
+        raise
+    except OSError:
+        _cleanup_authority_init_artifacts(
+            temp_path=temp_path if temp_identity is not None else None,
+            temp_identity=temp_identity,
+            target=None,
+            target_identity=None,
+            published=published_identity is not None,
+        )
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_CREATE_FAILED,
+            "Authority initialization could not create the key file.",
+        ) from None
+
+
+def _exclusive_write_key_file(path: Path, material: bytes) -> tuple[int, int]:
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -252,31 +420,143 @@ def initialize_lifecycle_authority_key(
         | getattr(os, "O_BINARY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    material = secrets.token_bytes(32)
     try:
-        descriptor = os.open(target, flags, 0o600)
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_CREATE_FAILED,
+            "Authority initialization could not create the key file.",
+        ) from None
+    except OSError:
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_CREATE_FAILED,
+            "Authority initialization could not create the key file.",
+        ) from None
+    failure: AuthorityKeyInitError | None = None
+    created_identity: tuple[int, int] | None = None
+    try:
         try:
             written = 0
             while written < len(material):
                 written += os.write(descriptor, material[written:])
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        try:
-            os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
         except OSError:
+            failure = AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_WRITE_FAILED,
+                "Authority initialization could not write the key file.",
+            )
+        if failure is None:
+            try:
+                os.fsync(descriptor)
+            except OSError:
+                failure = AuthorityKeyInitError(
+                    AUTHORITY_KEY_INIT_FLUSH_FAILED,
+                    "Authority initialization could not flush the key file.",
+                )
+        if failure is None:
+            identity = os.fstat(descriptor)
+            created_identity = (identity.st_dev, identity.st_ino)
+    finally:
+        os.close(descriptor)
+    if failure is not None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
             pass
-        loaded = load_lifecycle_authority_key_from_path(
-            target,
-            project_root=root,
+        except OSError:
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_CLEANUP_FAILED,
+                "Authority initialization could not clean up its temporary file.",
+            ) from None
+        raise failure
+    assert created_identity is not None
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+    try:
+        after = path.lstat()
+    except OSError:
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_VERIFY_FAILED,
+            "Authority initialization could not verify the published key.",
+        ) from None
+    if (after.st_dev, after.st_ino) != created_identity or after.st_size != len(
+        material
+    ):
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_VERIFY_FAILED,
+            "Authority initialization could not verify the published key.",
         )
-    except BaseException:
-        try:
-            target.unlink(missing_ok=True)
-        except OSError:
-            pass
+    return created_identity
+
+
+def _publish_authority_key(temp_path: Path, target: Path, material: bytes) -> None:
+    if target.exists() or target.is_symlink():
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_ALREADY_EXISTS,
+            "Authority initialization refuses overwrite.",
+        )
+    try:
+        os.link(temp_path, target)
+        return
+    except FileExistsError:
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_ALREADY_EXISTS,
+            "Authority initialization refuses overwrite.",
+        ) from None
+    except (AttributeError, OSError):
+        pass
+    if target.exists() or target.is_symlink():
+        raise AuthorityKeyInitError(
+            AUTHORITY_KEY_INIT_ALREADY_EXISTS,
+            "Authority initialization refuses overwrite.",
+        )
+    try:
+        _exclusive_write_key_file(target, material)
+    except AuthorityKeyInitError as error:
+        if error.code == AUTHORITY_KEY_INIT_CREATE_FAILED and (
+            target.exists() or target.is_symlink()
+        ):
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_ALREADY_EXISTS,
+                "Authority initialization refuses overwrite.",
+            ) from None
         raise
-    return loaded.fingerprint
+
+
+def _cleanup_authority_init_artifacts(
+    *,
+    temp_path: Path | None,
+    temp_identity: tuple[int, int] | None,
+    target: Path | None,
+    target_identity: tuple[int, int] | None,
+    published: bool,
+) -> None:
+    del published
+    if temp_path is not None and temp_identity is not None:
+        try:
+            meta = temp_path.lstat()
+            if (meta.st_dev, meta.st_ino) == temp_identity:
+                temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_CLEANUP_FAILED,
+                "Authority initialization could not clean up its temporary file.",
+            ) from None
+    if target is not None and target_identity is not None:
+        try:
+            meta = target.lstat()
+            if (meta.st_dev, meta.st_ino) == target_identity:
+                target.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise AuthorityKeyInitError(
+                AUTHORITY_KEY_INIT_CLEANUP_FAILED,
+                "Authority initialization could not clean up its temporary file.",
+            ) from None
 
 
 def load_lifecycle_authority_key_from_path(
@@ -308,6 +588,7 @@ class LifecycleAuthorityRecorder:
         self.key = key
         self.initial_statement = deepcopy(dict(initial_statement))
         self.events = [deepcopy(dict(event)) for event in events]
+        self._epochs: list[dict[str, Any]] | None = None
 
     @classmethod
     def initialize_or_load(
@@ -367,6 +648,17 @@ class LifecycleAuthorityRecorder:
                 to_state="STUDY_CREATED",
                 event_at_utc=created_at,
             )
+            open_epoch = _build_open_epoch_record(
+                study_uuid=study_uuid,
+                epoch_number=0,
+                previous_epoch_ledger_signature_sha256=None,
+                epoch_open_event_sequence=1,
+                configured_trial_target=configured_trial_count,
+                starting_trial_universe=[],
+                event_signature_prefix_count=0,
+            )
+            study.set_user_attr(EPOCHS_ATTR, [open_epoch])
+            recorder._epochs = [open_epoch]
             return recorder
         if not isinstance(events, list):
             raise OptunaLifecycleAuthorityError(
@@ -378,7 +670,7 @@ class LifecycleAuthorityRecorder:
             initial_statement=existing,
             events=events,
         )
-        recorder._validate_persisted_final_ledger()
+        recorder._epochs = recorder._load_and_validate_epochs()
         recorder.validate(
             expected={
                 "base_search_identity_sha256": base_search_identity_sha256,
@@ -391,50 +683,29 @@ class LifecycleAuthorityRecorder:
         )
         return recorder
 
-    def _validate_persisted_final_ledger(self) -> None:
-        persisted = self.study.user_attrs.get("lifecycle_authority_final_ledger")
-        finalized_events = [
-            event
-            for event in self.events
-            if event["payload"]["event_type"] == "report_finalized"
-        ]
-        if persisted is None:
-            if finalized_events:
-                raise OptunaLifecycleAuthorityError(
-                    "Study final lifecycle ledger is missing."
-                )
-            return
-        if (
-            not isinstance(persisted, Mapping)
-            or set(persisted)
-            != {
-                "authority_schema_version",
-                "report_finalized_event",
-                "final_ledger",
-            }
-            or not finalized_events
-            or persisted["report_finalized_event"] != finalized_events[-1]
-        ):
+    def _load_and_validate_epochs(self) -> list[dict[str, Any]]:
+        legacy = self.study.user_attrs.get(LEGACY_FINAL_LEDGER_ATTR)
+        persisted = self.study.user_attrs.get(EPOCHS_ATTR)
+        if legacy is not None and not isinstance(persisted, list):
             raise OptunaLifecycleAuthorityError(
-                "Study final lifecycle ledger schema differs."
+                "Singleton final ledger schema is unsupported."
             )
-        payload = _validate_signed_statement(
-            persisted["final_ledger"],
+        if not isinstance(persisted, list) or not persisted:
+            raise OptunaLifecycleAuthorityError(
+                "Study lifecycle authority epoch history is missing."
+            )
+        _validate_epoch_history(
+            persisted,
+            events=self.events,
+            initial_statement=self.initial_statement,
             key=self.key,
-            domain=LEDGER_DOMAIN,
-            payload_keys=LEDGER_PAYLOAD_KEYS,
-            label="persisted final lifecycle ledger",
         )
-        if (
-            payload["authority_key_fingerprint"] != self.key.fingerprint
-            or payload["study_uuid"] != self.initial_statement["payload"]["study_uuid"]
-            or payload["ordered_event_signatures"]
-            != [event["signature_sha256"] for event in self.events]
-            or payload["event_count"] != len(self.events)
-        ):
-            raise OptunaLifecycleAuthorityError(
-                "Study final lifecycle ledger differs from signed events."
-            )
+        return [deepcopy(item) for item in persisted]
+
+    def _require_epochs(self) -> list[dict[str, Any]]:
+        if self._epochs is None:
+            self._epochs = self._load_and_validate_epochs()
+        return self._epochs
 
     def validate(self, *, expected: Mapping[str, Any] | None = None) -> None:
         validate_initial_statement(self.initial_statement, key=self.key)
@@ -450,6 +721,13 @@ class LifecycleAuthorityRecorder:
             initial_statement=self.initial_statement,
             key=self.key,
             require_report_finalized=False,
+        )
+        epochs = self._require_epochs()
+        _validate_epoch_history(
+            epochs,
+            events=self.events,
+            initial_statement=self.initial_statement,
+            key=self.key,
         )
         self.validate_study_trial_states()
 
@@ -478,6 +756,10 @@ class LifecycleAuthorityRecorder:
         started_at_utc: str | None = None,
         event_at_utc: str | None = None,
         interrupted_recovery: bool = False,
+        configured_trial_target_before: int | None = None,
+        configured_trial_target_after: int | None = None,
+        previous_epoch_number: int | None = None,
+        opened_epoch_number: int | None = None,
         persist: bool = True,
     ) -> dict[str, Any]:
         sequence = len(self.events) + 1
@@ -509,6 +791,10 @@ class LifecycleAuthorityRecorder:
             "event_at_utc": event_at_utc
             or canonical_authority_timestamp(datetime.now(timezone.utc)),
             "interrupted_recovery": interrupted_recovery,
+            "configured_trial_target_before": configured_trial_target_before,
+            "configured_trial_target_after": configured_trial_target_after,
+            "previous_epoch_number": previous_epoch_number,
+            "opened_epoch_number": opened_epoch_number,
         }
         payload_identity = _event_payload_identity(payload)
         event = _signed_statement(
@@ -535,11 +821,66 @@ class LifecycleAuthorityRecorder:
         return deepcopy(event)
 
     def report_payload(self) -> dict[str, Any]:
+        events = deepcopy(self.events)
+        if events and events[-1]["payload"]["event_type"] == "report_finalized":
+            events = events[:-1]
         return {
             "authority_schema_version": AUTHORITY_SCHEMA_VERSION,
             "initial_statement": deepcopy(self.initial_statement),
-            "events": deepcopy(self.events),
+            "events": events,
         }
+
+    def extend_configured_trial_target(self, new_target: int) -> None:
+        if type(new_target) is not int or new_target < 1:
+            raise OptunaLifecycleAuthorityError(
+                "Extended lifecycle trial target is malformed."
+            )
+        epochs = self._require_epochs()
+        if not self.events or self.events[-1]["payload"]["event_type"] != (
+            "report_finalized"
+        ):
+            raise OptunaLifecycleAuthorityError(
+                "Lifecycle target extension requires a finalized epoch."
+            )
+        latest = epochs[-1]
+        if _epoch_status(latest) != "closed":
+            raise OptunaLifecycleAuthorityError(
+                "Lifecycle target extension requires a closed prior epoch."
+            )
+        previous_payload = latest["payload"]
+        previous_target = int(previous_payload["configured_trial_target"])
+        if new_target <= previous_target:
+            raise OptunaLifecycleAuthorityError(
+                "Lifecycle target extension requires a strictly larger target."
+            )
+        previous_number = int(previous_payload["epoch_number"])
+        ending_universe = deepcopy(previous_payload["ending_trial_universe"])
+        prefix_count = int(previous_payload["event_signature_end_count"])
+        self.append_event(
+            event_type="study_target_extended",
+            trial_number=None,
+            from_state="REPORT_FINALIZED",
+            to_state="STUDY_CREATED",
+            configured_trial_target_before=previous_target,
+            configured_trial_target_after=new_target,
+            previous_epoch_number=previous_number,
+            opened_epoch_number=previous_number + 1,
+        )
+        open_epoch = _build_open_epoch_record(
+            study_uuid=self.initial_statement["payload"]["study_uuid"],
+            epoch_number=previous_number + 1,
+            previous_epoch_ledger_signature_sha256=latest["signature_sha256"],
+            epoch_open_event_sequence=len(self.events),
+            configured_trial_target=new_target,
+            starting_trial_universe=ending_universe,
+            event_signature_prefix_count=prefix_count,
+        )
+        self._epochs = [*epochs, open_epoch]
+        self.persist_epoch_history()
+
+    def persist_epoch_history(self) -> None:
+        epochs = self._require_epochs()
+        self.study.set_user_attr(EPOCHS_ATTR, deepcopy(epochs))
 
     def finalize(
         self,
@@ -551,19 +892,11 @@ class LifecycleAuthorityRecorder:
         study_summary_identity_sha256: str,
         metric_prediction_evidence_identity_sha256: str,
         report_manifest_identity_sha256: str,
+        persist_epochs: bool = False,
     ) -> dict[str, Any]:
-        if self.events[-1]["payload"]["event_type"] != "study_completed":
-            raise OptunaLifecycleAuthorityError(
-                "Lifecycle authority cannot finalize before study completion."
-            )
-        completed_at = canonical_authority_timestamp(datetime.now(timezone.utc))
-        final_event = self.append_event(
-            event_type="report_finalized",
-            trial_number=None,
-            from_state="STUDY_COMPLETED",
-            to_state="REPORT_FINALIZED",
-            event_at_utc=completed_at,
-        )
+        del interrupted_recovery_trial_numbers, best_trial_number
+        epochs = self._require_epochs()
+        latest = epochs[-1]
         states = [
             {
                 "trial_number": int(item["trial_number"]),
@@ -571,48 +904,101 @@ class LifecycleAuthorityRecorder:
             }
             for item in trial_state_universe
         ]
-        completed = [
-            item["trial_number"] for item in states if item["state"] == "COMPLETE"
-        ]
-        failed = [item["trial_number"] for item in states if item["state"] == "FAIL"]
-        interrupted = sorted(int(value) for value in interrupted_recovery_trial_numbers)
-        payload = {
+        if _epoch_status(latest) == "closed":
+            closed = latest
+            payload = closed["payload"]
+            if (
+                payload["report_search_identity_sha256"]
+                == report_search_identity_sha256
+                and payload["study_summary_identity_sha256"]
+                == study_summary_identity_sha256
+                and payload["metric_prediction_evidence_identity_sha256"]
+                == metric_prediction_evidence_identity_sha256
+                and payload["pre_terminal_manifest_identity_sha256"]
+                == report_manifest_identity_sha256
+                and payload["ending_trial_universe"] == states
+            ):
+                final_event = None
+                for event in reversed(self.events):
+                    if event["payload"]["event_type"] == "report_finalized":
+                        final_event = deepcopy(event)
+                        break
+                if final_event is None:
+                    raise OptunaLifecycleAuthorityError(
+                        "Closed lifecycle epoch lacks report-finalized event."
+                    )
+                return {
+                    "authority_schema_version": AUTHORITY_SCHEMA_VERSION,
+                    "epoch_schema_version": EPOCH_SCHEMA_VERSION,
+                    "epoch_number": int(payload["epoch_number"]),
+                    "report_finalized_event": final_event,
+                    "epoch_ledger": deepcopy(closed),
+                }
+            raise OptunaLifecycleAuthorityError(
+                "Closed lifecycle epoch diverges from the new report evidence."
+            )
+        last_type = self.events[-1]["payload"]["event_type"]
+        if last_type == "study_completed":
+            completed_at = canonical_authority_timestamp(datetime.now(timezone.utc))
+            final_event = self.append_event(
+                event_type="report_finalized",
+                trial_number=None,
+                from_state="STUDY_COMPLETED",
+                to_state="REPORT_FINALIZED",
+                event_at_utc=completed_at,
+            )
+        elif last_type == "report_finalized":
+            final_event = deepcopy(self.events[-1])
+            completed_at = final_event["payload"]["event_at_utc"]
+        else:
+            raise OptunaLifecycleAuthorityError(
+                "Lifecycle authority cannot finalize before study completion."
+            )
+        open_payload = latest["payload"]
+        closed_payload = {
             "authority_schema_version": AUTHORITY_SCHEMA_VERSION,
-            "ledger_schema_version": LEDGER_SCHEMA_VERSION,
-            "authority_key_fingerprint": self.key.fingerprint,
+            "epoch_schema_version": EPOCH_SCHEMA_VERSION,
             "study_uuid": self.initial_statement["payload"]["study_uuid"],
-            "base_search_identity_sha256": self.initial_statement["payload"][
-                "base_search_identity_sha256"
+            "epoch_number": int(open_payload["epoch_number"]),
+            "previous_epoch_ledger_signature_sha256": open_payload[
+                "previous_epoch_ledger_signature_sha256"
             ],
-            "authority_bound_study_identity_sha256": self.initial_statement["payload"][
-                "authority_bound_study_identity_sha256"
-            ],
-            "ordered_event_signatures": [
-                event["signature_sha256"] for event in self.events
-            ],
-            "event_count": len(self.events),
-            "trial_state_universe": states,
-            "completed_trial_numbers": completed,
-            "failed_trial_numbers": failed,
-            "interrupted_trial_numbers": interrupted,
-            "interrupted_recovery_trial_numbers": interrupted,
-            "best_trial_number": best_trial_number,
+            "epoch_open_event_sequence": int(open_payload["epoch_open_event_sequence"]),
+            "epoch_close_event_sequence": len(self.events),
+            "configured_trial_target": int(open_payload["configured_trial_target"]),
+            "starting_trial_universe": deepcopy(
+                open_payload["starting_trial_universe"]
+            ),
+            "ending_trial_universe": states,
+            "event_signature_prefix_count": int(
+                open_payload["event_signature_prefix_count"]
+            ),
+            "event_signature_end_count": len(self.events),
             "report_search_identity_sha256": report_search_identity_sha256,
             "study_summary_identity_sha256": study_summary_identity_sha256,
             "metric_prediction_evidence_identity_sha256": (
                 metric_prediction_evidence_identity_sha256
             ),
-            "report_manifest_identity_sha256": report_manifest_identity_sha256,
+            "pre_terminal_manifest_identity_sha256": report_manifest_identity_sha256,
             "completed_at_utc": completed_at,
         }
-        ledger = _signed_statement(payload, key=self.key, domain=LEDGER_DOMAIN)
-        result = {
+        identity = _epoch_payload_identity(closed_payload)
+        closed_payload["epoch_payload_identity_sha256"] = identity
+        signed = _signed_statement(
+            closed_payload,
+            key=self.key,
+            domain=EPOCH_DOMAIN,
+        )
+        self._epochs = [*epochs[:-1], signed]
+        if persist_epochs:
+            self.persist_epoch_history()
+        return {
             "authority_schema_version": AUTHORITY_SCHEMA_VERSION,
+            "epoch_schema_version": EPOCH_SCHEMA_VERSION,
+            "epoch_number": int(closed_payload["epoch_number"]),
             "report_finalized_event": final_event,
-            "final_ledger": ledger,
+            "epoch_ledger": deepcopy(signed),
         }
-        self.study.set_user_attr("lifecycle_authority_final_ledger", result)
-        return result
 
 
 def validate_report_lifecycle_authority(
@@ -636,15 +1022,26 @@ def validate_report_lifecycle_authority(
         raise OptunaLifecycleAuthorityError(
             "Filesystem lifecycle authority schema differs."
         )
+    if "final_ledger" in authority_ledger:
+        raise OptunaLifecycleAuthorityError(
+            "Singleton final ledger schema is unsupported."
+        )
     if set(authority_ledger) != {
         "authority_schema_version",
+        "epoch_schema_version",
+        "epoch_number",
         "report_finalized_event",
-        "final_ledger",
+        "epoch_ledger",
     }:
         raise OptunaLifecycleAuthorityError(
             "Final lifecycle authority ledger schema differs."
         )
-    if authority_ledger["authority_schema_version"] != AUTHORITY_SCHEMA_VERSION:
+    if (
+        authority_ledger["authority_schema_version"] != AUTHORITY_SCHEMA_VERSION
+        or authority_ledger["epoch_schema_version"] != EPOCH_SCHEMA_VERSION
+        or type(authority_ledger["epoch_number"]) is not int
+        or authority_ledger["epoch_number"] < 0
+    ):
         raise OptunaLifecycleAuthorityError("Final lifecycle authority schema differs.")
     initial = authority_report["initial_statement"]
     validate_initial_statement(initial, key=key)
@@ -655,54 +1052,58 @@ def validate_report_lifecycle_authority(
         key=key,
         require_report_finalized=True,
     )
-    ledger = authority_ledger["final_ledger"]
+    ledger = authority_ledger["epoch_ledger"]
     payload = _validate_signed_statement(
         ledger,
         key=key,
-        domain=LEDGER_DOMAIN,
-        payload_keys=LEDGER_PAYLOAD_KEYS,
-        label="final lifecycle ledger",
+        domain=EPOCH_DOMAIN,
+        payload_keys=EPOCH_PAYLOAD_KEYS,
+        label="lifecycle epoch ledger",
     )
-    if (
-        type(payload["authority_schema_version"]) is not int
-        or payload["authority_schema_version"] != AUTHORITY_SCHEMA_VERSION
+    if payload["epoch_payload_identity_sha256"] != _epoch_payload_identity(
+        {
+            name: payload[name]
+            for name in EPOCH_PAYLOAD_KEYS - {"epoch_payload_identity_sha256"}
+        }
     ):
-        raise OptunaLifecycleAuthorityError("Final lifecycle ledger version differs.")
+        raise OptunaLifecycleAuthorityError("Lifecycle epoch payload identity differs.")
     if (
-        type(payload["ledger_schema_version"]) is not int
-        or payload["ledger_schema_version"] != LEDGER_SCHEMA_VERSION
+        payload["authority_schema_version"] != AUTHORITY_SCHEMA_VERSION
+        or payload["epoch_schema_version"] != EPOCH_SCHEMA_VERSION
+        or payload["study_uuid"] != initial["payload"]["study_uuid"]
+        or payload["epoch_number"] != authority_ledger["epoch_number"]
+        or payload["epoch_close_event_sequence"] != len(events)
+        or payload["event_signature_end_count"] != len(events)
+        or payload["completed_at_utc"] != events[-1]["payload"]["event_at_utc"]
     ):
-        raise OptunaLifecycleAuthorityError("Final lifecycle ledger schema differs.")
+        raise OptunaLifecycleAuthorityError(
+            "Lifecycle epoch ledger differs from reconstructed report evidence."
+        )
     expected_values = {
-        **expected,
-        "authority_key_fingerprint": key.fingerprint,
-        "study_uuid": initial["payload"]["study_uuid"],
-        "base_search_identity_sha256": initial["payload"][
-            "base_search_identity_sha256"
+        "ending_trial_universe": expected["ending_trial_universe"],
+        "report_search_identity_sha256": expected["report_search_identity_sha256"],
+        "study_summary_identity_sha256": expected["study_summary_identity_sha256"],
+        "metric_prediction_evidence_identity_sha256": expected[
+            "metric_prediction_evidence_identity_sha256"
         ],
-        "authority_bound_study_identity_sha256": initial["payload"][
-            "authority_bound_study_identity_sha256"
+        "pre_terminal_manifest_identity_sha256": expected[
+            "pre_terminal_manifest_identity_sha256"
         ],
-        "ordered_event_signatures": [event["signature_sha256"] for event in events],
-        "event_count": len(events),
     }
     if any(payload.get(name) != value for name, value in expected_values.items()):
         raise OptunaLifecycleAuthorityError(
-            "Final lifecycle ledger differs from reconstructed report evidence."
+            "Lifecycle epoch ledger differs from reconstructed report evidence."
         )
-    if payload["completed_at_utc"] != events[-1]["payload"]["event_at_utc"]:
-        raise OptunaLifecycleAuthorityError(
-            "Final lifecycle ledger timestamp differs from final event."
-        )
-    _validate_ledger_types(payload)
+    _validate_epoch_payload_types(payload, open_epoch=False)
     if database_path is not None and database_path.exists():
         _cross_check_sqlite_authority(
             database_path,
             study_name=study_name,
             initial_statement=initial,
             events=events,
-            final_ledger=authority_ledger,
-            expected_states=payload["trial_state_universe"],
+            epoch_number=int(authority_ledger["epoch_number"]),
+            epoch_ledger=ledger,
+            expected_states=payload["ending_trial_universe"],
         )
 
 
@@ -811,11 +1212,20 @@ def validate_event_chain(
             )
         _validate_event_types(payload)
         event_type = payload["event_type"]
-        expected_transition = EVENT_TRANSITIONS.get(event_type)
-        if expected_transition != (payload["from_state"], payload["to_state"]):
-            raise OptunaLifecycleAuthorityError(
-                "Lifecycle event state transition is illegal."
-            )
+        if event_type == "interrupted_running_trial_recovered":
+            if payload["to_state"] != "FAIL" or payload["from_state"] not in {
+                "RUNNING",
+                "ALLOCATED",
+            }:
+                raise OptunaLifecycleAuthorityError(
+                    "Lifecycle event state transition is illegal."
+                )
+        else:
+            expected_transition = EVENT_TRANSITIONS.get(event_type)
+            if expected_transition != (payload["from_state"], payload["to_state"]):
+                raise OptunaLifecycleAuthorityError(
+                    "Lifecycle event state transition is illegal."
+                )
         event_time = canonical_authority_timestamp(payload["event_at_utc"])
         if event_time < previous_time:
             raise OptunaLifecycleAuthorityError(
@@ -847,10 +1257,28 @@ def validate_event_chain(
                     "Report-finalized lifecycle event is misplaced."
                 )
             study_state = "REPORT_FINALIZED"
-        elif event_type == "trial_allocated":
-            if study_state not in {"STUDY_CREATED", "REPORT_FINALIZED"} or (
-                trial_number in trial_states
+        elif event_type == "study_target_extended":
+            if study_state != "REPORT_FINALIZED":
+                raise OptunaLifecycleAuthorityError(
+                    "Study target-extension lifecycle event is misplaced."
+                )
+            if (
+                type(payload["configured_trial_target_before"]) is not int
+                or type(payload["configured_trial_target_after"]) is not int
+                or type(payload["previous_epoch_number"]) is not int
+                or type(payload["opened_epoch_number"]) is not int
+                or payload["configured_trial_target_before"] < 1
+                or payload["configured_trial_target_after"]
+                <= payload["configured_trial_target_before"]
+                or payload["opened_epoch_number"]
+                != payload["previous_epoch_number"] + 1
             ):
+                raise OptunaLifecycleAuthorityError(
+                    "Study target-extension lifecycle binding is malformed."
+                )
+            study_state = "STUDY_CREATED"
+        elif event_type == "trial_allocated":
+            if study_state != "STUDY_CREATED" or (trial_number in trial_states):
                 raise OptunaLifecycleAuthorityError(
                     "Trial allocation lifecycle event is illegal."
                 )
@@ -862,6 +1290,16 @@ def validate_event_chain(
                     "Trial-start lifecycle event lacks allocation."
                 )
             trial_states[trial_number] = "RUNNING"
+        elif event_type == "interrupted_running_trial_recovered":
+            if trial_states.get(trial_number) not in {"RUNNING", "ALLOCATED"}:
+                raise OptunaLifecycleAuthorityError(
+                    "Terminal trial lifecycle event lacks signed RUNNING state."
+                )
+            if payload["from_state"] != trial_states.get(trial_number):
+                raise OptunaLifecycleAuthorityError(
+                    "Lifecycle event state transition is illegal."
+                )
+            trial_states[trial_number] = payload["to_state"]
         else:
             if trial_states.get(trial_number) != "RUNNING":
                 raise OptunaLifecycleAuthorityError(
@@ -882,7 +1320,9 @@ def _signed_trial_states(events: Sequence[Mapping[str, Any]]) -> dict[int, str]:
         payload = event["payload"]
         event_type = payload["event_type"]
         trial_number = payload["trial_number"]
-        if event_type in {"trial_allocated", "trial_started"}:
+        if event_type == "trial_allocated":
+            states[int(trial_number)] = "RUNNING"
+        elif event_type == "trial_started":
             states[int(trial_number)] = "RUNNING"
         elif event_type in {
             "trial_completed",
@@ -1042,6 +1482,14 @@ def _validate_event_types(payload: Mapping[str, Any]) -> None:
     ):
         if payload[name] is not None and type(payload[name]) is not str:
             raise OptunaLifecycleAuthorityError(f"Lifecycle event {name} is malformed.")
+    for name in (
+        "configured_trial_target_before",
+        "configured_trial_target_after",
+        "previous_epoch_number",
+        "opened_epoch_number",
+    ):
+        if payload[name] is not None and type(payload[name]) is not int:
+            raise OptunaLifecycleAuthorityError(f"Lifecycle event {name} is malformed.")
     if type(payload["to_state"]) is not str:
         raise OptunaLifecycleAuthorityError("Lifecycle event to_state is malformed.")
     if type(payload["interrupted_recovery"]) is not bool:
@@ -1054,6 +1502,46 @@ def _validate_event_types(payload: Mapping[str, Any]) -> None:
             raise OptunaLifecycleAuthorityError(
                 "Lifecycle event start timestamp follows event timestamp."
             )
+    if payload["event_type"] == "study_target_extended":
+        if (
+            any(
+                payload[name] is None
+                for name in (
+                    "configured_trial_target_before",
+                    "configured_trial_target_after",
+                    "previous_epoch_number",
+                    "opened_epoch_number",
+                )
+            )
+            or any(
+                payload[name] is not None
+                for name in (
+                    "failure_stage",
+                    "failure_reason_code",
+                    "exception_type",
+                    "failure_message_sha256",
+                    "started_at_utc",
+                )
+            )
+            or payload["interrupted_recovery"]
+            or payload["trial_number"] is not None
+        ):
+            raise OptunaLifecycleAuthorityError(
+                "Study target-extension lifecycle binding is malformed."
+            )
+        return
+    if any(
+        payload[name] is not None
+        for name in (
+            "configured_trial_target_before",
+            "configured_trial_target_after",
+            "previous_epoch_number",
+            "opened_epoch_number",
+        )
+    ):
+        raise OptunaLifecycleAuthorityError(
+            "Non-extension lifecycle event carries target-extension binding."
+        )
     failure_event = payload["event_type"] in {
         "trial_execution_failed",
         "interrupted_running_trial_recovered",
@@ -1101,37 +1589,100 @@ def _validate_event_types(payload: Mapping[str, Any]) -> None:
         )
 
 
-def _validate_ledger_types(payload: Mapping[str, Any]) -> None:
+def _validate_epoch_payload_types(
+    payload: Mapping[str, Any],
+    *,
+    open_epoch: bool,
+) -> None:
+    if (
+        type(payload["authority_schema_version"]) is not int
+        or payload["authority_schema_version"] != AUTHORITY_SCHEMA_VERSION
+        or type(payload["epoch_schema_version"]) is not int
+        or payload["epoch_schema_version"] != EPOCH_SCHEMA_VERSION
+        or type(payload["epoch_number"]) is not int
+        or payload["epoch_number"] < 0
+        or type(payload["epoch_open_event_sequence"]) is not int
+        or payload["epoch_open_event_sequence"] < 1
+        or type(payload["configured_trial_target"]) is not int
+        or payload["configured_trial_target"] < 1
+        or type(payload["event_signature_prefix_count"]) is not int
+        or payload["event_signature_prefix_count"] < 0
+        or not isinstance(payload["starting_trial_universe"], list)
+    ):
+        raise OptunaLifecycleAuthorityError("Lifecycle epoch payload is malformed.")
+    try:
+        if str(uuid.UUID(payload["study_uuid"])) != payload["study_uuid"]:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError) as error:
+        raise OptunaLifecycleAuthorityError("Study UUID is malformed.") from error
+    if payload["previous_epoch_ledger_signature_sha256"] is not None:
+        _require_sha256(
+            payload["previous_epoch_ledger_signature_sha256"],
+            "previous epoch ledger signature",
+        )
+    elif payload["epoch_number"] != 0:
+        raise OptunaLifecycleAuthorityError("Lifecycle epoch chain is malformed.")
+    _validate_trial_universe(payload["starting_trial_universe"])
+    _require_sha256(
+        payload["epoch_payload_identity_sha256"],
+        "epoch payload identity",
+    )
+    if open_epoch:
+        for name in (
+            "epoch_close_event_sequence",
+            "ending_trial_universe",
+            "event_signature_end_count",
+            "report_search_identity_sha256",
+            "study_summary_identity_sha256",
+            "metric_prediction_evidence_identity_sha256",
+            "pre_terminal_manifest_identity_sha256",
+            "completed_at_utc",
+        ):
+            if payload[name] is not None:
+                raise OptunaLifecycleAuthorityError(
+                    "Open lifecycle epoch carries closed fields."
+                )
+        return
+    if (
+        type(payload["epoch_close_event_sequence"]) is not int
+        or payload["epoch_close_event_sequence"] < payload["epoch_open_event_sequence"]
+        or type(payload["event_signature_end_count"]) is not int
+        or payload["event_signature_end_count"] != payload["epoch_close_event_sequence"]
+        or not isinstance(payload["ending_trial_universe"], list)
+    ):
+        raise OptunaLifecycleAuthorityError("Closed lifecycle epoch is malformed.")
+    _validate_trial_universe(payload["ending_trial_universe"])
     for name in (
-        "authority_key_fingerprint",
-        "base_search_identity_sha256",
-        "authority_bound_study_identity_sha256",
         "report_search_identity_sha256",
         "study_summary_identity_sha256",
         "metric_prediction_evidence_identity_sha256",
-        "report_manifest_identity_sha256",
+        "pre_terminal_manifest_identity_sha256",
     ):
         _require_sha256(payload[name], name)
-    if type(payload["event_count"]) is not int or payload["event_count"] < 3:
-        raise OptunaLifecycleAuthorityError("Final lifecycle event count is malformed.")
-    if (
-        not isinstance(payload["ordered_event_signatures"], list)
-        or len(payload["ordered_event_signatures"]) != payload["event_count"]
-        or any(
-            not isinstance(value, str) or not SHA256_PATTERN.fullmatch(value)
-            for value in payload["ordered_event_signatures"]
-        )
-    ):
-        raise OptunaLifecycleAuthorityError(
-            "Final lifecycle event signature universe is malformed."
-        )
     if (
         canonical_authority_timestamp(payload["completed_at_utc"])
         != payload["completed_at_utc"]
     ):
         raise OptunaLifecycleAuthorityError(
-            "Final lifecycle completion timestamp is malformed."
+            "Lifecycle epoch completion timestamp is malformed."
         )
+
+
+def _validate_trial_universe(universe: Sequence[Mapping[str, Any]]) -> None:
+    seen: set[int] = set()
+    for item in universe:
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"trial_number", "state"}
+            or type(item["trial_number"]) is not int
+            or item["trial_number"] < 0
+            or type(item["state"]) is not str
+            or item["trial_number"] in seen
+        ):
+            raise OptunaLifecycleAuthorityError(
+                "Lifecycle epoch trial universe is malformed."
+            )
+        seen.add(item["trial_number"])
 
 
 def _cross_check_sqlite_authority(
@@ -1140,7 +1691,8 @@ def _cross_check_sqlite_authority(
     study_name: str,
     initial_statement: Mapping[str, Any],
     events: Sequence[Mapping[str, Any]],
-    final_ledger: Mapping[str, Any],
+    epoch_number: int,
+    epoch_ledger: Mapping[str, Any],
     expected_states: Sequence[Mapping[str, Any]],
 ) -> None:
     uri = f"file:{database_path.as_posix()}?mode=ro"
@@ -1163,18 +1715,49 @@ def _cross_check_sqlite_authority(
                     (study_id,),
                 )
             }
-            expected_attributes = {
-                "lifecycle_authority_initial_statement": dict(initial_statement),
-                "lifecycle_authority_events": list(events),
-                "lifecycle_authority_final_ledger": dict(final_ledger),
-            }
-            if any(
-                attributes.get(name) != value
-                for name, value in expected_attributes.items()
+            if LEGACY_FINAL_LEDGER_ATTR in attributes and EPOCHS_ATTR not in attributes:
+                raise OptunaLifecycleAuthorityError(
+                    "Singleton final ledger schema is unsupported."
+                )
+            if attributes.get("lifecycle_authority_initial_statement") != dict(
+                initial_statement
             ):
                 raise OptunaLifecycleAuthorityError(
                     "SQLite and filesystem lifecycle authority differ."
                 )
+            sqlite_events = attributes.get("lifecycle_authority_events")
+            if not isinstance(sqlite_events, list) or len(sqlite_events) < len(events):
+                raise OptunaLifecycleAuthorityError(
+                    "SQLite and filesystem lifecycle authority differ."
+                )
+            if sqlite_events[: len(events)] != list(events):
+                raise OptunaLifecycleAuthorityError(
+                    "SQLite and filesystem lifecycle authority differ."
+                )
+            sqlite_epochs = attributes.get(EPOCHS_ATTR)
+            if not isinstance(sqlite_epochs, list) or epoch_number >= len(
+                sqlite_epochs
+            ):
+                raise OptunaLifecycleAuthorityError(
+                    "SQLite lifecycle epoch history is missing."
+                )
+            if sqlite_epochs[epoch_number] != dict(epoch_ledger):
+                raise OptunaLifecycleAuthorityError(
+                    "SQLite and filesystem lifecycle epoch ledgers differ."
+                )
+            if any(
+                _epoch_status(item) == "open" and index != len(sqlite_epochs) - 1
+                for index, item in enumerate(sqlite_epochs)
+            ):
+                raise OptunaLifecycleAuthorityError(
+                    "Lifecycle epoch history has a non-terminal open epoch."
+                )
+            for index, item in enumerate(sqlite_epochs):
+                payload = item["payload"]
+                if int(payload["epoch_number"]) != index:
+                    raise OptunaLifecycleAuthorityError(
+                        "Lifecycle epoch history sequence is malformed."
+                    )
             states = [
                 {"trial_number": int(number), "state": str(state)}
                 for number, state in connection.execute(
@@ -1183,7 +1766,8 @@ def _cross_check_sqlite_authority(
                     (study_id,),
                 )
             ]
-            if states != list(expected_states):
+            # Report ending universe may be a prefix of the operational study.
+            if states[: len(expected_states)] != list(expected_states):
                 raise OptunaLifecycleAuthorityError(
                     "SQLite and filesystem trial-state universes differ."
                 )
@@ -1193,6 +1777,184 @@ def _cross_check_sqlite_authority(
         raise OptunaLifecycleAuthorityError(
             "SQLite lifecycle authority validation failed."
         ) from error
+
+
+def _epoch_status(record: Mapping[str, Any]) -> str:
+    if record.get("epoch_status") == "open":
+        return "open"
+    if set(record) == {"payload", "payload_identity_sha256", "signature_sha256"}:
+        return "closed"
+    raise OptunaLifecycleAuthorityError("Lifecycle epoch record schema differs.")
+
+
+def _build_open_epoch_record(
+    *,
+    study_uuid: str,
+    epoch_number: int,
+    previous_epoch_ledger_signature_sha256: str | None,
+    epoch_open_event_sequence: int,
+    configured_trial_target: int,
+    starting_trial_universe: Sequence[Mapping[str, Any]],
+    event_signature_prefix_count: int,
+) -> dict[str, Any]:
+    payload = {
+        "authority_schema_version": AUTHORITY_SCHEMA_VERSION,
+        "epoch_schema_version": EPOCH_SCHEMA_VERSION,
+        "study_uuid": study_uuid,
+        "epoch_number": epoch_number,
+        "previous_epoch_ledger_signature_sha256": (
+            previous_epoch_ledger_signature_sha256
+        ),
+        "epoch_open_event_sequence": epoch_open_event_sequence,
+        "epoch_close_event_sequence": None,
+        "configured_trial_target": configured_trial_target,
+        "starting_trial_universe": [
+            {
+                "trial_number": int(item["trial_number"]),
+                "state": str(item["state"]),
+            }
+            for item in starting_trial_universe
+        ],
+        "ending_trial_universe": None,
+        "event_signature_prefix_count": event_signature_prefix_count,
+        "event_signature_end_count": None,
+        "report_search_identity_sha256": None,
+        "study_summary_identity_sha256": None,
+        "metric_prediction_evidence_identity_sha256": None,
+        "pre_terminal_manifest_identity_sha256": None,
+        "completed_at_utc": None,
+    }
+    identity = _epoch_payload_identity(payload)
+    payload["epoch_payload_identity_sha256"] = identity
+    return {
+        "epoch_status": "open",
+        "payload": payload,
+        "payload_identity_sha256": hashlib.sha256(
+            canonical_json_bytes(payload)
+        ).hexdigest(),
+    }
+
+
+def _epoch_payload_identity(payload: Mapping[str, Any]) -> str:
+    body = {
+        name: payload[name]
+        for name in sorted(EPOCH_PAYLOAD_KEYS - {"epoch_payload_identity_sha256"})
+    }
+    return hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+
+
+def _validate_epoch_history(
+    epochs: Sequence[Mapping[str, Any]],
+    *,
+    events: Sequence[Mapping[str, Any]],
+    initial_statement: Mapping[str, Any],
+    key: LifecycleAuthorityKey | None,
+    prevalidated_closed: Mapping[int, Mapping[str, Any]] | None = None,
+) -> None:
+    if not epochs:
+        raise OptunaLifecycleAuthorityError(
+            "Study lifecycle authority epoch history is missing."
+        )
+    study_uuid = initial_statement["payload"]["study_uuid"]
+    previous_signature: str | None = None
+    open_seen = False
+    for index, record in enumerate(epochs):
+        status = _epoch_status(record)
+        if open_seen:
+            raise OptunaLifecycleAuthorityError(
+                "Lifecycle epoch history has a non-terminal open epoch."
+            )
+        if status == "open":
+            if index != len(epochs) - 1:
+                raise OptunaLifecycleAuthorityError(
+                    "Lifecycle epoch history has a non-terminal open epoch."
+                )
+            open_seen = True
+            payload = deepcopy(dict(record["payload"]))
+            if set(payload) != EPOCH_PAYLOAD_KEYS:
+                raise OptunaLifecycleAuthorityError(
+                    "Open lifecycle epoch schema differs."
+                )
+            if (
+                record.get("payload_identity_sha256")
+                != hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+            ):
+                raise OptunaLifecycleAuthorityError(
+                    "Open lifecycle epoch payload identity differs."
+                )
+            if payload["epoch_payload_identity_sha256"] != _epoch_payload_identity(
+                payload
+            ):
+                raise OptunaLifecycleAuthorityError(
+                    "Open lifecycle epoch payload identity differs."
+                )
+            _validate_epoch_payload_types(payload, open_epoch=True)
+        else:
+            if key is None and not (
+                prevalidated_closed and index in prevalidated_closed
+            ):
+                # Cross-check path already compared the report epoch exactly; still
+                # require structural checks without recomputing HMAC when key absent.
+                payload = deepcopy(dict(record["payload"]))
+                if set(record) != {
+                    "payload",
+                    "payload_identity_sha256",
+                    "signature_sha256",
+                }:
+                    raise OptunaLifecycleAuthorityError(
+                        "Closed lifecycle epoch schema differs."
+                    )
+            else:
+                if key is None:
+                    payload = deepcopy(dict(record["payload"]))
+                else:
+                    payload = _validate_signed_statement(
+                        record,
+                        key=key,
+                        domain=EPOCH_DOMAIN,
+                        payload_keys=EPOCH_PAYLOAD_KEYS,
+                        label="lifecycle epoch ledger",
+                    )
+            if payload["epoch_payload_identity_sha256"] != _epoch_payload_identity(
+                payload
+            ):
+                raise OptunaLifecycleAuthorityError(
+                    "Lifecycle epoch payload identity differs."
+                )
+            _validate_epoch_payload_types(payload, open_epoch=False)
+            end_count = int(payload["event_signature_end_count"])
+            if end_count > len(events):
+                raise OptunaLifecycleAuthorityError(
+                    "Lifecycle epoch event coverage exceeds signed events."
+                )
+            close_event = events[end_count - 1]
+            if close_event["payload"]["event_type"] != "report_finalized":
+                raise OptunaLifecycleAuthorityError(
+                    "Lifecycle epoch close event is not report-finalized."
+                )
+        if (
+            payload["study_uuid"] != study_uuid
+            or payload["epoch_number"] != index
+            or payload["previous_epoch_ledger_signature_sha256"] != previous_signature
+        ):
+            raise OptunaLifecycleAuthorityError(
+                "Lifecycle epoch history sequence is malformed."
+            )
+        if status == "closed":
+            previous_signature = str(record["signature_sha256"])
+        else:
+            open_sequence = int(payload["epoch_open_event_sequence"])
+            if open_sequence != len(events) and open_sequence > len(events):
+                raise OptunaLifecycleAuthorityError(
+                    "Open lifecycle epoch event sequence is malformed."
+                )
+            if previous_signature is not None:
+                # Open suffix must continue after the previous closed end count.
+                prefix = int(payload["event_signature_prefix_count"])
+                if prefix > len(events):
+                    raise OptunaLifecycleAuthorityError(
+                        "Open lifecycle epoch event coverage is malformed."
+                    )
 
 
 def _reject_linked_components(path: Path) -> None:
