@@ -211,7 +211,7 @@ def execute_deployment(
                 "components": [item.summary for item in predictions],
             },
         )
-        store.write_csv("bag_summary.csv", pd.DataFrame.from_records(bag_records))
+        store.write_bag_summary(bag_records)
         component_frame = pd.DataFrame(
             {
                 "row_position": np.arange(len(blend), dtype=np.int64),

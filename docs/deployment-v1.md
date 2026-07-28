@@ -176,6 +176,26 @@ integers, or unsigned alternatives; persisted predictions are exact int8
 `{0,1}` and probabilities are nonnullable finite float64 in `[0,1]`. Threshold
 labels are recomputed directly from those float64 values using exact `>=`.
 
+Every authoritative deployment JSON object is checked recursively before
+inventory/manifest authentication and before semantic equality: exact key sets,
+list shape, primitive types (`type(value) is expected_type`), nullable policy,
+finite floats, integer/boolean separation, and field-specific enum/range rules.
+This applies to deployment, input, dataset, fixture, feature, encoding,
+component, prediction, runtime, environment, provenance, inventory/manifest,
+and terminal records. Resolved configuration and approval snapshots (including
+threshold and paired-comparison evidence) receive the same recursive exact-type
+comparison against their authenticated authorities. Python equality therefore
+cannot equate `true`, `1`, and `1.0` at this boundary.
+
+`bag_summary.csv` has a dedicated canonical writer and raw-byte reader. Its only
+accepted representation is UTF-8 without BOM, LF endings, the fixed v1 header,
+fixed row order, comma delimiters, no quoting, canonical nonnegative integer and
+`repr(float)` duration tokens, `True`/`False` booleans, one final newline, and no
+blank line. Validation preserves lexical provenance and reconstructs the exact
+canonical bytes before pandas materialization, so quoted numerics, alternate
+number spelling, whitespace, CRLF, BOM, quoting, and column reordering fail even
+when a permissive CSV parser could infer the same values.
+
 Runtime authority is limited to the exact schema/version, deployment ID, status,
 mode, canonical UTC timestamps, wall-clock duration derived from those
 timestamps, component/bag counts, model-persistence flag, and configured

@@ -49,6 +49,11 @@ from src.churn_ml.deployment_v1_features import (
     _validate_sample_and_alignment,
     build_full_data_encoding,
 )
+from src.churn_ml.deployment_v1_physical import (
+    BAG_SUMMARY_COLUMNS,
+    canonical_bag_summary_bytes,
+    read_exact_bag_summary,
+)
 from src.churn_ml.deployment_v1_paths import (
     DeploymentPathError,
     prewalk_regular_tree,
@@ -76,6 +81,32 @@ def test_production_loader_reconstructs_fully_authenticated_tiny_deployment(
         assert fixture.loaded.prediction_summary["row_count"] == 3
     finally:
         fixture.cleanup()
+
+
+def test_canonical_bag_summary_raw_bytes_round_trip(tmp_path: Path) -> None:
+    record = {
+        "component_id": "component",
+        "adapter_id": "xgboost_numeric_v1",
+        "bag_index": 1,
+        "bag_seed": 42,
+        "training_rows": 12,
+        "test_rows": 3,
+        "parameter_sha256": "a" * 64,
+        "probability_sha256": "b" * 64,
+        "probability_column": "component__seed_42",
+        "row_identity_sha256": "c" * 64,
+        "probability_bytes": 24,
+        "duration_seconds": 0.125,
+        "early_stopping": False,
+        "evaluation_set": False,
+        "model_persisted": False,
+    }
+    raw = canonical_bag_summary_bytes([record])
+    path = tmp_path / "bag_summary.csv"
+    path.write_bytes(raw)
+    loaded = read_exact_bag_summary(path)
+    assert loaded.columns.tolist() == BAG_SUMMARY_COLUMNS
+    assert raw == canonical_bag_summary_bytes(loaded.to_dict(orient="records"))
 
 
 def test_config_is_exact_and_rejects_bool_numbers_and_optimization(
@@ -612,6 +643,40 @@ PRODUCTION_CORRUPTIONS = (
     "alternate_quoting_submission",
     "float_text_label",
     "reordered_submission_columns",
+    "prediction_schema_bool",
+    "prediction_schema_float",
+    "prediction_schema_string",
+    "prediction_row_count_float",
+    "prediction_row_count_bool",
+    "prediction_row_count_string",
+    "dataset_train_rows_float",
+    "dataset_train_rows_bool",
+    "dataset_train_rows_string",
+    "feature_schema_bool",
+    "feature_schema_float",
+    "component_count_bool",
+    "component_count_float",
+    "deployment_seed_bool",
+    "deployment_seed_float",
+    "runtime_boolean_integer",
+    "encoding_unknown_nested_key",
+    "encoding_missing_nested_key",
+    "prediction_nan",
+    "prediction_inf",
+    "prediction_null_nonnullable",
+    "quoted_bag_index",
+    "quoted_bag_seed",
+    "quoted_probability_bytes",
+    "bag_seed_bool_token",
+    "bag_seed_leading_plus",
+    "bag_index_leading_zero",
+    "bag_index_whitespace",
+    "bag_duration_alternate_float",
+    "bag_crlf",
+    "bag_bom",
+    "bag_alternate_quoting",
+    "bag_reordered_columns",
+    "bag_trailing_blank_line",
 )
 
 
@@ -644,6 +709,98 @@ def test_production_loader_rejects_coherently_remanifested_corruption_matrix(
 
 
 def _mutate_completed_deployment(root: Path, corruption: str) -> None:
+    json_mutations: dict[str, tuple[str, tuple[str | int, ...], Any]] = {
+        "prediction_schema_bool": (
+            "prediction_summary.json",
+            ("schema_version",),
+            True,
+        ),
+        "prediction_schema_float": (
+            "prediction_summary.json",
+            ("schema_version",),
+            1.0,
+        ),
+        "prediction_schema_string": (
+            "prediction_summary.json",
+            ("schema_version",),
+            "1",
+        ),
+        "prediction_row_count_float": ("prediction_summary.json", ("row_count",), 3.0),
+        "prediction_row_count_bool": ("prediction_summary.json", ("row_count",), True),
+        "prediction_row_count_string": ("prediction_summary.json", ("row_count",), "3"),
+        "dataset_train_rows_float": ("dataset_identity.json", ("train_rows",), 12.0),
+        "dataset_train_rows_bool": ("dataset_identity.json", ("train_rows",), True),
+        "dataset_train_rows_string": ("dataset_identity.json", ("train_rows",), "12"),
+        "feature_schema_bool": ("feature_identity.json", ("schema_version",), True),
+        "feature_schema_float": ("feature_identity.json", ("schema_version",), 1.0),
+        "component_count_bool": (
+            "component_summary.json",
+            ("components", 0, "bag_count"),
+            True,
+        ),
+        "component_count_float": (
+            "component_summary.json",
+            ("components", 0, "bag_count"),
+            1.0,
+        ),
+        "deployment_seed_bool": (
+            "deployment_identity.json",
+            ("canonical", "resolved_config", "components", 0, "bag_seeds", 0),
+            True,
+        ),
+        "deployment_seed_float": (
+            "deployment_identity.json",
+            ("canonical", "resolved_config", "components", 0, "bag_seeds", 0),
+            0.0,
+        ),
+        "runtime_boolean_integer": ("runtime.json", ("network_access",), 0),
+        "prediction_nan": ("prediction_summary.json", ("positive_rate",), float("nan")),
+        "prediction_inf": ("prediction_summary.json", ("positive_rate",), float("inf")),
+        "prediction_null_nonnullable": (
+            "prediction_summary.json",
+            ("row_count",),
+            None,
+        ),
+    }
+    if corruption in json_mutations:
+        filename, path_parts, value = json_mutations[corruption]
+        path = root / filename
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        target: Any = payload
+        for part in path_parts[:-1]:
+            target = target[part]
+        target[path_parts[-1]] = value
+        _write_json(path, payload)
+        return
+    if corruption in {"encoding_unknown_nested_key", "encoding_missing_nested_key"}:
+        path = root / "encoding_identity.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        mapping = payload["components"]["manual-component"]["full_data_mappings"][
+            "category"
+        ]
+        if corruption == "encoding_unknown_nested_key":
+            mapping["unknown"] = 1
+        else:
+            del mapping["categories_sha256"]
+        _write_json(path, payload)
+        return
+    if corruption in {
+        "quoted_bag_index",
+        "quoted_bag_seed",
+        "quoted_probability_bytes",
+        "bag_seed_bool_token",
+        "bag_seed_leading_plus",
+        "bag_index_leading_zero",
+        "bag_index_whitespace",
+        "bag_duration_alternate_float",
+        "bag_crlf",
+        "bag_bom",
+        "bag_alternate_quoting",
+        "bag_reordered_columns",
+        "bag_trailing_blank_line",
+    }:
+        _mutate_bag_summary_bytes(root / "bag_summary.csv", corruption)
+        return
     if corruption in {
         "duplicate_encoding_assignment",
         "missing_encoding_assignment",
@@ -812,6 +969,50 @@ def _mutate_completed_deployment(root: Path, corruption: str) -> None:
         "terminal_not_newest",
     }:
         raise AssertionError(corruption)
+
+
+def _mutate_bag_summary_bytes(path: Path, corruption: str) -> None:
+    raw = path.read_bytes()
+    lines = raw.decode("utf-8").splitlines()
+    header = lines[0].split(",")
+    values = lines[1].split(",")
+    if corruption == "quoted_bag_index":
+        values[header.index("bag_index")] = '"1"'
+    elif corruption == "quoted_bag_seed":
+        index = header.index("bag_seed")
+        values[index] = f'"{values[index]}"'
+    elif corruption == "quoted_probability_bytes":
+        index = header.index("probability_bytes")
+        values[index] = f'"{values[index]}"'
+    elif corruption == "bag_seed_bool_token":
+        values[header.index("bag_seed")] = "True"
+    elif corruption == "bag_seed_leading_plus":
+        index = header.index("bag_seed")
+        values[index] = f"+{values[index]}"
+    elif corruption == "bag_index_leading_zero":
+        values[header.index("bag_index")] = "01"
+    elif corruption == "bag_index_whitespace":
+        values[header.index("bag_index")] = " 1"
+    elif corruption == "bag_duration_alternate_float":
+        index = header.index("duration_seconds")
+        values[index] = format(float(values[index]), ".18e")
+    elif corruption == "bag_crlf":
+        path.write_bytes(raw.replace(b"\n", b"\r\n"))
+        return
+    elif corruption == "bag_bom":
+        path.write_bytes(b"\xef\xbb\xbf" + raw)
+        return
+    elif corruption == "bag_alternate_quoting":
+        values[header.index("component_id")] = '"manual-component"'
+    elif corruption == "bag_reordered_columns":
+        header[0], header[1] = header[1], header[0]
+        values[0], values[1] = values[1], values[0]
+    elif corruption == "bag_trailing_blank_line":
+        path.write_bytes(raw + b"\n")
+        return
+    else:  # pragma: no cover - guards the explicit parameter allowlist.
+        raise AssertionError(corruption)
+    path.write_text(",".join(header) + "\n" + ",".join(values) + "\n", encoding="utf-8")
 
 
 def _mutate_terminal(root: Path, corruption: str) -> None:

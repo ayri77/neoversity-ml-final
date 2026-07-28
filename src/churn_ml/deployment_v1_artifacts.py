@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import math
 import platform
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -35,7 +37,9 @@ from src.churn_ml.deployment_v1_models import (
     probability_sha256,
 )
 from src.churn_ml.deployment_v1_physical import (
+    BAG_SUMMARY_COLUMNS,
     DeploymentPhysicalError,
+    canonical_bag_summary_bytes,
     canonical_csv_bytes,
     exact_mapping,
     format_utc_timestamp,
@@ -43,6 +47,8 @@ from src.churn_ml.deployment_v1_physical import (
     read_exact_bag_summary,
     require_columns,
     require_dtype,
+    require_exact_tree,
+    require_exact_tree_schema,
     require_exact_integer_values,
     require_float64_probabilities,
     require_row_id_dtype,
@@ -149,6 +155,12 @@ class DeploymentArtifactStore:
     def write_csv(self, relative: str, frame: pd.DataFrame) -> None:
         self._guard_write()
         _atomic_bytes(self.root / relative, canonical_csv_bytes(frame))
+
+    def write_bag_summary(self, records: list[dict[str, Any]]) -> None:
+        self._guard_write()
+        _atomic_bytes(
+            self.root / "bag_summary.csv", canonical_bag_summary_bytes(records)
+        )
 
     def write_parquet(self, relative: str, frame: pd.DataFrame) -> None:
         self._guard_write()
@@ -359,7 +371,37 @@ def _validate_deployment_artifacts_impl(
             f"directories={sorted(directories)}."
         )
 
+    authoritative_json = _validate_authoritative_json_artifacts(
+        deployment_root,
+        validated=validated,
+        data=data,
+        require_success=require_success,
+        verify_manifest=verify_manifest,
+    )
     resolved = _read_yaml(deployment_root / "resolved_deployment_config.yaml")
+    require_exact_tree_schema(
+        resolved, validated.config.resolved_payload(), "resolved_deployment_config"
+    )
+    approval_snapshots: dict[str, dict[str, Any]] = {}
+    for approval in validated.approvals:
+        snapshot = _read_yaml(
+            deployment_root / "approval_snapshot" / f"{approval.component_id}.yaml"
+        )
+        require_exact_tree_schema(snapshot, approval.payload, "approval_snapshot")
+        approval_snapshots[approval.component_id] = snapshot
+    if verify_manifest:
+        if authoritative_json["artifact_inventory.json"] != build_inventory(
+            deployment_root
+        ):
+            raise DeploymentArtifactError("Recursive artifact inventory differs.")
+        if authoritative_json["manifest.json"] != build_manifest(deployment_root):
+            raise DeploymentArtifactError("Deployment manifest differs.")
+    try:
+        require_exact_tree(
+            resolved, validated.config.resolved_payload(), "resolved_deployment_config"
+        )
+    except DeploymentPhysicalError as error:
+        raise DeploymentArtifactError(str(error)) from error
     if resolved != validated.config.resolved_payload():
         raise DeploymentArtifactError("Resolved deployment config differs.")
     identity = _read_json(deployment_root / "deployment_identity.json")
@@ -373,6 +415,10 @@ def _validate_deployment_artifacts_impl(
         snapshot = _read_yaml(
             deployment_root / "approval_snapshot" / f"{approval.component_id}.yaml"
         )
+        try:
+            require_exact_tree(snapshot, approval.payload, "approval_snapshot")
+        except DeploymentPhysicalError as error:
+            raise DeploymentArtifactError(str(error)) from error
         if snapshot != approval.payload:
             raise DeploymentArtifactError("Approval snapshot differs.")
         if _sha256(approval.source_path.read_bytes()) != approval.source_sha256:
@@ -539,27 +585,8 @@ def _validate_deployment_artifacts_impl(
         or tuple(bag_frame["row_id"].tolist()) != data.test_row_keys
     ):
         raise DeploymentArtifactError("Per-bag row identity/order differs.")
-    bag_columns = [
-        "component_id",
-        "adapter_id",
-        "bag_index",
-        "bag_seed",
-        "training_rows",
-        "test_rows",
-        "parameter_sha256",
-        "probability_sha256",
-        "probability_column",
-        "row_identity_sha256",
-        "probability_bytes",
-        "duration_seconds",
-        "early_stopping",
-        "evaluation_set",
-        "model_persisted",
-    ]
-    bag_summary = read_exact_bag_summary(
-        deployment_root / "bag_summary.csv", bag_columns
-    )
-    if bag_summary.columns.tolist() != bag_columns:
+    bag_summary = read_exact_bag_summary(deployment_root / "bag_summary.csv")
+    if bag_summary.columns.tolist() != BAG_SUMMARY_COLUMNS:
         raise DeploymentArtifactError("Bag summary schema differs.")
     expected_bag_count = sum(len(item["bag_seeds"]) for item in config_components)
     if len(bag_summary) != expected_bag_count:
@@ -785,9 +812,16 @@ def load_completed_deployment(
         allow_external_source=True,
     )
     validated = validate_loaded_deployment(config)
+    try:
+        require_exact_tree(
+            resolved, validated.config.resolved_payload(), "resolved_deployment_config"
+        )
+    except DeploymentPhysicalError as error:
+        raise DeploymentArtifactError(str(error)) from error
     if resolved != validated.config.resolved_payload():
         raise DeploymentArtifactError("Persisted deployment config differs.")
     fixture_identity = _read_json(deployment_root / "fixture_identity.json")
+    _validate_fixture_identity_header(fixture_identity)
     mode = fixture_identity.get("mode")
     fixture = None
     if mode == "synthetic":
@@ -830,8 +864,10 @@ def load_failed_deployment(root: Path) -> FailedDeployment:
         raise DeploymentArtifactError(str(error)) from error
     if (deployment_root / "_SUCCESS").exists():
         raise DeploymentArtifactError("Successful deployment is not failed.")
+    failure_payload = _read_json(deployment_root / "_FAILED")
+    _validate_json_primitive_tree(failure_payload, "_FAILED")
     failure = exact_mapping(
-        _read_json(deployment_root / "_FAILED"),
+        failure_payload,
         keys={"schema_version", "status", "failed_at_utc", "failure"},
         types={
             "schema_version": int,
@@ -853,6 +889,517 @@ def load_failed_deployment(root: Path) -> FailedDeployment:
     if not detail["type"] or not detail["message"]:
         raise DeploymentArtifactError("Failure marker detail differs.")
     return FailedDeployment(root=deployment_root, failure=failure)
+
+
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_JSON_FILE_RECORD_KEYS = {"path", "size_bytes", "sha256"}
+
+
+def _validate_authoritative_json_artifacts(
+    root: Path,
+    *,
+    validated: ValidatedDeployment,
+    data: DeploymentData,
+    require_success: bool,
+    verify_manifest: bool,
+) -> dict[str, dict[str, Any]]:
+    names = {
+        "deployment_identity.json",
+        "input_authentication.json",
+        "dataset_identity.json",
+        "fixture_identity.json",
+        "train_schema.json",
+        "test_schema.json",
+        "feature_identity.json",
+        "encoding_identity.json",
+        "component_summary.json",
+        "prediction_summary.json",
+        "runtime.json",
+        "environment.json",
+        "source_provenance.json",
+    }
+    if verify_manifest:
+        names.update({"artifact_inventory.json", "manifest.json"})
+    if require_success:
+        names.add("_SUCCESS")
+    payloads = {name: _read_json(root / name) for name in names}
+    for name, payload in payloads.items():
+        _validate_json_primitive_tree(payload, name)
+
+    pipeline_identity = validated.approvals[0].research_run.evaluation_plan_identity
+    expected_feature_identity = {
+        "schema_version": 1,
+        "pipeline_id": validated.config.payload["pipeline_id"],
+        "pipeline_sha256": validated.approvals[0].payload["research_run"][
+            "pipeline_sha256"
+        ],
+        "transformed_columns": data.X_train.columns.tolist(),
+        "transformed_columns_sha256": canonical_sha256(data.X_train.columns.tolist()),
+        "evaluation_plan_sha256": pipeline_identity["sha256"],
+    }
+    exact_expected = {
+        "deployment_identity.json": {
+            "sha256": validated.identity_sha256,
+            "canonical": validated.identity,
+        },
+        "dataset_identity.json": data.dataset_identity,
+        "fixture_identity.json": data.fixture_identity,
+        "train_schema.json": data.train_schema,
+        "test_schema.json": data.test_schema,
+        "feature_identity.json": expected_feature_identity,
+        "environment.json": environment_record(),
+        "source_provenance.json": source_provenance(validated.config.project_root),
+    }
+    for name, expected in exact_expected.items():
+        require_exact_tree_schema(payloads[name], expected, name)
+
+    _validate_input_authentication_schema(payloads["input_authentication.json"])
+    _validate_encoding_identity_schema(payloads["encoding_identity.json"], validated)
+    _validate_component_summary_schema(
+        payloads["component_summary.json"], validated, data
+    )
+    _validate_prediction_summary_schema(payloads["prediction_summary.json"])
+    _validate_runtime_schema(payloads["runtime.json"])
+    if verify_manifest:
+        _validate_inventory_schema(
+            payloads["artifact_inventory.json"],
+            label="artifact_inventory",
+            manifest=False,
+        )
+        _validate_inventory_schema(
+            payloads["manifest.json"], label="manifest", manifest=True
+        )
+    if require_success:
+        exact_mapping(
+            payloads["_SUCCESS"],
+            keys={
+                "schema_version",
+                "deployment_id",
+                "status",
+                "manifest_sha256",
+                "completed_at_utc",
+            },
+            types={
+                "schema_version": int,
+                "deployment_id": str,
+                "status": str,
+                "manifest_sha256": str,
+                "completed_at_utc": str,
+            },
+            label="_SUCCESS",
+        )
+    return payloads
+
+
+def _validate_json_primitive_tree(value: Any, label: str) -> None:
+    if type(value) is dict:
+        for key, child in value.items():
+            if type(key) is not str:
+                raise DeploymentArtifactError(f"{label} contains a non-string key.")
+            _validate_json_primitive_tree(child, f"{label}.{key}")
+        return
+    if type(value) is list:
+        for index, child in enumerate(value):
+            _validate_json_primitive_tree(child, f"{label}[{index}]")
+        return
+    if type(value) is float and not math.isfinite(value):
+        raise DeploymentArtifactError(f"{label} must be finite.")
+    if type(value) not in {str, int, float, bool, type(None)}:
+        raise DeploymentArtifactError(f"{label} contains an invalid JSON primitive.")
+
+
+def _validate_runtime_schema(payload: dict[str, Any]) -> None:
+    exact = exact_mapping(
+        payload,
+        keys={
+            "schema_version",
+            "deployment_id",
+            "status",
+            "mode",
+            "started_at_utc",
+            "finished_at_utc",
+            "duration_seconds",
+            "component_count",
+            "bag_count",
+            "model_persistence",
+            "competition_test_access_authorized",
+            "network_access",
+            "tracking_enabled",
+        },
+        types={
+            "schema_version": int,
+            "deployment_id": str,
+            "status": str,
+            "mode": str,
+            "started_at_utc": str,
+            "finished_at_utc": str,
+            "duration_seconds": float,
+            "component_count": int,
+            "bag_count": int,
+            "model_persistence": bool,
+            "competition_test_access_authorized": bool,
+            "network_access": bool,
+            "tracking_enabled": bool,
+        },
+        label="runtime",
+    )
+    if (
+        exact["schema_version"] != 1
+        or exact["status"] != "completed"
+        or exact["mode"] not in {"dry-run", "run"}
+        or exact["component_count"] <= 0
+        or exact["bag_count"] <= 0
+        or not math.isfinite(exact["duration_seconds"])
+        or exact["duration_seconds"] < 0.0
+    ):
+        raise DeploymentArtifactError("Runtime exact schema/range differs.")
+    parse_utc_timestamp(exact["started_at_utc"])
+    parse_utc_timestamp(exact["finished_at_utc"])
+
+
+def _validate_fixture_identity_header(payload: dict[str, Any]) -> None:
+    exact = exact_mapping(
+        payload,
+        keys={"schema_version", "mode", "sha256", "canonical"},
+        types={
+            "schema_version": int,
+            "mode": str,
+            "sha256": str,
+            "canonical": dict,
+        },
+        label="fixture_identity",
+    )
+    if exact["schema_version"] != 1 or exact["mode"] not in {
+        "synthetic",
+        "competition",
+    }:
+        raise DeploymentArtifactError("Fixture identity schema differs.")
+    _require_sha256(exact["sha256"], "fixture_identity.sha256")
+
+
+def _validate_input_authentication_schema(payload: dict[str, Any]) -> None:
+    exact = exact_mapping(
+        payload,
+        keys={"schema_version", "sources"},
+        types={"schema_version": int, "sources": list},
+        label="input_authentication",
+    )
+    if exact["schema_version"] != 1 or not exact["sources"]:
+        raise DeploymentArtifactError("Input authentication schema differs.")
+    fields = {
+        "source_type",
+        "repository_relative_path",
+        "kind",
+        "size_bytes",
+        "sha256",
+        "semantic_identity",
+        "path_chain_sha256",
+    }
+    types = {
+        "source_type": str,
+        "repository_relative_path": str,
+        "kind": str,
+        "size_bytes": int,
+        "sha256": str,
+        "semantic_identity": str,
+        "path_chain_sha256": str,
+    }
+    allowed_types = {
+        "deployment_config",
+        "candidate_approval",
+        "completed_research_run",
+        "threshold_evidence",
+        "paired_comparison",
+        "synthetic_fixture",
+        "competition_test",
+        "sample_submission",
+    }
+    for index, value in enumerate(exact["sources"]):
+        source = exact_mapping(
+            value,
+            keys=fields,
+            types=types,
+            label=f"input_authentication.sources[{index}]",
+        )
+        if source["source_type"] not in allowed_types:
+            raise DeploymentArtifactError("Input authentication source type differs.")
+        if source["kind"] not in {"file", "directory"}:
+            raise DeploymentArtifactError("Input authentication kind differs.")
+        if source["size_bytes"] <= 0:
+            raise DeploymentArtifactError("Input authentication size differs.")
+        _require_sha256(source["sha256"], "input_authentication.sha256")
+        _require_sha256(
+            source["path_chain_sha256"], "input_authentication.path_chain_sha256"
+        )
+        if not source["repository_relative_path"] or not source["semantic_identity"]:
+            raise DeploymentArtifactError("Input authentication string differs.")
+
+
+def _validate_encoding_identity_schema(
+    payload: dict[str, Any], validated: ValidatedDeployment
+) -> None:
+    exact = exact_mapping(
+        payload,
+        keys={"schema_version", "components"},
+        types={"schema_version": int, "components": dict},
+        label="encoding_identity",
+    )
+    if exact["schema_version"] != 1:
+        raise DeploymentArtifactError("Encoding identity version differs.")
+    expected_ids = {approval.component_id for approval in validated.approvals}
+    if set(exact["components"]) != expected_ids:
+        raise DeploymentArtifactError("Encoding identity component keys differ.")
+    keys = {
+        "schema_version",
+        "method",
+        "encoder_contract",
+        "assignment_sha256",
+        "categorical_columns",
+        "passthrough_columns",
+        "transformed_columns",
+        "full_data_mappings",
+        "train_matrix_sha256",
+        "test_matrix_sha256",
+        "test_fit_performed",
+        "imputation_performed",
+        "sha256",
+    }
+    types = {
+        "schema_version": int,
+        "method": str,
+        "encoder_contract": dict,
+        "assignment_sha256": str,
+        "categorical_columns": list,
+        "passthrough_columns": list,
+        "transformed_columns": list,
+        "full_data_mappings": dict,
+        "train_matrix_sha256": str,
+        "test_matrix_sha256": str,
+        "test_fit_performed": bool,
+        "imputation_performed": bool,
+        "sha256": str,
+    }
+    for approval in validated.approvals:
+        label = f"encoding_identity.components.{approval.component_id}"
+        identity = exact_mapping(
+            exact["components"][approval.component_id],
+            keys=keys,
+            types=types,
+            label=label,
+        )
+        if identity["schema_version"] != 1:
+            raise DeploymentArtifactError(f"{label} version differs.")
+        if identity["method"] != "deterministic_oof_train_full_mapping_test":
+            raise DeploymentArtifactError(f"{label} method differs.")
+        contract = approval.research_run.config.adapter_contract
+        expected_contract = (
+            contract["target_encoder"]
+            if approval.adapter_id == "manual_lightgbm_te_v1_compat"
+            else contract["numeric_features"]
+        )
+        require_exact_tree_schema(
+            identity["encoder_contract"], dict(expected_contract), label
+        )
+        for field in (
+            "assignment_sha256",
+            "train_matrix_sha256",
+            "test_matrix_sha256",
+            "sha256",
+        ):
+            _require_sha256(identity[field], f"{label}.{field}")
+        for field in (
+            "categorical_columns",
+            "passthrough_columns",
+            "transformed_columns",
+        ):
+            _require_string_list(identity[field], f"{label}.{field}")
+        for column, mapping in identity["full_data_mappings"].items():
+            if type(column) is not str or not column:
+                raise DeploymentArtifactError(f"{label} mapping key differs.")
+            record = exact_mapping(
+                mapping,
+                keys={"categories_sha256", "encoded_values_sha256", "global_mean"},
+                types={
+                    "categories_sha256": str,
+                    "encoded_values_sha256": str,
+                    "global_mean": float,
+                },
+                label=f"{label}.full_data_mappings.{column}",
+            )
+            _require_sha256(record["categories_sha256"], label)
+            _require_sha256(record["encoded_values_sha256"], label)
+            if (
+                not math.isfinite(record["global_mean"])
+                or not 0.0 <= record["global_mean"] <= 1.0
+            ):
+                raise DeploymentArtifactError(f"{label} global mean differs.")
+
+
+def _validate_component_summary_schema(
+    payload: dict[str, Any], validated: ValidatedDeployment, data: DeploymentData
+) -> None:
+    exact = exact_mapping(
+        payload,
+        keys={"schema_version", "components"},
+        types={"schema_version": int, "components": list},
+        label="component_summary",
+    )
+    if exact["schema_version"] != 1 or len(exact["components"]) != len(
+        validated.approvals
+    ):
+        raise DeploymentArtifactError("Component summary schema differs.")
+    keys = {
+        "schema_version",
+        "component_id",
+        "adapter_id",
+        "bag_seeds",
+        "bag_count",
+        "training_rows_per_bag",
+        "all_training_rows_used",
+        "aggregation",
+        "component_probability_sha256",
+        "runtime_library_version",
+        "row_identity_sha256",
+        "model_persistence",
+    }
+    for index, (summary, component, approval) in enumerate(
+        zip(
+            exact["components"],
+            validated.config.payload["components"],
+            validated.approvals,
+            strict=True,
+        )
+    ):
+        label = f"component_summary.components[{index}]"
+        if type(summary) is not dict or set(summary) != keys:
+            raise DeploymentArtifactError(f"{label} keys differ.")
+        exact_types = {
+            "schema_version": int,
+            "component_id": str,
+            "adapter_id": str,
+            "bag_seeds": list,
+            "bag_count": int,
+            "training_rows_per_bag": int,
+            "all_training_rows_used": bool,
+            "aggregation": str,
+            "component_probability_sha256": str,
+            "row_identity_sha256": str,
+            "model_persistence": bool,
+        }
+        for field, expected_type in exact_types.items():
+            if type(summary[field]) is not expected_type:
+                raise DeploymentArtifactError(f"{label}.{field} type differs.")
+        if (
+            summary["runtime_library_version"] is not None
+            and type(summary["runtime_library_version"]) is not str
+        ):
+            raise DeploymentArtifactError(
+                f"{label}.runtime_library_version type differs."
+            )
+        expected_seeds = sorted(int(seed) for seed in component["bag_seeds"])
+        require_exact_tree(summary["bag_seeds"], expected_seeds, f"{label}.bag_seeds")
+        if (
+            summary["schema_version"] != 1
+            or summary["component_id"] != approval.component_id
+            or summary["adapter_id"] != approval.adapter_id
+            or summary["bag_count"] != len(expected_seeds)
+            or summary["training_rows_per_bag"] != len(data.X_train)
+            or summary["all_training_rows_used"] is not True
+            or summary["aggregation"] != "arithmetic_mean"
+            or summary["model_persistence"] is not False
+        ):
+            raise DeploymentArtifactError(f"{label} value differs.")
+        _require_sha256(summary["component_probability_sha256"], label)
+        _require_sha256(summary["row_identity_sha256"], label)
+
+
+def _validate_prediction_summary_schema(payload: dict[str, Any]) -> None:
+    summary = exact_mapping(
+        payload,
+        keys={
+            "schema_version",
+            "row_count",
+            "blend_probability_sha256",
+            "threshold",
+            "comparison",
+            "positive_count",
+            "positive_rate",
+            "submission_sha256",
+        },
+        types={
+            "schema_version": int,
+            "row_count": int,
+            "blend_probability_sha256": str,
+            "threshold": float,
+            "comparison": str,
+            "positive_count": int,
+            "positive_rate": float,
+            "submission_sha256": str,
+        },
+        label="prediction_summary",
+    )
+    if (
+        summary["schema_version"] != 1
+        or summary["row_count"] <= 0
+        or not 0 <= summary["positive_count"] <= summary["row_count"]
+        or summary["comparison"] != "greater_than_or_equal"
+    ):
+        raise DeploymentArtifactError("Prediction summary range/enum differs.")
+    for field in ("threshold", "positive_rate"):
+        if not math.isfinite(summary[field]) or not 0.0 <= summary[field] <= 1.0:
+            raise DeploymentArtifactError(f"Prediction summary {field} differs.")
+    _require_sha256(summary["blend_probability_sha256"], "prediction_summary")
+    _require_sha256(summary["submission_sha256"], "prediction_summary")
+
+
+def _validate_inventory_schema(
+    payload: dict[str, Any], *, label: str, manifest: bool
+) -> None:
+    keys = {"schema_version", "hashing_method", "directories", "files"}
+    types = {
+        "schema_version": int,
+        "hashing_method": str,
+        "directories": list,
+        "files": list,
+    }
+    if manifest:
+        keys.add("manifest_sha256")
+        types["manifest_sha256"] = str
+    exact = exact_mapping(payload, keys=keys, types=types, label=label)
+    if (
+        exact["schema_version"] != 1
+        or exact["hashing_method"] != "sha256_raw_file_bytes_recursive_posix_paths"
+    ):
+        raise DeploymentArtifactError(f"{label} version/method differs.")
+    _require_string_list(exact["directories"], f"{label}.directories")
+    if exact["directories"] != sorted(set(exact["directories"])):
+        raise DeploymentArtifactError(f"{label} directories differ.")
+    paths: list[str] = []
+    for index, value in enumerate(exact["files"]):
+        record = exact_mapping(
+            value,
+            keys=_JSON_FILE_RECORD_KEYS,
+            types={"path": str, "size_bytes": int, "sha256": str},
+            label=f"{label}.files[{index}]",
+        )
+        if not record["path"] or record["size_bytes"] < 0:
+            raise DeploymentArtifactError(f"{label} file record differs.")
+        _require_sha256(record["sha256"], f"{label}.files[{index}].sha256")
+        paths.append(record["path"])
+    if paths != sorted(set(paths)):
+        raise DeploymentArtifactError(f"{label} file order differs.")
+    if manifest:
+        _require_sha256(exact["manifest_sha256"], f"{label}.manifest_sha256")
+
+
+def _require_string_list(value: Any, label: str) -> None:
+    if type(value) is not list or any(type(item) is not str for item in value):
+        raise DeploymentArtifactError(f"{label} must contain exact strings.")
+
+
+def _require_sha256(value: Any, label: str) -> None:
+    if type(value) is not str or _SHA256_PATTERN.fullmatch(value) is None:
+        raise DeploymentArtifactError(f"{label} must be a lowercase SHA-256.")
 
 
 def _tree_paths(root: Path) -> tuple[set[str], set[str]]:
