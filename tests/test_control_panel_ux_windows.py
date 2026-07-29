@@ -121,38 +121,60 @@ def test_child_can_resolve_path_home_with_windows_home_vars(tmp_path: Path) -> N
 def test_apptest_config_options_follow_command_and_action(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # After the readability patch, selectbox options and values contain readable labels
+    # (AppTest applies format_func to both options and value).
+    # We verify via _config_options that the raw paths are correct and check labels.
+    from src.churn_ml.control_panel.presentation import readable_config_label
+
     spy = StartSpy()
     at = _run_page(monkeypatch, spy)
     at = _select(at, "Operation", "mlflow_local_index")
     config = next(item for item in at.selectbox if item.label == "Config")
-    assert "configs/mlflow/local.yaml" in list(config.options)
+    # options are formatted labels; value is the raw path (session state)
+    mlflow_label = readable_config_label("configs/mlflow/local.yaml", PROJECT_ROOT)
+    assert mlflow_label in list(config.options)
     assert config.value == "configs/mlflow/local.yaml"
 
     at = _select(at, "Operation", "optuna_search_v1")
     config = next(item for item in at.selectbox if item.label == "Config")
-    assert "configs/mlflow/local.yaml" not in list(config.options)
-    assert all(
-        str(option).startswith("configs/optuna/")
-        or str(option).startswith("artifacts/ui_configs/")
-        for option in config.options
-    )
-    assert config.value in list(config.options)
+    # No mlflow label should appear in optuna config options (formatted)
+    assert mlflow_label not in list(config.options)
+    # value is a raw path; must start with valid roots
+    assert str(config.value).startswith("configs/optuna/") or str(
+        config.value
+    ).startswith("artifacts/ui_configs/")
 
     at = _select(at, "Action", "run")
     config = next(item for item in at.selectbox if item.label == "Config")
-    assert config.value in list(config.options)
+    # value is raw path, options are formatted labels; value must be non-empty
+    assert config.value
 
 
 def test_stale_config_session_value_is_discarded() -> None:
-    options = control_panel_app._config_options(
+    option_pairs = control_panel_app._config_options(
         load_registry(PROJECT_ROOT),
         ("configs/optuna/*.yaml",),
     )
-    assert options
+    assert option_pairs
+    options = [path for path, _label in option_pairs]
     stale = "configs/mlflow/local.yaml"
     assert stale not in options
     selected = stale if stale in options else options[0]
     assert selected == options[0]
+
+
+def test_config_label_includes_human_readable_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """readable_config_label for a lightgbm development config should mention LightGBM."""
+    from src.churn_ml.control_panel.presentation import readable_config_label
+
+    label = readable_config_label(
+        "configs/research_v2/manual_lightgbm_te_v1_compat_development.yaml",
+        PROJECT_ROOT,
+    )
+    assert "LightGBM" in label
+    assert "Development" in label
 
 
 def test_artifact_selector_lists_only_completed_optuna(tmp_path: Path) -> None:

@@ -99,3 +99,51 @@ runs. Re-sync is idempotent for already-indexed approved artifacts.
 | `artifacts/ui_jobs` | UI operational job records only |
 | `artifacts/ui_configs` | Editable config copies |
 | `artifacts/mlflow` | Local MLflow index store |
+
+## Understanding the control panel UI
+
+### Operations and Actions
+
+**Operation** corresponds to a command group (e.g. Experiment Core v2, Optuna Search v1).
+**Action** is the specific task within that operation (e.g. Run, Validate, New study).
+These are separate because they have different safety levels, configs, and CLIs.
+
+### Source types
+
+| Source | Meaning |
+| --- | --- |
+| Canonical config | Version-controlled config in `configs/` |
+| Optuna export | Best-trial YAML exported from a completed search |
+| UI config copy | Editable copy saved under `artifacts/ui_configs/` |
+
+### Model and Mode
+
+**Model** is inferred from the config filename (e.g. `manual_lightgbm_te_v1_compat` → LightGBM).
+**Mode** is inferred similarly (e.g. `_development` → Development, `_smoke` → Smoke).
+
+### Smoke vs Development
+
+| Mode | Purpose |
+| --- | --- |
+| SMOKE | Quick technical check; small subset; not for scoring |
+| DEVELOPMENT | Full evaluation protocol; use for model selection |
+
+### Verifying the pre-run summary
+
+Before clicking "Start background job", expand **Pre-run summary** and verify:
+
+- Model matches your intention (e.g. LightGBM, not XGBoost).
+- Mode is correct (Development for real evaluations, Smoke for checks).
+- Source shows "Canonical config" unless you intentionally selected an Optuna export.
+- Config basename matches the file you intended.
+
+The exact argv below the summary is always authoritative.
+
+### Example: running manual_lightgbm_te_v1_compat_development.yaml
+
+1. Operation → **Experiment Core v2**
+2. Action → **Run**
+3. Config → select **LightGBM — Development — manual TE compatibility [CANONICAL]**
+4. Expand Pre-run summary and confirm: Model=LightGBM, Mode=Development, Source=Canonical config
+5. Check the confirmation box
+6. Click **Start background job**

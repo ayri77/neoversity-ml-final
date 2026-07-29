@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import timedelta
 from pathlib import Path
 
 
@@ -8,7 +7,17 @@ def human_duration(seconds: float | int | None) -> str:
     if seconds is None:
         return "—"
     value = max(0, int(seconds))
-    return str(timedelta(seconds=value))
+    if value < 60:
+        return f"{value}s"
+    if value < 3600:
+        minutes = value // 60
+        secs = value % 60
+        return f"{minutes}m {secs:02d}s"
+    hours = value // 3600
+    remainder = value % 3600
+    minutes = remainder // 60
+    secs = remainder % 60
+    return f"{hours}h {minutes}m {secs:02d}s"
 
 
 def safe_path_display(path: Path, repository_root: Path) -> str:

@@ -17,7 +17,8 @@ commands:
       - "artifacts/ui_configs/*.yaml"
       - "artifacts/ui_configs/*.yml"
       - "artifacts/ui_configs/*.json"
-    allowed_input_roots: ["configs/research_v2", "artifacts/ui_configs"]
+      - "artifacts/optuna_exports/*.yaml"
+    allowed_input_roots: ["configs/research_v2", "artifacts/ui_configs", "artifacts/optuna_exports"]
     allowed_output_roots: []
     result_reader_id: research_v2
     artifact_url: null
@@ -32,7 +33,7 @@ commands:
             type: path
             role: config
             required: true
-            roots: ["configs/research_v2", "artifacts/ui_configs"]
+            roots: ["configs/research_v2", "artifacts/ui_configs", "artifacts/optuna_exports"]
             must_exist: true
         confirmation: none
         enabled: true
@@ -48,7 +49,7 @@ commands:
             type: path
             role: config
             required: true
-            roots: ["configs/research_v2", "artifacts/ui_configs"]
+            roots: ["configs/research_v2", "artifacts/ui_configs", "artifacts/optuna_exports"]
             must_exist: true
         confirmation: confirm
         enabled: true

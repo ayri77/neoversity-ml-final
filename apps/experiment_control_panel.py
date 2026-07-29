@@ -40,6 +40,18 @@ from src.churn_ml.control_panel.launch import (  # noqa: E402
     rendered_launch,
 )
 from src.churn_ml.control_panel.formatting import human_duration  # noqa: E402
+from src.churn_ml.control_panel.presentation import (  # noqa: E402
+    build_pre_run_summary,
+    config_badge,
+    format_date,
+    format_time,
+    job_primary_label,
+    mode_badge,
+    normalize_mode,
+    normalize_source_kind,
+    parse_config_metadata,
+    readable_config_label,
+)
 from src.churn_ml.control_panel.jobs import JobError, JobManager  # noqa: E402
 from src.churn_ml.control_panel.placeholder_suggestions import (  # noqa: E402
     SuggestionError,
@@ -96,11 +108,10 @@ def dashboard_page() -> None:
         st.dataframe(
             [
                 {
-                    "job": item.job_id,
+                    "label": job_primary_label(item.job),
                     "status": item.status["state"],
-                    "command": item.job["command_id"],
-                    "action": item.job["action_id"],
-                    "created": item.job["created_at_utc"],
+                    "date": format_date(item.job.get("created_at_utc")),
+                    "time": format_time(item.job.get("created_at_utc")),
                 }
                 for item in jobs[:10]
             ],
@@ -213,6 +224,11 @@ def run_page() -> None:
     if selected_config is not None and selected_config.is_file():
         _config_panel(loaded, selected_config)
 
+    # Save last valid selections for UX continuity.
+    # Per-command per-action placeholder keys already persist via widget_key scheme.
+    st.session_state["_last_command_id"] = command_id
+    st.session_state["_last_action_id"] = action_id
+
     built = None
     try:
         if action.enabled:
@@ -223,6 +239,23 @@ def run_page() -> None:
                 values,
                 repository_root=REPOSITORY_ROOT,
             )
+            pre_run = build_pre_run_summary(
+                command_id,
+                action_id,
+                command.title,
+                action.title,
+                values,
+                REPOSITORY_ROOT,
+            )
+            with st.expander("Pre-run summary"):
+                if pre_run:
+                    st.dataframe(
+                        [{"field": k, "value": v} for k, v in pre_run.items()],
+                        width="stretch",
+                        hide_index=True,
+                    )
+                else:
+                    st.caption("No metadata available.")
             st.code(display_argv(built.redacted_argv), language="python")
         else:
             st.code(
@@ -247,6 +280,28 @@ def run_page() -> None:
         st.session_state["_rendered_launch"] = rendered
     else:
         st.session_state["_rendered_launch"] = None
+    if action.competition_test or action.confirmation not in {"none", ""}:
+        config_path = values.get("config", "")
+        _meta = (
+            parse_config_metadata(str(config_path), REPOSITORY_ROOT)
+            if config_path
+            else {}
+        )
+        _model = _meta.get("model_family", "—")
+        _mode = _meta.get("mode", "—")
+        _cfg_base = Path(str(config_path)).name if config_path else "—"
+        if action.competition_test:
+            _level_badge = "[DEPLOYMENT]"
+        elif _meta.get("mode"):
+            _level_badge = f"[{mode_badge(_meta['mode'])}]"
+        else:
+            _level_badge = ""
+        st.warning(
+            f"⚠️ Review before launch\n\n"
+            f"Model: **{_model}** | Mode: **{_mode}** | "
+            f"Action: **{action.title}** | Config: `{_cfg_base}` {_level_badge}"
+        )
+
     confirmed = True
     if action.confirmation in {"confirm", "acknowledge"}:
         confirmed = st.checkbox(
@@ -316,7 +371,10 @@ def jobs_page() -> None:
         "Exit code",
         status.get("exit_code") if status.get("exit_code") is not None else "—",
     )
-    st.json(dict(record.job), expanded=False)
+    created = record.job.get("created_at_utc")
+    st.write(f"**Date:** {format_date(created)}  **Time:** {format_time(created)}")
+    with st.expander("Technical details"):
+        st.json(dict(record.job), expanded=False)
     if status.get("diagnostic"):
         st.warning(str(status["diagnostic"]))
     st.code(display_argv(tuple(record.command["argv"])), language="python")
@@ -364,10 +422,18 @@ def results_page() -> None:
     if not artifacts:
         st.info("No artifacts match this configured reader.")
         return
+    artifact_paths = [item.relative_path for item in artifacts]
+
+    def artifact_option_label(path: str) -> str:
+        return readable_config_label(path, REPOSITORY_ROOT) if path else path
+
     selected_path = st.selectbox(
         "Artifact",
-        [item.relative_path for item in artifacts],
+        artifact_paths,
+        format_func=artifact_option_label,
     )
+    if selected_path:
+        st.caption(f"`{selected_path}`")
     selected = next(item for item in artifacts if item.relative_path == selected_path)
     st.write(f"Status: `{selected.state}`")
     if selected.diagnostic:
@@ -574,15 +640,43 @@ def _placeholder_widget(
     if spec.type == "integer":
         return int(st.number_input(label, step=1, key=widget_key))
     if spec.role == "config":
-        options = _config_options(loaded, config_globs)
-        if not options:
+        option_pairs = _config_options(loaded, config_globs)
+        if not option_pairs:
             st.warning("No allowed configuration files were found.")
             st.session_state.pop(widget_key, None)
             return None
+        options = [path for path, _label in option_pairs]
+        labels = dict(option_pairs)
         current = st.session_state.get(widget_key)
         if current not in options:
             st.session_state[widget_key] = options[0]
-        return st.selectbox(label, options, key=widget_key)
+        selected_value = st.selectbox(
+            label,
+            options,
+            key=widget_key,
+            format_func=lambda v: labels.get(v, v),
+        )
+        st.caption(f"`{selected_value}`")
+        if selected_value:
+            _stem = Path(str(selected_value)).stem
+            _parts = _stem.split("_")
+            _mode_raw = ""
+            for _part in reversed(_parts):
+                if _part in ("smoke", "development", "deployment"):
+                    _mode_raw = _part
+                    break
+            _source_kind = normalize_source_kind(str(selected_value))
+            _badge_src = config_badge(_source_kind)
+            _mode_display = normalize_mode(_mode_raw) if _mode_raw else ""
+            _badge_mode = mode_badge(_mode_display) if _mode_display else ""
+            badge_parts = []
+            if _badge_src:
+                badge_parts.append(f"[{_badge_src}]")
+            if _badge_mode:
+                badge_parts.append(f"[{_badge_mode}]")
+            if badge_parts:
+                st.caption(" ".join(badge_parts))
+        return selected_value
     if spec.artifact_reader_id is not None:
         return _artifact_path_widget(loaded, name, spec, widget_key)
     if spec.suggested_value_template is not None:
@@ -686,14 +780,16 @@ def _action_requires_additional_input(action: ActionSpec) -> bool:
     return any(spec.role in {"output", "config", "value"} for spec in required)
 
 
-def _config_options(loaded: ControlPanelRegistry, globs: tuple[str, ...]) -> list[str]:
+def _config_options(
+    loaded: ControlPanelRegistry, globs: tuple[str, ...]
+) -> list[tuple[str, str]]:
     del loaded
     paths: set[str] = set()
     for pattern in globs:
         for path in REPOSITORY_ROOT.glob(pattern):
             if path.is_file() and not path.is_symlink():
                 paths.add(path.relative_to(REPOSITORY_ROOT).as_posix())
-    return sorted(paths)
+    return [(p, readable_config_label(p, REPOSITORY_ROOT)) for p in sorted(paths)]
 
 
 def _config_panel(loaded: ControlPanelRegistry, selected: Path) -> None:
@@ -701,7 +797,11 @@ def _config_panel(loaded: ControlPanelRegistry, selected: Path) -> None:
         text, canonical = read_config(
             REPOSITORY_ROOT,
             selected.relative_to(REPOSITORY_ROOT),
-            allowed_roots=("configs", loaded.settings.editable_config_root),
+            allowed_roots=(
+                "configs",
+                loaded.settings.editable_config_root,
+                "artifacts/optuna_exports",
+            ),
         )
     except ConfigEditError as error:
         st.error(str(error))
@@ -745,10 +845,8 @@ def _all_artifacts(loaded: ControlPanelRegistry) -> list[ArtifactRecord]:
 
 
 def _job_label(record: Any) -> str:
-    return (
-        f"{record.status['state']} · {record.job['command_id']}/"
-        f"{record.job['action_id']} · {record.job_id[:8]}"
-    )
+    label = job_primary_label(record.job)
+    return f"{label} · {record.job_id[:8]}"
 
 
 def main() -> None:
