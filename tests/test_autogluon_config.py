@@ -265,13 +265,32 @@ def test_config_only_validation_without_ignored_data(tmp_path: Path) -> None:
 def test_profile_registry_and_unknown_profile() -> None:
     assert {profile.profile_id for profile in list_profiles()} == {
         "realtabpfn_only_v1",
+        "tabm_only_gpu_v1",
         "catboost_only_cpu_v1",
         "lightgbmprep_only_cpu_v1",
         "extreme_seqmem_v1",
     }
     assert get_profile("realtabpfn_only_v1").included_model_types == ("REALTABPFN-V2",)
+    assert get_profile("tabm_only_gpu_v1").included_model_types == ("TABM",)
     with pytest.raises(ValueError, match="Unknown AutoGluon profile"):
         get_profile("arbitrary_python_profile")
+
+
+def test_tabm_overnight_yaml_loads_without_training() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    config_path = (
+        repository_root / "configs" / "autogluon" / "tabm_overnight_gpu_3h.yaml"
+    )
+    config = load_config(config_path, repository_root, require_data_files=False)
+    assert config.profile_id == "tabm_only_gpu_v1"
+    assert config.seed == 42
+    assert config.resources.time_limit_seconds == 10800
+    assert config.resources.num_gpus == 1
+    assert config.resources.fit_strategy == "sequential"
+    assert config.resources.fold_fitting_strategy == "sequential_local"
+    assert config.dataset.version == "v3_targeted_missingness"
+    assert config.fit.presets == "extreme_quality"
+    assert config.fit.calibrate_decision_threshold is True
 
 
 @pytest.mark.parametrize(

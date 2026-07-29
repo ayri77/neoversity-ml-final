@@ -89,3 +89,29 @@ def test_gpu_profile_rejects_insufficient_budget(
             seed=42,
             gpu_budget=0,
         )
+
+
+def test_tabm_only_gpu_profile_resources_and_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_registry(monkeypatch)
+    profile = get_profile("tabm_only_gpu_v1")
+    assert profile.included_model_types == ("TABM",)
+    assert profile.excluded_model_types == ()
+    assert profile.minimum_gpu_budget == 1
+    assert profile.portfolio == "zeroshot_2025_12_18_gpu"
+
+    resolved = resolve_profile_hyperparameters(profile, seed=42, gpu_budget=1)
+    assert set(resolved) == {"TABM"}
+    resources = effective_family_resources(resolved)
+    assert resources["TABM"]["num_gpus"] == [1]
+    for configuration in resolved["TABM"]:
+        assert configuration["ag_args_ensemble"]["model_random_seed"] == 42
+        assert (
+            configuration["ag_args_ensemble"]["fold_fitting_strategy"]
+            == "sequential_local"
+        )
+        assert configuration["ag_args_ensemble"]["vary_seed_across_folds"] is False
+
+    with pytest.raises(RuntimeError, match="requires GPU budget"):
+        resolve_profile_hyperparameters(profile, seed=42, gpu_budget=0)

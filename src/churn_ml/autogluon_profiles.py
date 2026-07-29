@@ -38,6 +38,17 @@ _PROFILES = {
         excluded_model_types=(),
         minimum_gpu_budget=1,
     ),
+    "tabm_only_gpu_v1": AutoGluonProfile(
+        profile_id="tabm_only_gpu_v1",
+        description=(
+            "All TabM configurations in the AutoGluon 1.5.0 "
+            "zeroshot_2025_12_18_gpu portfolio."
+        ),
+        portfolio="zeroshot_2025_12_18_gpu",
+        included_model_types=("TABM",),
+        excluded_model_types=(),
+        minimum_gpu_budget=1,
+    ),
     "catboost_only_cpu_v1": AutoGluonProfile(
         profile_id="catboost_only_cpu_v1",
         description="The AutoGluon 1.5.0 CPU portfolio CatBoost family, forced to CPU.",
