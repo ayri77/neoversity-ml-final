@@ -5,12 +5,16 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
 
 _MAX_CONFIG_BYTES = 32 * 1024
+_RUN_ID_RE = re.compile(
+    r"^(?P<stamp>\d{8}T\d{6}(?:\d{0,6})?Z)_(?P<hash>[0-9a-fA-F]{6,})$"
+)
+_NA = "Not available"
 
 
 def normalize_model_family(raw: str) -> str:
@@ -86,22 +90,8 @@ def mode_badge(mode: str) -> str:
     return mapping.get(mode, mode.upper())
 
 
-def _read_config_bounded(path: Path) -> dict[str, Any] | None:
+def _read_file_bounded(path: Path) -> dict[str, Any] | None:
     try:
-        if path.is_dir():
-            for candidate in (
-                "study_summary.json",
-                "best_trial.json",
-                "metrics/aggregate.json",
-                "decision_report.json",
-                "prediction_summary.json",
-                "aggregate_summary.json",
-            ):
-                nested = path / candidate
-                loaded = _read_config_bounded(nested)
-                if loaded is not None:
-                    return loaded
-            return None
         if not path.is_file():
             return None
         size = path.stat().st_size
@@ -119,6 +109,186 @@ def _read_config_bounded(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _read_config_bounded(path: Path) -> dict[str, Any] | None:
+    try:
+        if path.is_dir():
+            for candidate in (
+                "resolved_config.yaml",
+                "run_metadata.json",
+                "study_summary.json",
+                "best_trial.json",
+                "metrics/aggregate.json",
+                "decision_report.json",
+                "prediction_summary.json",
+                "aggregate_summary.json",
+            ):
+                nested = path / candidate
+                loaded = _read_file_bounded(nested)
+                if loaded is not None:
+                    return loaded
+            return None
+        return _read_file_bounded(path)
+    except Exception:
+        return None
+
+
+def parse_run_id_timestamp(run_id: str) -> str | None:
+    """Convert a research run_id stamp into an ISO-8601 UTC timestamp string."""
+    match = _RUN_ID_RE.match(run_id.strip())
+    if match is None:
+        return None
+    stamp = match.group("stamp")
+    # YYYYMMDDTHHMMSS[ffffff]Z
+    date_part = stamp[:8]
+    time_part = stamp[9:]
+    if time_part.endswith("Z"):
+        time_part = time_part[:-1]
+    if len(time_part) < 6:
+        return None
+    hour = time_part[0:2]
+    minute = time_part[2:4]
+    second = time_part[4:6]
+    fraction = time_part[6:]
+    iso = f"{date_part[0:4]}-{date_part[4:6]}-{date_part[6:8]}T{hour}:{minute}:{second}"
+    if fraction:
+        iso = f"{iso}.{fraction}"
+    return f"{iso}+00:00"
+
+
+def is_raw_run_id(value: str) -> bool:
+    return _RUN_ID_RE.match(value.strip()) is not None
+
+
+def humanize_experiment_token(raw: str, model_family: str = "") -> str:
+    """Turn adapter/experiment tokens into a short human label."""
+    text = raw.strip()
+    if not text:
+        return ""
+    if is_raw_run_id(text):
+        return ""
+    lower = text.lower()
+    for prefix in (
+        "manual_lightgbm_",
+        "lightgbm_",
+        "xgboost_",
+        "catboost_",
+        "autogluon_",
+        "manual_",
+    ):
+        if lower.startswith(prefix):
+            text = text[len(prefix) :]
+            lower = text.lower()
+            break
+    for suffix in ("_smoke", "_development", "_deployment"):
+        if lower.endswith(suffix):
+            text = text[: -len(suffix)]
+            lower = text.lower()
+            break
+    replacements = {
+        "te": "TE",
+        "compat": "compatibility",
+        "v1": "v1",
+        "v2": "v2",
+        "v3": "v3",
+        "numeric": "numeric",
+        "pipeline": "pipeline",
+    }
+    words: list[str] = []
+    for token in text.replace("__", "_").split("_"):
+        if not token:
+            continue
+        mapped = replacements.get(token.lower())
+        if mapped is not None:
+            words.append(mapped)
+        else:
+            words.append(token)
+    label = " ".join(words).strip()
+    if not label:
+        return model_family or raw
+    if model_family and not label.lower().startswith(model_family.lower()):
+        return f"{model_family} {label}".strip()
+    return label
+
+
+def format_primary_metric(value: Any, *, prefix: str = "BA") -> str | None:
+    try:
+        if value is None or value == "":
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f"{prefix} {number:.6f}"
+
+
+def _merge_metadata(result: dict[str, str], content: dict[str, Any]) -> None:
+    experiment = content.get("experiment", {})
+    if isinstance(experiment, dict):
+        exp_id = experiment.get("id", "")
+        if exp_id and "experiment_name" not in result:
+            result["experiment_name"] = str(exp_id)
+        model = experiment.get("model", {})
+        if isinstance(model, dict):
+            adapter = model.get("adapter", "")
+            if adapter:
+                result["adapter_id"] = str(adapter)
+                result.setdefault("model_family", normalize_model_family(str(adapter)))
+        cv = experiment.get("cv", {})
+        if isinstance(cv, dict):
+            repeats = cv.get("repeats")
+            folds = cv.get("folds")
+            if repeats is not None:
+                result["repeats"] = str(repeats)
+            if folds is not None:
+                result["folds"] = str(folds)
+
+    plan = content.get("plan", {})
+    if isinstance(plan, dict):
+        plan_id = plan.get("id", "")
+        if plan_id:
+            result["plan_id"] = str(plan_id)
+
+    optuna = content.get("optuna", {})
+    if isinstance(optuna, dict):
+        n_trials = optuna.get("n_trials")
+        if n_trials is not None:
+            result["n_trials"] = str(n_trials)
+
+    if "best_trial_number" in content:
+        result["best_trial"] = str(content["best_trial_number"])
+    if "best_objective" in content:
+        result["best_objective"] = str(content["best_objective"])
+    if "status" in content and "status" not in result:
+        result["status"] = str(content["status"])
+
+    if "study_name" in content and "experiment_name" not in result:
+        result["experiment_name"] = str(content["study_name"])
+    if "search_id" in content and "experiment_name" not in result:
+        result["experiment_name"] = str(content["search_id"])
+
+    if "experiment_id" in content and "experiment_name" not in result:
+        result["experiment_name"] = str(content["experiment_id"])
+    if "plan_id" in content and "plan_id" not in result:
+        result["plan_id"] = str(content["plan_id"])
+    if "candidate_adapter_id" in content:
+        adapter = str(content["candidate_adapter_id"])
+        result["adapter_id"] = adapter
+        result.setdefault("model_family", normalize_model_family(adapter))
+    if "started_at_utc" in content and "created_at_utc" not in result:
+        result["created_at_utc"] = str(content["started_at_utc"])
+    if "finished_at_utc" in content and "created_at_utc" not in result:
+        result["created_at_utc"] = str(content["finished_at_utc"])
+
+    metrics = content.get("metrics")
+    if isinstance(metrics, dict):
+        ba = metrics.get("balanced_accuracy")
+        if isinstance(ba, dict) and ba.get("mean") is not None:
+            result["balanced_accuracy"] = str(ba["mean"])
+        elif content.get("primary_metric") == "balanced_accuracy" and isinstance(
+            metrics.get("balanced_accuracy"), (int, float)
+        ):
+            result["balanced_accuracy"] = str(metrics["balanced_accuracy"])
+
+
 def parse_config_metadata(path_str: str, repo_root: Path) -> dict[str, str]:
     try:
         full_path = repo_root / path_str
@@ -127,8 +297,14 @@ def parse_config_metadata(path_str: str, repo_root: Path) -> dict[str, str]:
         result: dict[str, str] = {"source_kind": source_kind}
 
         stem = Path(path_str).stem
+        basename = Path(path_str).name
         parts = [p for p in Path(path_str).parts if p not in (".",)]
-        path_tokens = list(parts) + stem.split("_")
+        path_tokens: list[str] = []
+        for part in parts:
+            path_tokens.append(part)
+            path_tokens.extend(part.split("_"))
+            path_tokens.extend(part.split("__"))
+        path_tokens.extend(stem.split("_"))
 
         mode_candidates = ["smoke", "development", "deployment"]
         for part in reversed(path_tokens):
@@ -136,51 +312,36 @@ def parse_config_metadata(path_str: str, repo_root: Path) -> dict[str, str]:
                 result["mode"] = normalize_mode(part)
                 break
 
+        run_stamp = parse_run_id_timestamp(basename)
+        if run_stamp is not None:
+            result["created_at_utc"] = run_stamp
+            result["run_id"] = basename
+
+        if full_path.is_dir():
+            for relative in (
+                "run_metadata.json",
+                "resolved_config.yaml",
+                "metrics/aggregate.json",
+                "study_summary.json",
+                "best_trial.json",
+            ):
+                nested = _read_file_bounded(full_path / relative)
+                if nested is not None:
+                    _merge_metadata(result, nested)
+            # Parent pipeline__adapter directory often encodes model family.
+            if len(parts) >= 2:
+                parent = parts[-2]
+                if "__" in parent:
+                    adapter_token = parent.split("__", 1)[1]
+                    result.setdefault(
+                        "model_family", normalize_model_family(adapter_token)
+                    )
+                    result.setdefault("adapter_id", adapter_token)
+                    if "experiment_name" not in result:
+                        result["experiment_name"] = adapter_token
+
         if content is not None:
-            experiment = content.get("experiment", {})
-            if isinstance(experiment, dict):
-                exp_id = experiment.get("id", "")
-                if exp_id:
-                    result["experiment_name"] = str(exp_id)
-                model = experiment.get("model", {})
-                if isinstance(model, dict):
-                    adapter = model.get("adapter", "")
-                    if adapter:
-                        result["adapter_id"] = str(adapter)
-                        result["model_family"] = normalize_model_family(str(adapter))
-                cv = experiment.get("cv", {})
-                if isinstance(cv, dict):
-                    repeats = cv.get("repeats")
-                    folds = cv.get("folds")
-                    if repeats is not None:
-                        result["repeats"] = str(repeats)
-                    if folds is not None:
-                        result["folds"] = str(folds)
-
-            plan = content.get("plan", {})
-            if isinstance(plan, dict):
-                plan_id = plan.get("id", "")
-                if plan_id:
-                    result["plan_id"] = str(plan_id)
-
-            optuna = content.get("optuna", {})
-            if isinstance(optuna, dict):
-                n_trials = optuna.get("n_trials")
-                if n_trials is not None:
-                    result["n_trials"] = str(n_trials)
-
-            if "best_trial_number" in content:
-                result["best_trial"] = str(content["best_trial_number"])
-            if "best_objective" in content:
-                result["best_objective"] = str(content["best_objective"])
-            if "status" in content:
-                result["status"] = str(content["status"])
-
-            # Optuna study_summary / best_trial payloads under artifact dirs
-            if "study_name" in content and "best_trial" not in result:
-                result["experiment_name"] = str(content["study_name"])
-            if "search_id" in content and "experiment_name" not in result:
-                result["experiment_name"] = str(content["search_id"])
+            _merge_metadata(result, content)
 
         if "model_family" not in result:
             for token in path_tokens:
@@ -308,7 +469,9 @@ def format_duration(seconds: float | int | None) -> str:
     return f"{hours}h {minutes}m {secs:02d}s"
 
 
-def job_primary_label(record_job: dict, record_commands: dict | None = None) -> str:
+def job_primary_label(
+    record_job: Mapping[str, Any], record_commands: dict | None = None
+) -> str:
     try:
         command_id = record_job.get("command_id", "")
         action_id = record_job.get("action_id", "")
@@ -343,6 +506,15 @@ def job_primary_label(record_job: dict, record_commands: dict | None = None) -> 
 
         if operation:
             parts.append(operation)
+
+        created = record_job.get("created_at_utc")
+        if isinstance(created, str) and created:
+            date_label = format_date(created)
+            time_label = format_time(created)
+            if date_label and date_label not in {"—", "Invalid timestamp"}:
+                parts.append(date_label)
+            if time_label:
+                parts.append(time_label)
 
         if parts:
             return " · ".join(parts)
@@ -442,6 +614,41 @@ class ConfigCascadeOption:
     basename: str
 
 
+def _experiment_core_label(meta: dict[str, str], basename: str) -> str:
+    model_family = meta.get("model_family", "")
+    experiment_token = (
+        meta.get("experiment_name")
+        or meta.get("adapter_id")
+        or _stem_description(Path(basename).stem)
+        or ""
+    )
+    experiment = humanize_experiment_token(str(experiment_token), model_family)
+    if not experiment or is_raw_run_id(experiment):
+        experiment = humanize_experiment_token(
+            meta.get("adapter_id", ""), model_family
+        ) or (model_family or "Experiment")
+
+    created = meta.get("created_at_utc")
+    date_label = format_date(created) if created else ""
+    time_label = format_time(created) if created else ""
+    # Prefer HH:MM for compact selector labels when seconds are available.
+    if time_label and len(time_label) >= 5:
+        time_label = time_label[:5]
+
+    metric = format_primary_metric(meta.get("balanced_accuracy"))
+    if metric is None:
+        metric = format_primary_metric(meta.get("best_objective"), prefix="obj")
+
+    parts = [experiment]
+    if date_label and date_label not in {"—", "Invalid timestamp"}:
+        parts.append(date_label)
+    if time_label:
+        parts.append(time_label)
+    if metric:
+        parts.append(metric)
+    return " · ".join(parts)
+
+
 def build_cascade_options(
     paths: list[str], repo_root: Path
 ) -> list[ConfigCascadeOption]:
@@ -459,22 +666,40 @@ def build_cascade_options(
             trial = meta.get("best_trial", "")
             obj = meta.get("best_objective", "")
             name = meta.get("experiment_name", "")
+            created = meta.get("created_at_utc")
+            date_label = format_date(created) if created else ""
+            time_label = format_time(created) if created else ""
+            if time_label and len(time_label) >= 5:
+                time_label = time_label[:5]
+            metric = format_primary_metric(obj, prefix="BA")
             if trial and obj not in ("", "None", "none"):
-                try:
-                    obj_f = float(obj)
-                    label_core = f"trial {trial} · objective {obj_f:.6f}"
-                except ValueError:
-                    label_core = f"trial {trial} · {obj}"
+                label_core = f"Optuna trial {trial}"
             elif name:
                 label_core = str(name)
             elif trial:
-                label_core = f"trial {trial}"
+                label_core = f"Optuna trial {trial}"
             else:
                 label_core = basename
+            extras = [
+                part
+                for part in (date_label, time_label, metric)
+                if part and part not in {"—", "Invalid timestamp"}
+            ]
+            if extras:
+                label_core = " · ".join([label_core, *extras])
+        elif source_kind in {"Experiment Core run", "Research v1 run"} or is_raw_run_id(
+            basename
+        ):
+            label_core = _experiment_core_label(meta, basename)
         else:
             stem = Path(path).stem
             desc = _stem_description(stem)
-            label_core = desc if desc else (meta.get("experiment_name") or basename)
+            if desc and not is_raw_run_id(desc.replace(" ", "_")):
+                label_core = desc
+            else:
+                label_core = meta.get("experiment_name") or basename
+                if is_raw_run_id(str(label_core)):
+                    label_core = _experiment_core_label(meta, basename)
 
         if label_core in seen_labels:
             seen_labels[label_core] += 1
@@ -557,8 +782,32 @@ def readable_path_label(path_str: str, repo_root: Path) -> str:
         parts.append(opt.model_family)
     if opt.mode:
         parts.append(opt.mode)
-    parts.append(opt.display_label)
-    return " · ".join(parts)
+    # Avoid duplicating model/mode already present in the experiment label.
+    display = opt.display_label
+    if opt.model_family and display.startswith(f"{opt.model_family} "):
+        display = display
+    parts.append(display)
+    label = " · ".join(parts)
+    if is_raw_run_id(Path(path_str).name) and Path(path_str).name in label:
+        # Never present timestamp hashes as the primary readable label.
+        meta = parse_config_metadata(path_str, repo_root)
+        rebuilt = _experiment_core_label(meta, Path(path_str).name)
+        parts = []
+        if opt.model_family:
+            parts.append(opt.model_family)
+        if opt.mode:
+            parts.append(opt.mode)
+        parts.append(rebuilt)
+        label = " · ".join(parts)
+    return label
+
+
+def experiment_selector_label(path_str: str, repo_root: Path) -> str:
+    """Final-cascade experiment label (date/time/metric; no raw run id)."""
+    opts = build_cascade_options([path_str], repo_root)
+    if not opts:
+        return Path(path_str).name
+    return opts[0].display_label
 
 
 def enum_human_label(value: str) -> str:

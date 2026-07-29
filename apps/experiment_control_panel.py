@@ -6,7 +6,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
+import pandas as pd
 import streamlit as st
+
+try:
+    import plotly.express as px  # type: ignore[import-untyped]
+except Exception:  # pragma: no cover - optional at runtime if env is incomplete
+    px = None  # type: ignore[assignment]
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -17,10 +23,13 @@ from src.churn_ml.control_panel.artifacts import (  # noqa: E402
     ArtifactRecord,
     ArtifactReadError,
     artifact_selector_options,
+    build_experiment_table_rows,
     configured_artifact_file,
     comparison_rows,
     csv_preview,
+    default_comparison_id,
     discover_artifacts,
+    display_compatibility_summary,
     text_tail,
 )
 from src.churn_ml.control_panel.command_builder import (  # noqa: E402
@@ -51,6 +60,7 @@ from src.churn_ml.control_panel.presentation import (  # noqa: E402
     enum_human_label,
     format_date,
     format_time,
+    is_raw_run_id,
     job_primary_label,
     mode_badge,
     mode_human_label,
@@ -73,6 +83,11 @@ from src.churn_ml.control_panel.schemas import (  # noqa: E402
     ActionSpec,
     PlaceholderSpec,
     SchemaError,
+)
+from src.churn_ml.control_panel.selection_state import (  # noqa: E402
+    remember_widget_selection,
+    seed_widget_from_logical,
+    widget_selection_key,
 )
 
 
@@ -219,10 +234,21 @@ def run_page() -> None:
         else {}
     )
     for name, value in prefill_values.items():
+        placeholder = action.placeholders.get(name)
+        role = placeholder.role if placeholder is not None else "value"
+        shared_key = widget_selection_key(command_id, role, name)
+        st.session_state.setdefault(shared_key, value)
+        # Keep legacy per-action key in sync for older session handoffs.
         st.session_state.setdefault(f"value-{command_id}-{action_id}-{name}", value)
 
     for name, placeholder in action.placeholders.items():
-        widget_key = f"value-{command_id}-{action_id}-{name}"
+        widget_key = widget_selection_key(command_id, placeholder.role, name)
+        # Migrate a previous per-action value once when shared key is empty.
+        legacy_key = f"value-{command_id}-{action_id}-{name}"
+        if st.session_state.get(widget_key) in (None, "") and st.session_state.get(
+            legacy_key
+        ) not in (None, ""):
+            st.session_state[widget_key] = st.session_state[legacy_key]
         value = _placeholder_widget(
             loaded,
             command.allowed_config_globs,
@@ -230,6 +256,7 @@ def run_page() -> None:
             placeholder,
             widget_key,
             values,
+            operation=command_id,
         )
         if value not in (None, ""):
             values[name] = value
@@ -239,8 +266,6 @@ def run_page() -> None:
     if selected_config is not None and selected_config.is_file():
         _config_panel(loaded, selected_config)
 
-    # Save last valid selections for UX continuity.
-    # Per-command per-action placeholder keys already persist via widget_key scheme.
     st.session_state["_last_command_id"] = command_id
     st.session_state["_last_action_id"] = action_id
 
@@ -426,28 +451,217 @@ def jobs_page() -> None:
 def results_page() -> None:
     loaded = registry()
     st.title("Results")
-    reader_id = st.selectbox(
+    experiments_tab, inspect_tab, compare_tab = st.tabs(
+        ["Experiments", "Inspect result", "Compare experiments"]
+    )
+    with experiments_tab:
+        _results_experiments_tab(loaded)
+    with inspect_tab:
+        _results_inspect_tab(loaded)
+    with compare_tab:
+        _results_compare_tab(loaded)
+
+
+def _results_reader_select(loaded: ControlPanelRegistry, key: str) -> Any:
+    reader_ids = list(loaded.readers)
+    return st.selectbox(
         "Artifact type",
-        list(loaded.readers),
+        reader_ids,
+        key=key,
         format_func=lambda value: loaded.readers[value].title,
     )
+
+
+def _results_experiments_tab(loaded: ControlPanelRegistry) -> None:
+    reader_id = _results_reader_select(loaded, "results-experiments-reader")
+    reader = loaded.readers[reader_id]
+    artifacts = discover_artifacts(REPOSITORY_ROOT, reader)
+    if not artifacts:
+        st.info("No artifacts match this configured reader.")
+        return
+
+    rows = build_experiment_table_rows(artifacts, repo_root=REPOSITORY_ROOT)
+    models = sorted(
+        {str(row["Model"]) for row in rows if row["Model"] != "Not available"}
+    )
+    modes = sorted({str(row["Mode"]) for row in rows if row["Mode"] != "Not available"})
+    statuses = sorted({str(row["Status"]) for row in rows})
+
+    filter_cols = st.columns(4)
+    selected_model = filter_cols[0].selectbox(
+        "Model",
+        ["All", *models],
+        key=f"results-exp-filter-model-{reader_id}",
+    )
+    selected_mode = filter_cols[1].selectbox(
+        "Mode",
+        ["All", *modes],
+        key=f"results-exp-filter-mode-{reader_id}",
+    )
+    selected_status = filter_cols[2].selectbox(
+        "Status",
+        ["All", *statuses],
+        key=f"results-exp-filter-status-{reader_id}",
+    )
+    search = filter_cols[3].text_input(
+        "Search experiment/config",
+        key=f"results-exp-filter-search-{reader_id}",
+    )
+
+    filtered = []
+    for row in rows:
+        if selected_model != "All" and row["Model"] != selected_model:
+            continue
+        if selected_mode != "All" and row["Mode"] != selected_mode:
+            continue
+        if selected_status != "All" and row["Status"] != selected_status:
+            continue
+        if search:
+            needle = search.lower()
+            haystack = " ".join(
+                str(row.get(key, ""))
+                for key in ("Experiment", "Model", "Mode", "Artifact path")
+            ).lower()
+            if needle not in haystack:
+                continue
+        filtered.append(row)
+
+    display_columns = [
+        "Model",
+        "Mode",
+        "Experiment",
+        "Created date",
+        "Created time",
+        "Balanced Accuracy",
+        "Sensitivity",
+        "Specificity",
+        "ROC AUC",
+        "Average Precision",
+        "Brier score",
+        "Threshold median",
+        "Status",
+        "Artifact path",
+    ]
+    display_rows = [{key: row.get(key) for key in display_columns} for row in filtered]
+    if not display_rows:
+        st.info("No experiments match the current filters.")
+    else:
+        st.dataframe(
+            display_rows,
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption(
+            "Select one or more rows when Streamlit selection is available. "
+            "Artifact path is technical metadata only."
+        )
+
+    _render_experiment_charts(filtered)
+
+
+def _render_experiment_charts(rows: list[dict[str, Any]]) -> None:
+    st.subheader("Experiment charts")
+    if not rows:
+        st.info("Charts appear when at least one experiment row is available.")
+        return
+    if len(rows) == 1:
+        st.caption(
+            "Only one experiment is in view; charts still render for inspection."
+        )
+
+    chart_frame = []
+    for row in rows:
+        chart_frame.append(
+            {
+                "Experiment": row.get("_chart_label") or row.get("Experiment"),
+                "Model": row.get("Model"),
+                "Mode": row.get("Mode"),
+                "Created date": row.get("Created date"),
+                "Created time": row.get("Created time"),
+                "Balanced Accuracy": row.get("_ba"),
+                "Sensitivity": row.get("_sensitivity"),
+                "Specificity": row.get("_specificity"),
+                "ROC AUC": row.get("_roc_auc"),
+                "Average Precision": row.get("_average_precision"),
+            }
+        )
+    frame = pd.DataFrame(chart_frame)
+    hover = ["Model", "Mode", "Created date", "Created time", "Balanced Accuracy"]
+
+    if px is None:
+        st.warning("Plotly is unavailable; showing tabular chart data instead.")
+        st.dataframe(frame, width="stretch", hide_index=True)
+        return
+
+    ba_frame = frame.dropna(subset=["Balanced Accuracy"])
+    if ba_frame.empty:
+        st.info("Balanced Accuracy is not available for the filtered experiments.")
+    else:
+        fig_ba = px.bar(
+            ba_frame,
+            x="Experiment",
+            y="Balanced Accuracy",
+            hover_data=hover,
+            title="Balanced Accuracy by experiment",
+        )
+        fig_ba.update_layout(xaxis_title="Experiment", yaxis_title="Balanced Accuracy")
+        st.plotly_chart(fig_ba, width="stretch")
+
+    sens_frame = frame.dropna(subset=["Sensitivity", "Specificity"])
+    if sens_frame.empty:
+        st.info("Sensitivity/Specificity are not available for scatter plotting.")
+    else:
+        fig_ss = px.scatter(
+            sens_frame,
+            x="Sensitivity",
+            y="Specificity",
+            text="Experiment",
+            hover_data=hover,
+            title="Sensitivity vs Specificity",
+        )
+        fig_ss.update_traces(textposition="top center")
+        st.plotly_chart(fig_ss, width="stretch")
+
+    roc_frame = frame.dropna(subset=["ROC AUC", "Average Precision"])
+    if roc_frame.empty:
+        st.info("ROC AUC / Average Precision are not available for scatter plotting.")
+    else:
+        fig_roc = px.scatter(
+            roc_frame,
+            x="ROC AUC",
+            y="Average Precision",
+            text="Experiment",
+            hover_data=hover,
+            title="ROC AUC vs Average Precision",
+        )
+        fig_roc.update_traces(textposition="top center")
+        st.plotly_chart(fig_roc, width="stretch")
+
+
+def _results_inspect_tab(loaded: ControlPanelRegistry) -> None:
+    reader_id = _results_reader_select(loaded, "results-inspect-reader")
     reader = loaded.readers[reader_id]
     artifacts = discover_artifacts(REPOSITORY_ROOT, reader)
     if not artifacts:
         st.info("No artifacts match this configured reader.")
         return
     artifact_paths = [item.relative_path for item in artifacts]
-
+    source_kinds = {
+        opt.source_kind
+        for opt in build_cascade_options(artifact_paths, REPOSITORY_ROOT)
+    }
     selected_path = _cascade_item_selector(
         artifact_paths,
-        widget_key=f"results-{reader_id}-artifact",
-        item_label="Artifact",
-        include_source=False,
+        widget_key=f"results-inspect-{reader_id}",
+        item_label="Experiment",
+        include_source=len(source_kinds) > 1,
         advanced_label="Advanced: raw artifact path",
     )
     if not selected_path:
         return
     selected = next(item for item in artifacts if item.relative_path == selected_path)
+    st.caption(f"Config basename: `{Path(selected_path).name}`")
+    st.code(selected_path, language="text")
     st.write(f"Status: `{selected.state}`")
     if selected.diagnostic:
         st.warning(selected.diagnostic)
@@ -483,87 +697,13 @@ def results_page() -> None:
                     language="text",
                 )
 
-    st.subheader("Side-by-side comparison")
-    left_item = selected
-    right_item = selected
-    if len(artifacts) < 2:
-        st.info("At least two artifacts are required.")
-    else:
-        left_col, right_col = st.columns(2)
-        with left_col:
-            st.markdown("**Left**")
-            left_path = _cascade_item_selector(
-                artifact_paths,
-                widget_key=f"compare-left-{reader_id}",
-                item_label="Left artifact",
-                include_source=False,
-                model_label="Left model",
-                mode_label="Left mode",
-                show_advanced=False,
-                default_index=0,
-            )
-        with right_col:
-            st.markdown("**Right**")
-            right_path = _cascade_item_selector(
-                artifact_paths,
-                widget_key=f"compare-right-{reader_id}",
-                item_label="Right artifact",
-                include_source=False,
-                model_label="Right model",
-                mode_label="Right mode",
-                show_advanced=False,
-                default_index=1,
-            )
-        if left_path and right_path:
-            left_item = next(
-                item for item in artifacts if item.relative_path == left_path
-            )
-            right_item = next(
-                item for item in artifacts if item.relative_path == right_path
-            )
-            st.dataframe(
-                comparison_rows(left_item, right_item, reader.compare_fields),
-                width="stretch",
-                hide_index=True,
-            )
-        if reader_id == "research_v2":
-            st.caption(
-                "Use the Paired Comparison action on the Run page for the official "
-                "compatibility gate and comparison artifact. This table is display-only."
-            )
-
-    if reader_id == "research_v2" and len(artifacts) >= 2:
-        comparison_id = st.text_input(
-            "New comparison ID",
-            value="ui-paired-comparison",
-        )
-        comparison_ready = (
-            left_item.state == "completed" and right_item.state == "completed"
-        )
-        if (
-            st.button("Prepare Paired Comparison action", disabled=not comparison_ready)
-            and comparison_ready
-        ):
-            st.session_state["run-command"] = "paired_comparison"
-            st.session_state["run-action-paired_comparison"] = "run"
-            st.session_state["run_prefill"] = {
-                "command_id": "paired_comparison",
-                "action_id": "run",
-                "values": {
-                    "baseline_run_dir": left_item.relative_path,
-                    "candidate_run_dir": right_item.relative_path,
-                    "comparison_id": comparison_id,
-                    "output_root": "artifacts/research_v2_comparisons",
-                },
-            }
-            st.success(
-                "Prepared the allowlisted action. Open Run to review argv and confirm."
-            )
     if reader_id == "deployment_v1":
         deployment_valid = selected.state != "invalid"
         if (
             st.button(
-                "Prepare deployment Inspect action", disabled=not deployment_valid
+                "Prepare deployment Inspect action",
+                disabled=not deployment_valid,
+                key="results-prepare-deployment-inspect",
             )
             and deployment_valid
         ):
@@ -578,6 +718,149 @@ def results_page() -> None:
                 "Prepared the allowlisted action. Open Run to review argv and start."
             )
 
+    _results_registry_actions(loaded, reader_id)
+
+
+def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
+    reader_id = _results_reader_select(loaded, "results-compare-reader")
+    reader = loaded.readers[reader_id]
+    artifacts = discover_artifacts(REPOSITORY_ROOT, reader)
+    if not artifacts:
+        st.info("No artifacts match this configured reader.")
+        return
+    if len(artifacts) < 2:
+        st.info("At least two artifacts are required for comparison.")
+        return
+
+    artifact_paths = [item.relative_path for item in artifacts]
+    source_kinds = {
+        opt.source_kind
+        for opt in build_cascade_options(artifact_paths, REPOSITORY_ROOT)
+    }
+    include_source = len(source_kinds) > 1
+
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.markdown("**Left**")
+        left_path = _cascade_item_selector(
+            artifact_paths,
+            widget_key=f"compare-left-{reader_id}",
+            item_label="Experiment",
+            include_source=include_source,
+            model_label="Model",
+            mode_label="Mode",
+            show_advanced=False,
+            default_index=0,
+        )
+    with right_col:
+        st.markdown("**Right**")
+        right_path = _cascade_item_selector(
+            artifact_paths,
+            widget_key=f"compare-right-{reader_id}",
+            item_label="Experiment",
+            include_source=include_source,
+            model_label="Model",
+            mode_label="Mode",
+            show_advanced=False,
+            default_index=1,
+        )
+    if not left_path or not right_path:
+        return
+
+    left_item = next(item for item in artifacts if item.relative_path == left_path)
+    right_item = next(item for item in artifacts if item.relative_path == right_path)
+
+    compatibility = display_compatibility_summary(left_item, right_item)
+    st.subheader("Compatibility")
+    st.write(
+        {
+            "same evaluation plan": compatibility["same_evaluation_plan"],
+            "same dataset fingerprint": compatibility["same_dataset_fingerprint"],
+            "same fold assignments": compatibility["same_fold_assignments"],
+            "status": compatibility["status"],
+        }
+    )
+    if compatibility["compatible"]:
+        st.success("Display check: compatible fingerprints.")
+    else:
+        st.warning(
+            "Display check: incompatible or incomplete fingerprints. "
+            "Official Paired Comparison remains the authoritative gate."
+        )
+
+    compare_frame = comparison_rows(left_item, right_item, reader.compare_fields)
+    st.dataframe(
+        [
+            {
+                "Metric": row["Metric"],
+                "Left": row["Left"],
+                "Right": row["Right"],
+                "Delta (Right - Left)": row["Delta (Right - Left)"],
+            }
+            for row in compare_frame
+        ],
+        width="stretch",
+        hide_index=True,
+    )
+    if any(row["Metric"] == "Brier score" for row in compare_frame):
+        st.caption(
+            "Brier score delta is numeric only (Right - Left). Lower Brier score is better; "
+            "a positive delta is not an improvement."
+        )
+    if reader_id == "research_v2":
+        st.caption(
+            "This table is display-only. Use Prepare Paired Comparison for the official "
+            "compatibility gate and comparison artifact."
+        )
+
+    if reader_id == "research_v2":
+        default_id = default_comparison_id(
+            left_item, right_item, repo_root=REPOSITORY_ROOT
+        )
+        id_key = f"results-comparison-id-{reader_id}"
+        if st.session_state.get(id_key) in (None, "", "ui-paired-comparison"):
+            st.session_state[id_key] = default_id
+        comparison_id = st.text_input("New comparison ID", key=id_key)
+        comparison_ready = (
+            left_item.state == "completed" and right_item.state == "completed"
+        )
+        if (
+            st.button(
+                "Prepare Paired Comparison action",
+                disabled=not comparison_ready,
+                key="results-prepare-paired-comparison",
+            )
+            and comparison_ready
+        ):
+            st.session_state["run-command"] = "paired_comparison"
+            st.session_state["run-action-paired_comparison"] = "run"
+            st.session_state[
+                widget_selection_key("paired_comparison", "input", "baseline_run_dir")
+            ] = left_item.relative_path
+            st.session_state[
+                widget_selection_key("paired_comparison", "input", "candidate_run_dir")
+            ] = right_item.relative_path
+            st.session_state[
+                widget_selection_key("paired_comparison", "value", "comparison_id")
+            ] = comparison_id
+            st.session_state["run_prefill"] = {
+                "command_id": "paired_comparison",
+                "action_id": "run",
+                "values": {
+                    "baseline_run_dir": left_item.relative_path,
+                    "candidate_run_dir": right_item.relative_path,
+                    "comparison_id": comparison_id,
+                    "output_root": "artifacts/research_v2_comparisons",
+                },
+            }
+            st.success(
+                "Prepared the allowlisted action. Open Run to review argv and confirm."
+            )
+
+    _results_registry_actions(loaded, reader_id)
+
+
+def _results_registry_actions(loaded: ControlPanelRegistry, reader_id: str) -> None:
     st.subheader("Registry-defined actions")
     action_rows = []
     for command in loaded.commands.values():
@@ -677,21 +960,56 @@ def _placeholder_widget(
     spec: PlaceholderSpec,
     widget_key: str,
     current_values: dict[str, Any],
+    *,
+    operation: str | None = None,
 ) -> Any:
     label = name.replace("_", " ").title()
     if spec.type == "enum":
-        return st.selectbox(
+        value = st.selectbox(
             label,
             spec.choices,
             key=widget_key,
             format_func=enum_human_label,
         )
+        if operation is not None:
+            remember_widget_selection(
+                st.session_state,
+                operation=operation,
+                role=spec.role,
+                name=name,
+                value=value,
+                allowed=list(spec.choices),
+            )
+        return value
     if spec.type == "integer":
-        return int(st.number_input(label, step=1, key=widget_key))
+        number_value = int(st.number_input(label, step=1, key=widget_key))
+        if operation is not None:
+            remember_widget_selection(
+                st.session_state,
+                operation=operation,
+                role=spec.role,
+                name=name,
+                value=number_value,
+                allowed=None,
+            )
+        return number_value
     if spec.role == "config":
-        return _cascade_config_widget(loaded, config_globs, widget_key)
+        return _cascade_config_widget(
+            loaded,
+            config_globs,
+            widget_key,
+            operation=operation,
+            name=name,
+            role=spec.role,
+        )
     if spec.artifact_reader_id is not None:
-        return _artifact_path_widget(loaded, name, spec, widget_key)
+        return _artifact_path_widget(
+            loaded,
+            name,
+            spec,
+            widget_key,
+            operation=operation,
+        )
     if (
         spec.type == "path"
         and spec.role == "input"
@@ -710,16 +1028,49 @@ def _placeholder_widget(
                     allow_manual_advanced=True,
                 ),
                 widget_key,
+                operation=operation,
             )
         discovered = _discover_input_directories(spec.roots)
         if discovered:
-            return _cascade_item_selector(
+            if operation is not None:
+                meta = None
+                logical = seed_widget_from_logical(
+                    st.session_state,
+                    operation=operation,
+                    role=spec.role,
+                    name=name,
+                    widget_key=widget_key,
+                    allowed=discovered,
+                    cascade_meta=None,
+                )
+                if logical:
+                    meta = parse_config_metadata(str(logical), REPOSITORY_ROOT)
+                    seed_widget_from_logical(
+                        st.session_state,
+                        operation=operation,
+                        role=spec.role,
+                        name=name,
+                        widget_key=widget_key,
+                        allowed=discovered,
+                        cascade_meta=meta,
+                    )
+            selected = _cascade_item_selector(
                 discovered,
                 widget_key=widget_key,
                 item_label=label,
                 include_source=True,
                 advanced_label=f"Advanced: raw {label} path",
             )
+            if operation is not None:
+                remember_widget_selection(
+                    st.session_state,
+                    operation=operation,
+                    role=spec.role,
+                    name=name,
+                    value=selected,
+                    allowed=discovered,
+                )
+            return selected
     if spec.suggested_value_template is not None:
         _apply_suggested_path(spec, widget_key, current_values)
     if spec.type == "path" and spec.external_absolute:
@@ -733,11 +1084,21 @@ def _placeholder_widget(
         path_help = f"Repository-relative path within: {', '.join(spec.roots)}"
     else:
         path_help = "Safe identifier"
-    return st.text_input(
+    value = st.text_input(
         label,
         help=path_help,
         key=widget_key,
     )
+    if operation is not None:
+        remember_widget_selection(
+            st.session_state,
+            operation=operation,
+            role=spec.role,
+            name=name,
+            value=value,
+            allowed=None,
+        )
+    return value
 
 
 def _artifact_path_widget(
@@ -745,6 +1106,8 @@ def _artifact_path_widget(
     name: str,
     spec: PlaceholderSpec,
     widget_key: str,
+    *,
+    operation: str | None = None,
 ) -> Any:
     label = name.replace("_", " ").title()
     reader = loaded.readers[spec.artifact_reader_id or ""]
@@ -755,11 +1118,38 @@ def _artifact_path_widget(
         statuses=spec.artifact_statuses,
     )
     selected: str | None = None
+    paths = [path for path, _label in options]
     if not options:
         st.info("No matching completed artifacts were found for this action.")
         st.session_state.pop(widget_key, None)
     else:
-        paths = [path for path, _label in options]
+        if operation is not None:
+            current = st.session_state.get(widget_key)
+            meta = (
+                parse_config_metadata(str(current), REPOSITORY_ROOT)
+                if current not in (None, "")
+                else None
+            )
+            seed_widget_from_logical(
+                st.session_state,
+                operation=operation,
+                role=spec.role,
+                name=name,
+                widget_key=widget_key,
+                allowed=paths,
+                cascade_meta=meta,
+            )
+            seeded = st.session_state.get(widget_key)
+            if seeded not in (None, "") and seeded in paths:
+                seed_widget_from_logical(
+                    st.session_state,
+                    operation=operation,
+                    role=spec.role,
+                    name=name,
+                    widget_key=widget_key,
+                    allowed=paths,
+                    cascade_meta=parse_config_metadata(str(seeded), REPOSITORY_ROOT),
+                )
         selected = _cascade_item_selector(
             paths,
             widget_key=widget_key,
@@ -768,6 +1158,15 @@ def _artifact_path_widget(
             advanced_label=f"Advanced: raw {label} path",
             show_advanced=True,
         )
+        if operation is not None:
+            remember_widget_selection(
+                st.session_state,
+                operation=operation,
+                role=spec.role,
+                name=name,
+                value=selected,
+                allowed=paths,
+            )
     if spec.allow_manual_advanced:
         with st.expander("Advanced / manual path"):
             manual_toggle = f"{widget_key}__manual_toggle"
@@ -857,6 +1256,10 @@ def _cascade_config_widget(
     loaded: ControlPanelRegistry,
     config_globs: tuple[str, ...],
     widget_key: str,
+    *,
+    operation: str | None = None,
+    name: str = "config",
+    role: str = "config",
 ) -> str | None:
     """Four-level cascading config selector: Source → Model → Mode → Config."""
     option_pairs = _config_options(loaded, config_globs)
@@ -865,7 +1268,34 @@ def _cascade_config_widget(
         st.session_state.pop(widget_key, None)
         return None
     raw_paths = [path for path, _ in option_pairs]
-    return _cascade_item_selector(
+    if operation is not None:
+        current = st.session_state.get(widget_key)
+        meta = (
+            parse_config_metadata(str(current), REPOSITORY_ROOT)
+            if current not in (None, "")
+            else None
+        )
+        seed_widget_from_logical(
+            st.session_state,
+            operation=operation,
+            role=role,
+            name=name,
+            widget_key=widget_key,
+            allowed=raw_paths,
+            cascade_meta=meta,
+        )
+        seeded = st.session_state.get(widget_key)
+        if seeded not in (None, "") and seeded in raw_paths:
+            seed_widget_from_logical(
+                st.session_state,
+                operation=operation,
+                role=role,
+                name=name,
+                widget_key=widget_key,
+                allowed=raw_paths,
+                cascade_meta=parse_config_metadata(str(seeded), REPOSITORY_ROOT),
+            )
+    selected = _cascade_item_selector(
         raw_paths,
         widget_key=widget_key,
         item_label="Config",
@@ -873,6 +1303,16 @@ def _cascade_config_widget(
         advanced_label="Advanced: raw config path selector",
         show_advanced=True,
     )
+    if operation is not None:
+        remember_widget_selection(
+            st.session_state,
+            operation=operation,
+            role=role,
+            name=name,
+            value=selected,
+            allowed=raw_paths,
+        )
+    return selected
 
 
 def _cascade_item_selector(
@@ -964,6 +1404,11 @@ def _cascade_item_selector(
     }
     for path in item_paths:
         labels.setdefault(path, Path(path).name)
+        # Never present raw run IDs as the primary selector label.
+        if is_raw_run_id(Path(path).name) and is_raw_run_id(
+            str(labels.get(path, "")).split(" · ")[0]
+        ):
+            labels[path] = readable_path_label(path, REPOSITORY_ROOT)
 
     if st.session_state.get(widget_key) not in item_paths:
         index = min(max(default_index, 0), len(item_paths) - 1)
@@ -975,7 +1420,7 @@ def _cascade_item_selector(
         format_func=lambda v: labels.get(v, v),
     )
     if selected_value:
-        st.caption(f"`{Path(selected_value).name}`")
+        st.caption(f"Basename: `{Path(selected_value).name}`")
         st.caption(f"`{selected_value}`")
 
     if show_advanced:

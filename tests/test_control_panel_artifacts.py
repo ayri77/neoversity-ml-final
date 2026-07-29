@@ -6,6 +6,8 @@ import subprocess
 import uuid
 from pathlib import Path
 
+import pytest
+
 from src.churn_ml.control_panel.artifacts import (
     comparison_rows,
     csv_preview,
@@ -89,7 +91,11 @@ def test_dot_path_csv_tail_and_comparison_limits(tmp_path: Path) -> None:
         )
     records = {item.root.name: item for item in discover_artifacts(tmp_path, reader)}
     rows = comparison_rows(records["left"], records["right"], reader.compare_fields)
-    assert rows[0] == {"field": "Score", "left": 0.7, "right": 0.8}
+    assert rows[0]["field"] == "Score"
+    assert rows[0]["left"] == 0.7
+    assert rows[0]["right"] == 0.8
+    assert rows[0]["Metric"] == "Score"
+    assert rows[0]["Delta (Right - Left)"] == pytest.approx(0.1)
 
 
 def test_conflicting_terminal_markers_are_explicitly_invalid(tmp_path: Path) -> None:

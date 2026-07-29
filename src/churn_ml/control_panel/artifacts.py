@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
@@ -17,6 +19,12 @@ from src.churn_ml.control_panel.path_safety import (
     require_regular_file,
     require_safe_directory,
     require_safe_existing_ancestors,
+)
+from src.churn_ml.control_panel.presentation import (
+    format_date,
+    format_time,
+    humanize_experiment_token,
+    parse_config_metadata,
 )
 from src.churn_ml.control_panel.schemas import ReaderSpec
 
@@ -214,14 +222,33 @@ def comparison_rows(
     right: ArtifactRecord,
     compare_fields: tuple[str, ...],
 ) -> list[dict[str, Any]]:
-    return [
-        {
-            "field": field,
-            "left": left.summaries.get(field),
-            "right": right.summaries.get(field),
-        }
-        for field in compare_fields
-    ]
+    rows: list[dict[str, Any]] = []
+    for field in compare_fields:
+        left_value = left.summaries.get(field)
+        right_value = right.summaries.get(field)
+        rows.append(
+            {
+                "Metric": field,
+                "Left": left_value,
+                "Right": right_value,
+                "Delta (Right - Left)": _numeric_delta(left_value, right_value),
+                # Backward-compatible aliases used by older tests/callers.
+                "field": field,
+                "left": left_value,
+                "right": right_value,
+                "delta": _numeric_delta(left_value, right_value),
+            }
+        )
+    return rows
+
+
+def _numeric_delta(left: Any, right: Any) -> float | None:
+    try:
+        if left is None or right is None:
+            return None
+        return float(right) - float(left)
+    except (TypeError, ValueError):
+        return None
 
 
 def artifact_selector_options(
@@ -261,6 +288,236 @@ def artifact_option_label(artifact: ArtifactRecord) -> str:
         parts.append(f"best={objective}")
     parts.append(artifact.state)
     return " · ".join(parts)
+
+
+def _summary_or_na(summaries: Mapping[str, Any], key: str) -> Any:
+    value = summaries.get(key)
+    return value if value is not None else "Not available"
+
+
+def build_experiment_table_rows(
+    artifacts: list[ArtifactRecord],
+    *,
+    repo_root: Path,
+) -> list[dict[str, Any]]:
+    """Build human-readable experiment catalog rows (newest first)."""
+    rows: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        try:
+            meta = parse_config_metadata(artifact.relative_path, repo_root)
+            created = meta.get("created_at_utc")
+            experiment = humanize_experiment_token(
+                meta.get("experiment_name") or meta.get("adapter_id") or "",
+                meta.get("model_family", ""),
+            )
+            if not experiment:
+                experiment = Path(artifact.relative_path).name
+            rows.append(
+                {
+                    "Model": meta.get("model_family") or "Not available",
+                    "Mode": meta.get("mode") or "Not available",
+                    "Experiment": experiment,
+                    "Created date": format_date(created)
+                    if created
+                    else "Not available",
+                    "Created time": format_time(created)
+                    if created
+                    else "Not available",
+                    "Balanced Accuracy": _summary_or_na(
+                        artifact.summaries, "Balanced Accuracy mean"
+                    ),
+                    "Sensitivity": _summary_or_na(artifact.summaries, "Sensitivity"),
+                    "Specificity": _summary_or_na(artifact.summaries, "Specificity"),
+                    "ROC AUC": _summary_or_na(artifact.summaries, "ROC AUC"),
+                    "Average Precision": _summary_or_na(
+                        artifact.summaries, "Average Precision"
+                    ),
+                    "Brier score": _summary_or_na(artifact.summaries, "Brier score"),
+                    "Threshold median": _summary_or_na(
+                        artifact.summaries, "Threshold median"
+                    ),
+                    "Status": artifact.state,
+                    "Artifact path": artifact.relative_path,
+                    "_created_sort": created or "",
+                    "_chart_label": experiment,
+                    "_ba": artifact.summaries.get("Balanced Accuracy mean"),
+                    "_sensitivity": artifact.summaries.get("Sensitivity"),
+                    "_specificity": artifact.summaries.get("Specificity"),
+                    "_roc_auc": artifact.summaries.get("ROC AUC"),
+                    "_average_precision": artifact.summaries.get("Average Precision"),
+                }
+            )
+        except Exception:
+            rows.append(
+                {
+                    "Model": "Not available",
+                    "Mode": "Not available",
+                    "Experiment": Path(artifact.relative_path).name,
+                    "Created date": "Not available",
+                    "Created time": "Not available",
+                    "Balanced Accuracy": "Not available",
+                    "Sensitivity": "Not available",
+                    "Specificity": "Not available",
+                    "ROC AUC": "Not available",
+                    "Average Precision": "Not available",
+                    "Brier score": "Not available",
+                    "Threshold median": "Not available",
+                    "Status": artifact.state,
+                    "Artifact path": artifact.relative_path,
+                    "_created_sort": "",
+                    "_chart_label": Path(artifact.relative_path).name,
+                    "_ba": None,
+                    "_sensitivity": None,
+                    "_specificity": None,
+                    "_roc_auc": None,
+                    "_average_precision": None,
+                }
+            )
+    rows.sort(key=lambda item: str(item.get("_created_sort") or ""), reverse=True)
+    return rows
+
+
+def display_compatibility_summary(
+    left: ArtifactRecord,
+    right: ArtifactRecord,
+) -> dict[str, Any]:
+    """UI-local compatibility display for research artifacts.
+
+    This does not replace the official Paired Comparison gate; it only surfaces
+    fingerprint equality checks already present on disk.
+    """
+    left_plan = _identity_hash(left.root, "identities/evaluation_plan.json")
+    right_plan = _identity_hash(right.root, "identities/evaluation_plan.json")
+    left_dataset = _dataset_fingerprint_token(left.root)
+    right_dataset = _dataset_fingerprint_token(right.root)
+    left_folds = _fold_assignment_token(left.root)
+    right_folds = _fold_assignment_token(right.root)
+
+    same_plan = (
+        left_plan is not None and right_plan is not None and left_plan == right_plan
+    )
+    same_dataset = (
+        left_dataset is not None
+        and right_dataset is not None
+        and left_dataset == right_dataset
+    )
+    same_folds = (
+        left_folds is not None and right_folds is not None and left_folds == right_folds
+    )
+    compatible = bool(same_plan and same_dataset and same_folds)
+    return {
+        "same_evaluation_plan": same_plan,
+        "same_dataset_fingerprint": same_dataset,
+        "same_fold_assignments": same_folds,
+        "compatible": compatible,
+        "status": "compatible" if compatible else "incompatible",
+    }
+
+
+def default_comparison_id(
+    left: ArtifactRecord,
+    right: ArtifactRecord,
+    *,
+    repo_root: Path,
+) -> str:
+    left_meta = parse_config_metadata(left.relative_path, repo_root)
+    right_meta = parse_config_metadata(right.relative_path, repo_root)
+    left_model = _slug(left_meta.get("model_family") or "left")
+    right_model = _slug(right_meta.get("model_family") or "right")
+    mode = _slug(left_meta.get("mode") or right_meta.get("mode") or "development")
+    plan = left_meta.get("plan_id") or right_meta.get("plan_id") or "compare"
+    plan_slug = _slug(plan)
+    # Prefer trailing plan tokens such as r2x5-t3-v1 when present.
+    tokens = plan_slug.split("-")
+    short_plan = plan_slug
+    for index, token in enumerate(tokens):
+        if re.fullmatch(r"r\d+x\d+", token):
+            short_plan = "-".join(tokens[index:])
+            break
+    return f"{left_model}-vs-{right_model}-{mode}-{short_plan}"
+
+
+def _slug(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9]+", "-", value.strip().lower()).strip("-")
+    return text or "item"
+
+
+def _identity_hash(root: Path, relative: str) -> str | None:
+    path = root.joinpath(*relative.split("/"))
+    if not path.is_file():
+        return None
+    try:
+        payload = safe_json_load(path)
+    except ArtifactReadError:
+        return None
+    if isinstance(payload, dict):
+        sha = payload.get("sha256")
+        if isinstance(sha, str) and sha:
+            return sha
+        hashes = payload.get("hashes")
+        if isinstance(hashes, dict):
+            plan = hashes.get("plan")
+            if isinstance(plan, str) and plan:
+                return plan
+    return _file_sha256(path)
+
+
+def _dataset_fingerprint_token(root: Path) -> str | None:
+    path = root / "dataset_fingerprints.json"
+    if not path.is_file():
+        # Fall back to evaluation-plan embedded dataset identity.
+        return _identity_hash(root, "identities/evaluation_plan.json")
+    try:
+        payload = safe_json_load(path)
+    except ArtifactReadError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    version = payload.get("dataset_version")
+    files = payload.get("files")
+    train_sha = None
+    if isinstance(files, dict):
+        train = files.get("train_features")
+        if isinstance(train, dict):
+            train_sha = train.get("sha256")
+    row = payload.get("row_position_identity")
+    row_sha = row.get("sha256") if isinstance(row, dict) else None
+    parts = [str(version or ""), str(train_sha or ""), str(row_sha or "")]
+    token = "|".join(parts)
+    return token if any(parts) else _file_sha256(path)
+
+
+def _fold_assignment_token(root: Path) -> str | None:
+    splits = root / "splits"
+    names = (
+        "outer_assignments.parquet",
+        "threshold_selection_assignments.parquet",
+    )
+    digests: list[str] = []
+    for name in names:
+        path = splits / name
+        if not path.is_file():
+            return None
+        digest = _file_sha256(path)
+        if digest is None:
+            return None
+        digests.append(digest)
+    return "|".join(digests)
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        require_regular_file(path, reject_hardlinks=True)
+        hasher = hashlib.sha256()
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except (OSError, PathSafetyError):
+        return None
 
 
 def _relative_within_roots(relative_path: str, roots: tuple[str, ...]) -> bool:

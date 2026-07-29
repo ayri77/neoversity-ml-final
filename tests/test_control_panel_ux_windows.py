@@ -360,17 +360,27 @@ def test_apptest_side_by_side_defaults_to_distinct_artifacts(
     control_panel_app.registry.clear()
     at = AppTest.from_function(_apptest_results_page, default_timeout=10).run()
     assert not at.exception
-    reader = next(item for item in at.selectbox if item.label == "Artifact type")
-    reader.select("optuna_search_v1")
+    for item in at.selectbox:
+        if item.label == "Artifact type":
+            item.select("optuna_search_v1")
     at = at.run()
     assert not at.exception
-    left = next(item for item in at.selectbox if item.label.startswith("Left"))
-    right = next(item for item in at.selectbox if item.label.startswith("Right"))
-    assert left.value != right.value
-    # In the cascade UI, options contain formatted display labels while value is a
-    # raw path (session state). Verify that both values are non-empty valid paths.
-    assert left.value
-    assert right.value
+    left = _session_get(at, "compare-left-optuna_search_v1")
+    right = _session_get(at, "compare-right-optuna_search_v1")
+    assert left
+    assert right
+    assert left != right
+    experiment_boxes = [item for item in at.selectbox if item.label == "Experiment"]
+    assert experiment_boxes
+    for box in experiment_boxes:
+        assert str(box.value).startswith("artifacts/")
+
+
+def _session_get(at: AppTest, key: str, default: object = None) -> object:
+    try:
+        return at.session_state[key]
+    except Exception:
+        return default
 
 
 def test_action_requires_additional_input_helper() -> None:

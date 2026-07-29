@@ -12,6 +12,11 @@ readers:
           Balanced Accuracy mean: "metrics.balanced_accuracy.mean"
           Balanced Accuracy minimum: "metrics.balanced_accuracy.minimum"
           Balanced Accuracy maximum: "metrics.balanced_accuracy.maximum"
+          Sensitivity: "metrics.sensitivity.mean"
+          Specificity: "metrics.specificity.mean"
+          ROC AUC: "metrics.roc_auc.mean"
+          Average Precision: "metrics.average_precision.mean"
+          Brier score: "metrics.brier_score.mean"
       - path: "thresholds/threshold_summary.json"
         fields:
           Threshold median: "median"
@@ -20,8 +25,11 @@ readers:
     log_files: []
     compare_fields:
       - "Balanced Accuracy mean"
-      - "Balanced Accuracy minimum"
-      - "Balanced Accuracy maximum"
+      - "Sensitivity"
+      - "Specificity"
+      - "ROC AUC"
+      - "Average Precision"
+      - "Brier score"
       - "Threshold median"
       - "Threshold IQR"
 
@@ -37,6 +45,11 @@ readers:
           Balanced Accuracy mean: "metrics.balanced_accuracy.mean"
           Balanced Accuracy minimum: "metrics.balanced_accuracy.minimum"
           Balanced Accuracy maximum: "metrics.balanced_accuracy.maximum"
+          Sensitivity: "metrics.sensitivity.mean"
+          Specificity: "metrics.specificity.mean"
+          ROC AUC: "metrics.roc_auc.mean"
+          Average Precision: "metrics.average_precision.mean"
+          Brier score: "metrics.brier_score.mean"
       - path: "thresholds/threshold_summary.json"
         fields:
           Threshold median: "median"
@@ -45,9 +58,13 @@ readers:
     log_files: []
     compare_fields:
       - "Balanced Accuracy mean"
-      - "Balanced Accuracy minimum"
-      - "Balanced Accuracy maximum"
+      - "Sensitivity"
+      - "Specificity"
+      - "ROC AUC"
+      - "Average Precision"
+      - "Brier score"
       - "Threshold median"
+      - "Threshold IQR"
 
   - id: paired_comparison
     title: Paired Comparison v1 results
