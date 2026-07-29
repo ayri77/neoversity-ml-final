@@ -89,6 +89,31 @@ readers:
       - "Decision status"
       - "Every repeat improved"
 
+  - id: blend_evaluation_v1
+    title: Blend Evaluation v1 results
+    artifact_roots: ["artifacts/blend_evaluations"]
+    discovery_glob: "*"
+    success_markers: ["_SUCCESS"]
+    failure_markers: ["_FAILED"]
+    summary_files:
+      - path: "aggregate_summary.json"
+        fields:
+          Balanced Accuracy mean: "metrics.balanced_accuracy.aggregate_mean"
+          Balanced Accuracy median: "metrics.balanced_accuracy.aggregate_median"
+          Weight median: "weight_summary.median"
+          Threshold median: "threshold_summary.median"
+      - path: "deployment_parameters.json"
+        fields:
+          Deployment LightGBM weight: "deployment_lightgbm_weight"
+          Deployment threshold: "deployment_threshold"
+    csv_previews: ["repeat_metrics.csv", "fold_metrics.csv", "sensitivity_table.csv"]
+    log_files: []
+    compare_fields:
+      - "Balanced Accuracy mean"
+      - "Balanced Accuracy median"
+      - "Deployment LightGBM weight"
+      - "Deployment threshold"
+
   - id: deployment_v1
     title: Final Deployment v1 results
     artifact_roots: ["artifacts/deployments"]

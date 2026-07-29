@@ -23,7 +23,10 @@ from src.churn_ml.research_data import canonical_sha256
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-THRESHOLD_SOURCE_TYPES = {"experiment_core_v2_manual_threshold_v1"}
+THRESHOLD_SOURCE_TYPES = {
+    "experiment_core_v2_manual_threshold_v1",
+    "blend_evaluation_v1_cross_fit_threshold_v1",
+}
 THRESHOLD_REFERENCE_KEYS = {
     "schema_version",
     "path",
@@ -265,17 +268,42 @@ def load_threshold_evidence(
     if not 0.0 <= threshold <= 1.0:
         raise DeploymentAuthenticationError("Threshold evidence value is out of range.")
     run_plan = _read_json(research_run.root / "identities/evaluation_plan.json")
-    run_candidate = _read_json(research_run.root / "identities/candidate.json")
-    expected = {
-        "source_run_id": research_run.metadata["run_id"],
-        "source_manifest_sha256": research_run.manifest["manifest_sha256"],
-        "plan_sha256": run_plan["sha256"],
-        "candidate_sha256": run_candidate["sha256"],
-    }
-    for key, value in expected.items():
-        if reference[key] != value:
+    if reference["source_type"] == "experiment_core_v2_manual_threshold_v1":
+        run_candidate = _read_json(research_run.root / "identities/candidate.json")
+        expected = {
+            "source_run_id": research_run.metadata["run_id"],
+            "source_manifest_sha256": research_run.manifest["manifest_sha256"],
+            "plan_sha256": run_plan["sha256"],
+            "candidate_sha256": run_candidate["sha256"],
+        }
+        for key, value in expected.items():
+            if reference[key] != value:
+                raise DeploymentAuthenticationError(
+                    f"Threshold evidence {key} differs from completed research run."
+                )
+    else:
+        if reference["plan_sha256"] != run_plan["sha256"]:
             raise DeploymentAuthenticationError(
-                f"Threshold evidence {key} differs from completed research run."
+                "Blend threshold evidence plan_sha256 differs from completed research run."
+            )
+        blend_root = _portable_path(
+            f"artifacts/blend_evaluations/{reference['source_run_id']}",
+            project_root,
+            "threshold_evidence.blend_evaluation",
+        )
+        if not (blend_root / "_SUCCESS").is_file():
+            raise DeploymentAuthenticationError(
+                "Blend threshold evidence source evaluation is incomplete."
+            )
+        blend_manifest = _read_json(blend_root / "manifest.json")
+        if reference["source_manifest_sha256"] != blend_manifest["manifest_sha256"]:
+            raise DeploymentAuthenticationError(
+                "Blend threshold evidence manifest authentication failed."
+            )
+        parameters = _read_json(blend_root / "deployment_parameters.json")
+        if float(parameters["deployment_threshold"]) != threshold:
+            raise DeploymentAuthenticationError(
+                "Blend threshold evidence value differs from evaluation medians."
             )
     canonical = deepcopy(reference)
     identity = {

@@ -455,7 +455,10 @@ def load_deployment_config(
     _positive_integer(evidence["size_bytes"], "threshold.evidence.size_bytes")
     for key in ("sha256", "source_manifest_sha256", "plan_sha256", "candidate_sha256"):
         _sha(evidence[key], f"threshold.evidence.{key}")
-    if evidence["source_type"] != "experiment_core_v2_manual_threshold_v1":
+    if evidence["source_type"] not in {
+        "experiment_core_v2_manual_threshold_v1",
+        "blend_evaluation_v1_cross_fit_threshold_v1",
+    }:
         raise DeploymentContractError("threshold evidence source_type differs.")
     _slug(evidence["source_run_id"], "threshold.evidence.source_run_id")
     _slug(evidence["threshold_policy_id"], "threshold.evidence.threshold_policy_id")

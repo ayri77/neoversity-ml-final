@@ -3,6 +3,7 @@ approved_public_clis:
   - scripts/run_research_v2.py
   - scripts/run_research_evaluation.py
   - scripts/compare_research_v2.py
+  - scripts/run_blend_evaluation_v1.py
   - scripts/sync_mlflow.py
   - scripts/run_deployment_v1.py
   - scripts/run_optuna_search.py
@@ -186,6 +187,103 @@ commands:
         success_markers: ["Status: completed"]
         failure_markers: ["Status: failed", "Traceback"]
 
+  - id: blend_evaluation_v1
+    title: Blend Evaluation v1
+    description: Validate or run a leakage-safe LightGBM + XGBoost probability blend with second-level cross-fitting.
+    category: Analysis
+    argv_prefix: ["$PYTHON", "-u", "scripts/run_blend_evaluation_v1.py"]
+    allowed_config_globs:
+      - "configs/blend_evaluation/*.yaml"
+      - "artifacts/ui_configs/*.yaml"
+      - "artifacts/ui_configs/*.yml"
+    allowed_input_roots:
+      - "configs/blend_evaluation"
+      - "artifacts/ui_configs"
+      - "artifacts/research_v2"
+      - "artifacts/blend_evaluations"
+      - "artifacts/deployments"
+    allowed_output_roots:
+      - "artifacts/blend_evaluations"
+      - "artifacts/blend_deployment_packages"
+      - "artifacts/blend_submissions"
+    result_reader_id: blend_evaluation_v1
+    artifact_url: null
+    environment: []
+    actions:
+      - id: validate
+        title: Validate
+        description: Validate config, base artifacts, and compatibility without writing output.
+        argv: ["validate", "--config", "{config}"]
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/blend_evaluation", "artifacts/ui_configs"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ["Compatibility: compatible"]
+        failure_markers: ["Status: failed", "Traceback"]
+      - id: run
+        title: Run
+        description: Run leakage-safe blend evaluation and write artifacts.
+        argv:
+          - "run"
+          - "--config"
+          - "{config}"
+          - "--evaluation-id"
+          - "{evaluation_id}"
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/blend_evaluation", "artifacts/ui_configs"]
+            must_exist: true
+          evaluation_id:
+            type: string
+            role: value
+            required: true
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ["Status: completed"]
+        failure_markers: ["Status: failed", "Traceback"]
+      - id: inspect
+        title: Inspect
+        description: Inspect a completed blend evaluation artifact.
+        argv: ["inspect", "--evaluation-dir", "{evaluation_dir}"]
+        placeholders:
+          evaluation_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/blend_evaluations"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ['"ok": true']
+        failure_markers: ["Status: failed", "Traceback"]
+      - id: prepare_deployment
+        title: Prepare deployment
+        description: Prepare draft Final Deployment inputs and shared blend threshold evidence.
+        argv: ["prepare-deployment", "--evaluation-dir", "{evaluation_dir}"]
+        placeholders:
+          evaluation_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/blend_evaluations"]
+            must_exist: true
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ["Status: completed"]
+        failure_markers: ["Status: failed", "Traceback"]
+
   - id: mlflow_local_index
     title: MLflow local index
     description: Validate or synchronize the optional read-only metadata mirror.
@@ -302,11 +400,13 @@ commands:
       - "artifacts/ui_configs/*.yaml"
       - "artifacts/ui_configs/*.yml"
       - "artifacts/ui_configs/*.json"
+      - "artifacts/blend_deployment_packages/*/deployment_config.draft.yaml"
     allowed_input_roots:
       - "configs/deployment"
       - "artifacts/ui_configs"
       - "artifacts/deployment_fixtures"
       - "artifacts/deployments"
+      - "artifacts/blend_deployment_packages"
     allowed_output_roots: ["artifacts/deployments"]
     result_reader_id: deployment_v1
     artifact_url: null

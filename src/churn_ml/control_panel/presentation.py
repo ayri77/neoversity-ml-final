@@ -19,6 +19,8 @@ _NA = "Not available"
 
 def normalize_model_family(raw: str) -> str:
     lower = raw.lower()
+    if "lightgbm" in lower and "xgboost" in lower:
+        return "LightGBM + XGBoost Blend"
     if lower.startswith("xgboost"):
         return "XGBoost"
     if lower.startswith("catboost"):
@@ -27,6 +29,8 @@ def normalize_model_family(raw: str) -> str:
         return "LightGBM"
     if lower.startswith("autogluon"):
         return "AutoGluon"
+    if "blend" in lower:
+        return "LightGBM + XGBoost Blend"
     if raw == raw.lower():
         return raw.title()
     return raw
@@ -53,6 +57,10 @@ def normalize_source_kind(path_str: str, content: dict | None = None) -> str:
         return "UI config copy"
     if path_str.startswith("artifacts/research_v2_comparisons"):
         return "Paired comparison"
+    if path_str.startswith("artifacts/blend_evaluations"):
+        return "Blend evaluation"
+    if path_str.startswith("artifacts/blend_deployment_packages"):
+        return "Blend deployment package"
     if path_str.startswith("artifacts/research_v2"):
         return "Experiment Core run"
     if path_str.startswith("artifacts/research/"):
@@ -75,6 +83,8 @@ def config_badge(source_kind: str) -> str:
         "Experiment Core run": "RUN",
         "Research v1 run": "RUN",
         "Paired comparison": "COMPARE",
+        "Blend evaluation": "BLEND",
+        "Blend deployment package": "BLEND",
         "Deployment artifact": "DEPLOY",
         "Deployment fixture": "FIXTURE",
     }
@@ -346,7 +356,13 @@ def parse_config_metadata(path_str: str, repo_root: Path) -> dict[str, str]:
         if "model_family" not in result:
             for token in path_tokens:
                 family = normalize_model_family(token)
-                if family in {"LightGBM", "XGBoost", "CatBoost", "AutoGluon"}:
+                if family in {
+                    "LightGBM",
+                    "XGBoost",
+                    "CatBoost",
+                    "AutoGluon",
+                    "LightGBM + XGBoost Blend",
+                }:
                     result["model_family"] = family
                     break
             if "model_family" not in result:
@@ -583,6 +599,8 @@ _SOURCE_LABEL_MAP: dict[str, str] = {
     "Experiment Core run": "Experiment Core run",
     "Research v1 run": "Research v1 run",
     "Paired comparison": "Paired comparison",
+    "Blend evaluation": "Blend evaluation",
+    "Blend deployment package": "Blend deployment package",
     "Deployment artifact": "Deployment artifact",
     "Deployment fixture": "Deployment fixture",
     "Other": "Other approved source",
@@ -593,6 +611,7 @@ _MODEL_LABEL_MAP: dict[str, str] = {
     "XGBoost": "XGBoost",
     "CatBoost": "CatBoost",
     "AutoGluon": "AutoGluon",
+    "LightGBM + XGBoost Blend": "LightGBM + XGBoost Blend",
 }
 
 _MODE_LABEL_MAP: dict[str, str] = {

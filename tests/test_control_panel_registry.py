@@ -23,6 +23,7 @@ def test_repository_registry_is_strict_and_cross_referenced() -> None:
         "experiment_core_v2",
         "research_v1",
         "paired_comparison",
+        "blend_evaluation_v1",
         "mlflow_local_index",
         "final_deployment_v1",
         "optuna_search_v1",
@@ -31,6 +32,7 @@ def test_repository_registry_is_strict_and_cross_referenced() -> None:
         "research_v2",
         "research_v1",
         "paired_comparison",
+        "blend_evaluation_v1",
         "deployment_v1",
         "optuna_search_v1",
     }
