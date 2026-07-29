@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -47,6 +48,7 @@ from src.churn_ml.control_panel.presentation import (  # noqa: E402
     cascade_available_modes,
     cascade_available_sources,
     cascade_filter_configs,
+    enum_human_label,
     format_date,
     format_time,
     job_primary_label,
@@ -55,6 +57,7 @@ from src.churn_ml.control_panel.presentation import (  # noqa: E402
     model_human_label,
     parse_config_metadata,
     readable_config_label,
+    readable_path_label,
     source_human_label,
 )
 from src.churn_ml.control_panel.jobs import JobError, JobManager  # noqa: E402
@@ -113,7 +116,9 @@ def dashboard_page() -> None:
         st.dataframe(
             [
                 {
-                    "label": job_primary_label(item.job),
+                    "label": job_primary_label(
+                        item.job, record_commands=loaded.commands
+                    ),
                     "status": item.status["state"],
                     "date": format_date(item.job.get("created_at_utc")),
                     "time": format_time(item.job.get("created_at_utc")),
@@ -132,8 +137,13 @@ def dashboard_page() -> None:
         st.dataframe(
             [
                 {
-                    "reader": item.reader_id,
-                    "artifact": item.relative_path,
+                    "reader": loaded.readers[item.reader_id].title
+                    if item.reader_id in loaded.readers
+                    else item.reader_id,
+                    "artifact": readable_path_label(
+                        item.relative_path, REPOSITORY_ROOT
+                    ),
+                    "path": item.relative_path,
                     "status": item.state,
                 }
                 for item in artifacts[:10]
@@ -359,9 +369,11 @@ def jobs_page() -> None:
         "Job",
         [item.job_id for item in jobs],
         format_func=lambda value: _job_label(
-            next(item for item in jobs if item.job_id == value)
+            next(item for item in jobs if item.job_id == value),
+            commands=loaded.commands,
         ),
     )
+    st.caption(f"Job ID: `{selected}`")
     record = manager.refresh(selected)
     status = record.status
     columns = st.columns(4)
@@ -425,74 +437,16 @@ def results_page() -> None:
         st.info("No artifacts match this configured reader.")
         return
     artifact_paths = [item.relative_path for item in artifacts]
-    cascade_arts = build_cascade_options(artifact_paths, REPOSITORY_ROOT)
 
-    # Cascading artifact selection: Model → Mode → Artifact
-    art_models = [m for m in dict.fromkeys(o.model_family for o in cascade_arts) if m]
-    art_mdl_key = f"results-{reader_id}-model"
-    if st.session_state.get(art_mdl_key) not in art_models and art_models:
-        st.session_state[art_mdl_key] = art_models[0]
-    if art_models:
-        if len(art_models) > 1:
-            sel_art_model = st.selectbox(
-                "Model",
-                art_models,
-                key=art_mdl_key,
-                format_func=model_human_label,
-            )
-        else:
-            sel_art_model = art_models[0]
-            st.caption(f"Model: **{model_human_label(sel_art_model)}**")
-        art_modes = [
-            m
-            for m in dict.fromkeys(
-                o.mode for o in cascade_arts if o.model_family == sel_art_model
-            )
-            if m
-        ]
-    else:
-        sel_art_model = ""
-        art_modes = []
-    art_mode_key = f"results-{reader_id}-mode"
-    if st.session_state.get(art_mode_key) not in art_modes and art_modes:
-        st.session_state[art_mode_key] = art_modes[0]
-    if art_modes:
-        if len(art_modes) > 1:
-            sel_art_mode = st.selectbox(
-                "Mode",
-                art_modes,
-                key=art_mode_key,
-                format_func=mode_human_label,
-            )
-        else:
-            sel_art_mode = art_modes[0]
-            st.caption(f"Mode: **{mode_human_label(sel_art_mode)}**")
-    else:
-        sel_art_mode = ""
-    filtered_arts = [
-        o
-        for o in cascade_arts
-        if (not sel_art_model or o.model_family == sel_art_model)
-        and (not sel_art_mode or o.mode == sel_art_mode)
-    ]
-    filtered_paths = [o.path for o in filtered_arts]
-    filtered_labels = {o.path: o.display_label for o in filtered_arts}
-    if not filtered_paths:
-        filtered_paths = artifact_paths
-        filtered_labels = {
-            p: readable_config_label(p, REPOSITORY_ROOT) for p in artifact_paths
-        }
-    art_cfg_key = f"results-{reader_id}-artifact"
-    if st.session_state.get(art_cfg_key) not in filtered_paths:
-        st.session_state[art_cfg_key] = filtered_paths[0]
-    selected_path = st.selectbox(
-        "Artifact",
-        filtered_paths,
-        key=art_cfg_key,
-        format_func=lambda v: filtered_labels.get(v, v),
+    selected_path = _cascade_item_selector(
+        artifact_paths,
+        widget_key=f"results-{reader_id}-artifact",
+        item_label="Artifact",
+        include_source=False,
+        advanced_label="Advanced: raw artifact path",
     )
-    if selected_path:
-        st.caption(f"`{selected_path}`")
+    if not selected_path:
+        return
     selected = next(item for item in artifacts if item.relative_path == selected_path)
     st.write(f"Status: `{selected.state}`")
     if selected.diagnostic:
@@ -535,40 +489,43 @@ def results_page() -> None:
     if len(artifacts) < 2:
         st.info("At least two artifacts are required.")
     else:
-        paths = [item.relative_path for item in artifacts]
-        left_key = f"compare-left-{reader_id}"
-        right_key = f"compare-right-{reader_id}"
-        if left_key not in st.session_state or st.session_state[left_key] not in paths:
-            st.session_state[left_key] = paths[0]
-        if (
-            right_key not in st.session_state
-            or st.session_state[right_key] not in paths
-        ):
-            st.session_state[right_key] = paths[1]
         left_col, right_col = st.columns(2)
-        _compare_arts = build_cascade_options(paths, REPOSITORY_ROOT)
-        _compare_labels = {o.path: o.display_label for o in _compare_arts}
-        left_path = left_col.selectbox(
-            "Left model · mode · artifact",
-            paths,
-            key=left_key,
-            format_func=lambda v: _compare_labels.get(v, v),
-        )
-        right_path = right_col.selectbox(
-            "Right model · mode · artifact",
-            paths,
-            key=right_key,
-            format_func=lambda v: _compare_labels.get(v, v),
-        )
-        left_item = next(item for item in artifacts if item.relative_path == left_path)
-        right_item = next(
-            item for item in artifacts if item.relative_path == right_path
-        )
-        st.dataframe(
-            comparison_rows(left_item, right_item, reader.compare_fields),
-            width="stretch",
-            hide_index=True,
-        )
+        with left_col:
+            st.markdown("**Left**")
+            left_path = _cascade_item_selector(
+                artifact_paths,
+                widget_key=f"compare-left-{reader_id}",
+                item_label="Left artifact",
+                include_source=False,
+                model_label="Left model",
+                mode_label="Left mode",
+                show_advanced=False,
+                default_index=0,
+            )
+        with right_col:
+            st.markdown("**Right**")
+            right_path = _cascade_item_selector(
+                artifact_paths,
+                widget_key=f"compare-right-{reader_id}",
+                item_label="Right artifact",
+                include_source=False,
+                model_label="Right model",
+                mode_label="Right mode",
+                show_advanced=False,
+                default_index=1,
+            )
+        if left_path and right_path:
+            left_item = next(
+                item for item in artifacts if item.relative_path == left_path
+            )
+            right_item = next(
+                item for item in artifacts if item.relative_path == right_path
+            )
+            st.dataframe(
+                comparison_rows(left_item, right_item, reader.compare_fields),
+                width="stretch",
+                hide_index=True,
+            )
         if reader_id == "research_v2":
             st.caption(
                 "Use the Paired Comparison action on the Run page for the official "
@@ -657,43 +614,59 @@ def configuration_page() -> None:
     if st.button("Reload registry files"):
         registry.clear()
         st.rerun()
-    st.subheader("Sources")
-    st.code(
-        "\n".join(
-            str(path.relative_to(REPOSITORY_ROOT))
-            for path in (
-                loaded.sources.settings,
-                loaded.sources.commands,
-                loaded.sources.readers,
+    st.subheader("Registry overview")
+    st.dataframe(
+        [
+            {
+                "file": path.name,
+                "role": role,
+            }
+            for role, path in (
+                ("Settings", loaded.sources.settings),
+                ("Commands", loaded.sources.commands),
+                ("Readers", loaded.sources.readers),
             )
-        ),
-        language="text",
+        ],
+        width="stretch",
+        hide_index=True,
     )
-    st.subheader("Settings")
-    st.json(loaded.settings.__dict__)
-    st.subheader("Commands")
-    st.json(
-        {
-            command.id: {
-                "title": command.title,
-                "category": command.category,
-                "argv_prefix": command.argv_prefix,
-                "actions": list(command.actions),
+    with st.expander("Technical registry paths", expanded=False):
+        st.code(
+            "\n".join(
+                str(path.relative_to(REPOSITORY_ROOT))
+                for path in (
+                    loaded.sources.settings,
+                    loaded.sources.commands,
+                    loaded.sources.readers,
+                )
+            ),
+            language="text",
+        )
+    with st.expander("Settings (raw)", expanded=False):
+        st.json(loaded.settings.__dict__)
+    with st.expander("Commands (raw)", expanded=False):
+        st.json(
+            {
+                command.id: {
+                    "title": command.title,
+                    "category": command.category,
+                    "argv_prefix": command.argv_prefix,
+                    "actions": list(command.actions),
+                }
+                for command in loaded.commands.values()
             }
-            for command in loaded.commands.values()
-        }
-    )
-    st.subheader("Readers")
-    st.json(
-        {
-            reader.id: {
-                "title": reader.title,
-                "artifact_roots": reader.artifact_roots,
-                "discovery_glob": reader.discovery_glob,
+        )
+    with st.expander("Readers (raw)", expanded=False):
+        st.json(
+            {
+                reader.id: {
+                    "title": reader.title,
+                    "artifact_roots": reader.artifact_roots,
+                    "discovery_glob": reader.discovery_glob,
+                }
+                for reader in loaded.readers.values()
             }
-            for reader in loaded.readers.values()
-        }
-    )
+        )
     st.caption("Registry and settings files are read-only in the v1 UI.")
 
 
@@ -707,13 +680,46 @@ def _placeholder_widget(
 ) -> Any:
     label = name.replace("_", " ").title()
     if spec.type == "enum":
-        return st.selectbox(label, spec.choices, key=widget_key)
+        return st.selectbox(
+            label,
+            spec.choices,
+            key=widget_key,
+            format_func=enum_human_label,
+        )
     if spec.type == "integer":
         return int(st.number_input(label, step=1, key=widget_key))
     if spec.role == "config":
         return _cascade_config_widget(loaded, config_globs, widget_key)
     if spec.artifact_reader_id is not None:
         return _artifact_path_widget(loaded, name, spec, widget_key)
+    if (
+        spec.type == "path"
+        and spec.role == "input"
+        and not spec.external_absolute
+        and spec.roots
+    ):
+        reader = _reader_matching_roots(loaded, spec.roots)
+        if reader is not None:
+            return _artifact_path_widget(
+                loaded,
+                name,
+                replace(
+                    spec,
+                    artifact_reader_id=reader.id,
+                    artifact_statuses=(),
+                    allow_manual_advanced=True,
+                ),
+                widget_key,
+            )
+        discovered = _discover_input_directories(spec.roots)
+        if discovered:
+            return _cascade_item_selector(
+                discovered,
+                widget_key=widget_key,
+                item_label=label,
+                include_source=True,
+                advanced_label=f"Advanced: raw {label} path",
+            )
     if spec.suggested_value_template is not None:
         _apply_suggested_path(spec, widget_key, current_values)
     if spec.type == "path" and spec.external_absolute:
@@ -754,15 +760,13 @@ def _artifact_path_widget(
         st.session_state.pop(widget_key, None)
     else:
         paths = [path for path, _label in options]
-        labels = dict(options)
-        current = st.session_state.get(widget_key)
-        if current not in paths:
-            st.session_state[widget_key] = paths[0]
-        selected = st.selectbox(
-            label,
+        selected = _cascade_item_selector(
             paths,
-            key=widget_key,
-            format_func=lambda value: labels.get(value, value),
+            widget_key=widget_key,
+            item_label=label,
+            include_source=False,
+            advanced_label=f"Advanced: raw {label} path",
+            show_advanced=True,
         )
     if spec.allow_manual_advanced:
         with st.expander("Advanced / manual path"):
@@ -783,6 +787,28 @@ def _artifact_path_widget(
                     key=manual_key,
                 )
     return selected
+
+
+def _reader_matching_roots(
+    loaded: ControlPanelRegistry, roots: tuple[str, ...]
+) -> Any | None:
+    root_set = set(roots)
+    for reader in loaded.readers.values():
+        if root_set.intersection(reader.artifact_roots):
+            return reader
+    return None
+
+
+def _discover_input_directories(roots: tuple[str, ...]) -> list[str]:
+    discovered: list[str] = []
+    for root in roots:
+        base = REPOSITORY_ROOT / root
+        if not base.is_dir():
+            continue
+        for child in sorted(base.iterdir()):
+            if child.is_dir() and not child.is_symlink():
+                discovered.append(child.relative_to(REPOSITORY_ROOT).as_posix())
+    return discovered
 
 
 def _apply_suggested_path(
@@ -838,146 +864,137 @@ def _cascade_config_widget(
         st.warning("No allowed configuration files were found.")
         st.session_state.pop(widget_key, None)
         return None
-
     raw_paths = [path for path, _ in option_pairs]
-    cascade_opts = build_cascade_options(raw_paths, REPOSITORY_ROOT)
+    return _cascade_item_selector(
+        raw_paths,
+        widget_key=widget_key,
+        item_label="Config",
+        include_source=True,
+        advanced_label="Advanced: raw config path selector",
+        show_advanced=True,
+    )
 
-    # --- Level 1: Source ---
-    sources = cascade_available_sources(cascade_opts)
-    src_key = f"{widget_key}__src"
-    if st.session_state.get(src_key) not in sources:
-        st.session_state[src_key] = sources[0]
-    if len(sources) > 1:
-        selected_source = st.selectbox(
-            "Source",
-            sources,
-            key=src_key,
-            format_func=source_human_label,
-        )
-    else:
-        selected_source = sources[0]
-        st.caption(f"Source: **{source_human_label(selected_source)}**")
 
-    # --- Level 2: Model ---
+def _cascade_item_selector(
+    paths: list[str],
+    *,
+    widget_key: str,
+    item_label: str,
+    include_source: bool = True,
+    model_label: str = "Model",
+    mode_label: str = "Mode",
+    advanced_label: str = "Advanced: raw path selector",
+    show_advanced: bool = True,
+    default_index: int = 0,
+) -> str | None:
+    """Cascading Source/Model/Mode/Item selector for configs or artifacts."""
+    if not paths:
+        return None
+    cascade_opts = build_cascade_options(paths, REPOSITORY_ROOT)
+    path_set = set(paths)
+
+    selected_source: str | None = None
+    if include_source:
+        sources = cascade_available_sources(cascade_opts)
+        src_key = f"{widget_key}__src"
+        if st.session_state.get(src_key) not in sources:
+            st.session_state[src_key] = sources[0]
+        if len(sources) > 1:
+            selected_source = st.selectbox(
+                "Source",
+                sources,
+                key=src_key,
+                format_func=source_human_label,
+            )
+        else:
+            selected_source = sources[0]
+            st.caption(f"Source: **{source_human_label(selected_source)}**")
+
     models = cascade_available_models(cascade_opts, selected_source)
     mdl_key = f"{widget_key}__mdl"
-    if not models:
-        # No model metadata — fall back to flat selection within this source
-        source_paths = [
-            o.path for o in cascade_opts if o.source_kind == selected_source
-        ]
-        source_labels = {
-            o.path: o.display_label
-            for o in cascade_opts
-            if o.source_kind == selected_source
-        }
-        if not source_paths:
-            source_paths = raw_paths
-            source_labels = dict(option_pairs)
-        if st.session_state.get(widget_key) not in source_paths:
-            st.session_state[widget_key] = source_paths[0]
-        selected_value = st.selectbox(
-            "Config",
-            source_paths,
-            key=widget_key,
-            format_func=lambda v: source_labels.get(v, v),
-        )
-        if selected_value:
-            st.caption(f"`{selected_value}`")
-        return selected_value
-    if st.session_state.get(mdl_key) not in models:
-        st.session_state[mdl_key] = models[0]
-    if len(models) > 1:
-        selected_model = st.selectbox(
-            "Model",
-            models,
-            key=mdl_key,
-            format_func=model_human_label,
-        )
-    else:
-        selected_model = models[0]
-        st.caption(f"Model: **{model_human_label(selected_model)}**")
+    selected_model: str | None = None
+    if models:
+        if st.session_state.get(mdl_key) not in models:
+            st.session_state[mdl_key] = models[0]
+        if len(models) > 1:
+            selected_model = st.selectbox(
+                model_label,
+                models,
+                key=mdl_key,
+                format_func=model_human_label,
+            )
+        else:
+            selected_model = models[0]
+            st.caption(f"{model_label}: **{model_human_label(selected_model)}**")
 
-    # --- Level 3: Mode ---
     modes = cascade_available_modes(cascade_opts, selected_source, selected_model)
     mode_key = f"{widget_key}__mode"
-    if not modes:
-        # No mode metadata — fall back to flat selection within source+model
-        model_paths = [
-            o.path
-            for o in cascade_opts
-            if o.source_kind == selected_source and o.model_family == selected_model
-        ]
-        model_labels = {
-            o.path: o.display_label
-            for o in cascade_opts
-            if o.source_kind == selected_source and o.model_family == selected_model
-        }
-        if not model_paths:
-            model_paths = raw_paths
-            model_labels = dict(option_pairs)
-        if st.session_state.get(widget_key) not in model_paths:
-            st.session_state[widget_key] = model_paths[0]
-        selected_value = st.selectbox(
-            "Config",
-            model_paths,
-            key=widget_key,
-            format_func=lambda v: model_labels.get(v, v),
-        )
-        if selected_value:
-            st.caption(f"`{selected_value}`")
-        return selected_value
-    if st.session_state.get(mode_key) not in modes:
-        st.session_state[mode_key] = modes[0]
-    if len(modes) > 1:
-        selected_mode = st.selectbox(
-            "Mode",
-            modes,
-            key=mode_key,
-            format_func=mode_human_label,
-        )
-    else:
-        selected_mode = modes[0]
-        st.caption(f"Mode: **{mode_human_label(selected_mode)}**")
+    selected_mode: str | None = None
+    if modes:
+        if st.session_state.get(mode_key) not in modes:
+            st.session_state[mode_key] = modes[0]
+        if len(modes) > 1:
+            selected_mode = st.selectbox(
+                mode_label,
+                modes,
+                key=mode_key,
+                format_func=mode_human_label,
+            )
+        else:
+            selected_mode = modes[0]
+            st.caption(f"{mode_label}: **{mode_human_label(selected_mode)}**")
 
-    # --- Level 4: Config ---
     matching = cascade_filter_configs(
-        cascade_opts, selected_source, selected_model, selected_mode
+        cascade_opts,
+        selected_source,
+        selected_model or None,
+        selected_mode or None,
     )
+    # When model/mode metadata is sparse, still restrict to selected source.
+    if not matching and selected_source is not None:
+        matching = [o for o in cascade_opts if o.source_kind == selected_source]
     if not matching:
-        st.warning("No configs match the selected Source / Model / Mode.")
-        st.session_state.pop(widget_key, None)
-        return None
+        matching = cascade_opts
 
-    cfg_paths = [opt.path for opt in matching]
-    cfg_labels = {opt.path: opt.display_label for opt in matching}
-    if st.session_state.get(widget_key) not in cfg_paths:
-        st.session_state[widget_key] = cfg_paths[0]
+    item_paths = [opt.path for opt in matching if opt.path in path_set]
+    if not item_paths:
+        item_paths = [p for p in paths]
+    labels = {
+        opt.path: opt.display_label for opt in cascade_opts if opt.path in item_paths
+    }
+    for path in item_paths:
+        labels.setdefault(path, Path(path).name)
 
+    if st.session_state.get(widget_key) not in item_paths:
+        index = min(max(default_index, 0), len(item_paths) - 1)
+        st.session_state[widget_key] = item_paths[index]
     selected_value = st.selectbox(
-        "Config",
-        cfg_paths,
+        item_label,
+        item_paths,
         key=widget_key,
-        format_func=lambda v: cfg_labels.get(v, v),
+        format_func=lambda v: labels.get(v, v),
     )
     if selected_value:
+        st.caption(f"`{Path(selected_value).name}`")
         st.caption(f"`{selected_value}`")
 
-    with st.expander("Advanced: raw config path selector"):
-        all_paths = [path for path, _ in option_pairs]
-        all_labels = dict(option_pairs)
-        flat_key = f"{widget_key}__flat"
-        if st.session_state.get(flat_key) not in all_paths:
-            st.session_state[flat_key] = (
-                selected_value if selected_value in all_paths else all_paths[0]
+    if show_advanced:
+        with st.expander(advanced_label):
+            all_labels = {
+                opt.path: readable_path_label(opt.path, REPOSITORY_ROOT)
+                for opt in cascade_opts
+            }
+            flat_key = f"{widget_key}__flat"
+            if st.session_state.get(flat_key) not in paths:
+                st.session_state[flat_key] = (
+                    selected_value if selected_value in paths else paths[0]
+                )
+            st.selectbox(
+                f"Raw {item_label.lower()} path (diagnostic)",
+                paths,
+                key=flat_key,
+                format_func=lambda v: all_labels.get(v, v),
             )
-        st.selectbox(
-            "Raw config path (diagnostic)",
-            all_paths,
-            key=flat_key,
-            format_func=lambda v: all_labels.get(v, v),
-        )
-
     return selected_value
 
 
@@ -1033,9 +1050,10 @@ def _all_artifacts(loaded: ControlPanelRegistry) -> list[ArtifactRecord]:
     return records
 
 
-def _job_label(record: Any) -> str:
-    label = job_primary_label(record.job)
-    return f"{label} · {record.job_id[:8]}"
+def _job_label(record: Any, commands: Mapping[str, Any] | None = None) -> str:
+    return job_primary_label(
+        record.job, record_commands=dict(commands) if commands else None
+    )
 
 
 def main() -> None:

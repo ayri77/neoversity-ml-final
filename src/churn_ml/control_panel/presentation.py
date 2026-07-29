@@ -43,8 +43,20 @@ def normalize_source_kind(path_str: str, content: dict | None = None) -> str:
     del content
     if path_str.startswith("artifacts/optuna_exports"):
         return "Optuna export"
+    if path_str.startswith("artifacts/optuna_searches"):
+        return "Optuna study"
     if path_str.startswith("artifacts/ui_configs"):
         return "UI config copy"
+    if path_str.startswith("artifacts/research_v2_comparisons"):
+        return "Paired comparison"
+    if path_str.startswith("artifacts/research_v2"):
+        return "Experiment Core run"
+    if path_str.startswith("artifacts/research/"):
+        return "Research v1 run"
+    if path_str.startswith("artifacts/deployments"):
+        return "Deployment artifact"
+    if path_str.startswith("artifacts/deployment_fixtures"):
+        return "Deployment fixture"
     if path_str.startswith("configs/"):
         return "Canonical config"
     return "Other"
@@ -53,8 +65,14 @@ def normalize_source_kind(path_str: str, content: dict | None = None) -> str:
 def config_badge(source_kind: str) -> str:
     mapping = {
         "Optuna export": "EXPORTED",
+        "Optuna study": "STUDY",
         "UI config copy": "COPY",
         "Canonical config": "CANONICAL",
+        "Experiment Core run": "RUN",
+        "Research v1 run": "RUN",
+        "Paired comparison": "COMPARE",
+        "Deployment artifact": "DEPLOY",
+        "Deployment fixture": "FIXTURE",
     }
     return mapping.get(source_kind, "OTHER")
 
@@ -70,6 +88,20 @@ def mode_badge(mode: str) -> str:
 
 def _read_config_bounded(path: Path) -> dict[str, Any] | None:
     try:
+        if path.is_dir():
+            for candidate in (
+                "study_summary.json",
+                "best_trial.json",
+                "metrics/aggregate.json",
+                "decision_report.json",
+                "prediction_summary.json",
+                "aggregate_summary.json",
+            ):
+                nested = path / candidate
+                loaded = _read_config_bounded(nested)
+                if loaded is not None:
+                    return loaded
+            return None
         if not path.is_file():
             return None
         size = path.stat().st_size
@@ -77,7 +109,8 @@ def _read_config_bounded(path: Path) -> dict[str, Any] | None:
             return None
         text = path.read_text(encoding="utf-8")
         if path.suffix == ".json":
-            return json.loads(text)
+            result = json.loads(text)
+            return result if isinstance(result, dict) else None
         result = yaml.safe_load(text)
         if isinstance(result, dict):
             return result
@@ -94,11 +127,12 @@ def parse_config_metadata(path_str: str, repo_root: Path) -> dict[str, str]:
         result: dict[str, str] = {"source_kind": source_kind}
 
         stem = Path(path_str).stem
-        parts = stem.split("_")
+        parts = [p for p in Path(path_str).parts if p not in (".",)]
+        path_tokens = list(parts) + stem.split("_")
 
         mode_candidates = ["smoke", "development", "deployment"]
-        for part in reversed(parts):
-            if part in mode_candidates:
+        for part in reversed(path_tokens):
+            if part.lower() in mode_candidates:
                 result["mode"] = normalize_mode(part)
                 break
 
@@ -142,21 +176,33 @@ def parse_config_metadata(path_str: str, repo_root: Path) -> dict[str, str]:
             if "status" in content:
                 result["status"] = str(content["status"])
 
+            # Optuna study_summary / best_trial payloads under artifact dirs
+            if "study_name" in content and "best_trial" not in result:
+                result["experiment_name"] = str(content["study_name"])
+            if "search_id" in content and "experiment_name" not in result:
+                result["experiment_name"] = str(content["search_id"])
+
         if "model_family" not in result:
-            family = normalize_model_family(stem)
-            if family not in (stem, stem.title()):
-                result["model_family"] = family
-            else:
-                for prefix in (
-                    "xgboost",
-                    "catboost",
-                    "lightgbm",
-                    "manual_lightgbm",
-                    "autogluon",
-                ):
-                    if stem.lower().startswith(prefix):
-                        result["model_family"] = normalize_model_family(stem)
-                        break
+            for token in path_tokens:
+                family = normalize_model_family(token)
+                if family in {"LightGBM", "XGBoost", "CatBoost", "AutoGluon"}:
+                    result["model_family"] = family
+                    break
+            if "model_family" not in result:
+                family = normalize_model_family(stem)
+                if family not in (stem, stem.title()):
+                    result["model_family"] = family
+                else:
+                    for prefix in (
+                        "xgboost",
+                        "catboost",
+                        "lightgbm",
+                        "manual_lightgbm",
+                        "autogluon",
+                    ):
+                        if stem.lower().startswith(prefix):
+                            result["model_family"] = normalize_model_family(stem)
+                            break
 
         return result
     except Exception:
@@ -281,10 +327,22 @@ def job_primary_label(record_job: dict, record_commands: dict | None = None) -> 
             if mode:
                 parts.append(mode)
 
-        if not parts and command_id:
-            parts.append(command_id.replace("_", " ").title())
-        if action_id:
-            parts.append(action_id.replace("_", " ").title())
+        operation = ""
+        if record_commands and command_id in record_commands:
+            command = record_commands[command_id]
+            operation = getattr(command, "title", "") or str(command_id)
+            actions = getattr(command, "actions", {})
+            if action_id in actions:
+                action_title = getattr(actions[action_id], "title", "")
+                if action_title:
+                    operation = f"{operation} {action_title}".strip()
+        if not operation:
+            cmd_part = command_id.replace("_", " ").title() if command_id else ""
+            act_part = action_id.replace("_", " ").title() if action_id else ""
+            operation = " ".join(p for p in (cmd_part, act_part) if p)
+
+        if operation:
+            parts.append(operation)
 
         if parts:
             return " · ".join(parts)
@@ -348,7 +406,13 @@ def build_pre_run_summary(
 _SOURCE_LABEL_MAP: dict[str, str] = {
     "Canonical config": "Canonical config",
     "Optuna export": "Optuna export",
+    "Optuna study": "Optuna study",
     "UI config copy": "UI copy",
+    "Experiment Core run": "Experiment Core run",
+    "Research v1 run": "Research v1 run",
+    "Paired comparison": "Paired comparison",
+    "Deployment artifact": "Deployment artifact",
+    "Deployment fixture": "Deployment fixture",
     "Other": "Other approved source",
 }
 
@@ -391,15 +455,18 @@ def build_cascade_options(
         mode = meta.get("mode", "")
         basename = Path(path).name
 
-        if source_kind == "Optuna export":
+        if source_kind in {"Optuna export", "Optuna study"}:
             trial = meta.get("best_trial", "")
             obj = meta.get("best_objective", "")
-            if trial and obj:
+            name = meta.get("experiment_name", "")
+            if trial and obj not in ("", "None", "none"):
                 try:
                     obj_f = float(obj)
                     label_core = f"trial {trial} · objective {obj_f:.6f}"
                 except ValueError:
                     label_core = f"trial {trial} · {obj}"
+            elif name:
+                label_core = str(name)
             elif trial:
                 label_core = f"trial {trial}"
             else:
@@ -407,10 +474,7 @@ def build_cascade_options(
         else:
             stem = Path(path).stem
             desc = _stem_description(stem)
-            parts_l = []
-            if desc:
-                parts_l.append(desc)
-            label_core = " ".join(parts_l) if parts_l else stem
+            label_core = desc if desc else (meta.get("experiment_name") or basename)
 
         if label_core in seen_labels:
             seen_labels[label_core] += 1
@@ -440,11 +504,11 @@ def cascade_available_sources(options: list[ConfigCascadeOption]) -> list[str]:
 
 
 def cascade_available_models(
-    options: list[ConfigCascadeOption], source: str
+    options: list[ConfigCascadeOption], source: str | None = None
 ) -> list[str]:
     seen: list[str] = []
     for opt in options:
-        if opt.source_kind != source:
+        if source is not None and opt.source_kind != source:
             continue
         if opt.model_family and opt.model_family not in seen:
             seen.append(opt.model_family)
@@ -452,11 +516,15 @@ def cascade_available_models(
 
 
 def cascade_available_modes(
-    options: list[ConfigCascadeOption], source: str, model: str
+    options: list[ConfigCascadeOption],
+    source: str | None = None,
+    model: str | None = None,
 ) -> list[str]:
     seen: list[str] = []
     for opt in options:
-        if opt.source_kind != source or opt.model_family != model:
+        if source is not None and opt.source_kind != source:
+            continue
+        if model is not None and opt.model_family != model:
             continue
         if opt.mode and opt.mode not in seen:
             seen.append(opt.mode)
@@ -465,15 +533,41 @@ def cascade_available_modes(
 
 def cascade_filter_configs(
     options: list[ConfigCascadeOption],
-    source: str,
-    model: str,
-    mode: str,
+    source: str | None = None,
+    model: str | None = None,
+    mode: str | None = None,
 ) -> list[ConfigCascadeOption]:
     return [
         opt
         for opt in options
-        if opt.source_kind == source and opt.model_family == model and opt.mode == mode
+        if (source is None or opt.source_kind == source)
+        and (model is None or not model or opt.model_family == model)
+        and (mode is None or not mode or opt.mode == mode)
     ]
+
+
+def readable_path_label(path_str: str, repo_root: Path) -> str:
+    """Human-readable primary label for any config or artifact path."""
+    opts = build_cascade_options([path_str], repo_root)
+    if not opts:
+        return Path(path_str).name
+    opt = opts[0]
+    parts = []
+    if opt.model_family:
+        parts.append(opt.model_family)
+    if opt.mode:
+        parts.append(opt.mode)
+    parts.append(opt.display_label)
+    return " · ".join(parts)
+
+
+def enum_human_label(value: str) -> str:
+    mapping = {
+        "research_v2": "Experiment Core v2",
+        "autogluon": "AutoGluon",
+        "all": "All sources",
+    }
+    return mapping.get(value, value.replace("_", " ").title())
 
 
 def source_human_label(source_kind: str) -> str:

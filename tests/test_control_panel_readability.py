@@ -71,8 +71,8 @@ def test_job_label_readable(
         status = {"state": "succeeded"}
 
     label = control_panel_app._job_label(_FakeRecord())
-    assert " · " in label
-    assert "abc12345"[:8] in label
+    assert " · " in label or "Run" in label
+    assert "abc12345" not in label  # UUID shown separately below selector
 
 
 def _apptest_run_page_deployment() -> None:

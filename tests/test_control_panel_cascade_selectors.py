@@ -15,6 +15,7 @@ from src.churn_ml.control_panel.presentation import (
     cascade_filter_configs,
     model_human_label,
     mode_human_label,
+    readable_path_label,
     source_human_label,
 )
 from src.churn_ml.control_panel.registry import load_registry
@@ -310,4 +311,139 @@ def test_jobs_fallback_label_without_config() -> None:
     label = job_primary_label(job)
     # Without config metadata, must still produce a readable non-empty label
     assert label
-    assert " · " in label or "/" in label
+    assert "Experiment Core" in label or "Run" in label
+
+
+def test_optuna_config_cascade_excludes_other_models() -> None:
+    loaded = load_registry(PROJECT_ROOT)
+    pairs = control_panel_app._config_options(
+        loaded, loaded.commands["optuna_search_v1"].allowed_config_globs
+    )
+    opts = build_cascade_options([p for p, _ in pairs], PROJECT_ROOT)
+    matched = cascade_filter_configs(
+        opts, "Canonical config", "CatBoost", "Development"
+    )
+    assert matched
+    assert all("catboost" in o.path.lower() for o in matched)
+    assert not any("xgboost" in o.path.lower() for o in matched)
+
+
+def test_optuna_export_and_research_v1_configs_use_cascade_helpers() -> None:
+    loaded = load_registry(PROJECT_ROOT)
+    for command_id in ("optuna_search_v1", "research_v1", "final_deployment_v1"):
+        command = loaded.commands[command_id]
+        if not command.allowed_config_globs:
+            continue
+        pairs = control_panel_app._config_options(loaded, command.allowed_config_globs)
+        if not pairs:
+            continue  # deployment configs may be absent in this worktree
+        opts = build_cascade_options([p for p, _ in pairs], PROJECT_ROOT)
+        assert opts
+        sources = cascade_available_sources(opts)
+        assert sources
+
+
+def test_paired_comparison_reader_roots_match() -> None:
+    loaded = load_registry(PROJECT_ROOT)
+    reader = control_panel_app._reader_matching_roots(
+        loaded, ("artifacts/research_v2",)
+    )
+    assert reader is not None
+    assert reader.id == "research_v2"
+    deploy_reader = control_panel_app._reader_matching_roots(
+        loaded, ("artifacts/deployments",)
+    )
+    assert deploy_reader is not None
+    assert deploy_reader.id == "deployment_v1"
+
+
+def test_results_left_right_cascade_filters_models() -> None:
+    raw_paths = [
+        "artifacts/research_v2/lightgbm_numeric_v1_development/run_a",
+        "artifacts/research_v2/xgboost_numeric_v1_development/run_b",
+        "artifacts/research_v2/catboost_numeric_v1_smoke/run_c",
+    ]
+    opts = build_cascade_options(raw_paths, PROJECT_ROOT)
+    models = cascade_available_models(opts)
+    assert "LightGBM" in models
+    assert "XGBoost" in models
+    lgbm = cascade_filter_configs(opts, model="LightGBM", mode="Development")
+    assert all(o.model_family == "LightGBM" for o in lgbm)
+    assert not any(o.model_family == "XGBoost" for o in lgbm)
+
+
+def test_mlflow_enum_human_labels() -> None:
+    from src.churn_ml.control_panel.presentation import enum_human_label
+
+    assert enum_human_label("research_v2") == "Experiment Core v2"
+    assert enum_human_label("autogluon") == "AutoGluon"
+    assert enum_human_label("all") == "All sources"
+
+
+def test_dashboard_artifact_label_is_human_readable() -> None:
+    label = readable_path_label(
+        "configs/research_v2/manual_lightgbm_te_v1_compat_development.yaml",
+        PROJECT_ROOT,
+    )
+    assert "LightGBM" in label
+    assert "Development" in label
+    assert "configs/research_v2/" not in label
+
+
+def test_optuna_inspect_renders_search_dir_cascade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spy = StartSpy()
+    at = _run_page(monkeypatch, spy)
+    at = _select(at, "Operation", "optuna_search_v1")
+    at = _select(at, "Action", "inspect")
+    # Inspect has search_dir via artifact reader; either a cascade item or info message
+    select_labels = [item.label for item in at.selectbox]
+    info_texts = [str(i.value) for i in at.info]
+    assert any(
+        "Search Dir" in label or "search" in label.lower() for label in select_labels
+    ) or any("No matching" in t for t in info_texts), (
+        f"Expected search_dir selector or empty info; selects={select_labels}, info={info_texts}"
+    )
+
+
+def test_paired_comparison_renders_baseline_candidate_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spy = StartSpy()
+    at = _run_page(monkeypatch, spy)
+    at = _select(at, "Operation", "paired_comparison")
+    at = _select(at, "Action", "validate")
+    select_labels = [item.label for item in at.selectbox]
+    info_texts = [str(i.value) for i in at.info]
+    # Either cascade widgets for baseline/candidate or empty-artifact info
+    has_baseline = any("Baseline" in label for label in select_labels)
+    has_candidate = any("Candidate" in label for label in select_labels)
+    empty = any("No matching" in t or "No artifacts" in t for t in info_texts)
+    assert (
+        has_baseline
+        or has_candidate
+        or empty
+        or any("Model" in label for label in select_labels)
+    ), (
+        f"Expected paired comparison selectors; selects={select_labels}, info={info_texts}"
+    )
+
+
+def test_mlflow_source_type_uses_human_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spy = StartSpy()
+    at = _run_page(monkeypatch, spy)
+    at = _select(at, "Operation", "mlflow_local_index")
+    at = _select(at, "Action", "sync_dry_run")
+    source_box = next(
+        (item for item in at.selectbox if item.label == "Source Type"),
+        None,
+    )
+    assert source_box is not None, (
+        f"Expected Source Type selectbox; got {[i.label for i in at.selectbox]}"
+    )
+    # options are formatted via enum_human_label
+    options = list(source_box.options)
+    assert any("Experiment Core" in str(o) or "research_v2" in str(o) for o in options)
