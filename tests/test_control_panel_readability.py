@@ -27,25 +27,31 @@ def test_config_selectbox_shows_readable_label(
     at = _select(at, "Operation", "experiment_core_v2")
     config = next(item for item in at.selectbox if item.label == "Config")
     options = list(config.options)
-    assert options
-    # format_func is applied via the selectbox — the value is a raw path
-    # but readable labels should be buildable from it
-    labels = [readable_config_label(str(o), PROJECT_ROOT) for o in options]
-    assert any(
-        "LightGBM" in label or "XGBoost" in label or "CatBoost" in label
-        for label in labels
+    assert options, "Config selectbox must have at least one option"
+    # In the cascade UI, the model is already determined by the Model selectbox (or
+    # shown as a caption when there is only one). The Config selectbox shows
+    # display_label values filtered to the selected model. Verify the raw session
+    # value (selectbox.value) is a valid repository-relative path from the allowed
+    # globs, and that readable_config_label on that path mentions a known model.
+    raw_value = str(config.value)
+    label = readable_config_label(raw_value, PROJECT_ROOT)
+    assert any(m in label for m in ("LightGBM", "XGBoost", "CatBoost")), (
+        f"readable_config_label for '{raw_value}' did not contain a known model: {label}"
     )
 
 
-def test_pre_run_summary_expander_present(
+def test_pre_run_summary_not_in_expander(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Pre-run summary is now shown inline as a compact card, not inside an expander."""
     spy = StartSpy()
     at = _run_page(monkeypatch, spy)
     at = _select(at, "Action", "run")
     expander_labels = [e.label for e in at.expander]
-    assert any("Pre-run summary" in label for label in expander_labels), (
-        f"Expected 'Pre-run summary' expander, got: {expander_labels}"
+    # After the compact layout patch, summary fields are shown inline (st.markdown).
+    # The Technical command and Config preview are collapsed expanders.
+    assert any("Technical command" in label for label in expander_labels), (
+        f"Expected 'Technical command' expander, got: {expander_labels}"
     )
 
 

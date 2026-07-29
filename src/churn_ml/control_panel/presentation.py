@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -338,3 +339,150 @@ def build_pre_run_summary(
             summary["Trials"] = n_trials
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Cascade config selector helpers
+# ---------------------------------------------------------------------------
+
+_SOURCE_LABEL_MAP: dict[str, str] = {
+    "Canonical config": "Canonical config",
+    "Optuna export": "Optuna export",
+    "UI config copy": "UI copy",
+    "Other": "Other approved source",
+}
+
+_MODEL_LABEL_MAP: dict[str, str] = {
+    "LightGBM": "LightGBM",
+    "XGBoost": "XGBoost",
+    "CatBoost": "CatBoost",
+    "AutoGluon": "AutoGluon",
+}
+
+_MODE_LABEL_MAP: dict[str, str] = {
+    "Smoke": "Smoke",
+    "Development": "Development",
+    "Deployment": "Deployment",
+}
+
+
+@dataclass
+class ConfigCascadeOption:
+    """One config file with its extracted metadata for cascade filtering."""
+
+    path: str
+    source_kind: str
+    model_family: str
+    mode: str
+    display_label: str
+    basename: str
+
+
+def build_cascade_options(
+    paths: list[str], repo_root: Path
+) -> list[ConfigCascadeOption]:
+    """Parse metadata for each path and return structured cascade options."""
+    options: list[ConfigCascadeOption] = []
+    seen_labels: dict[str, int] = {}
+    for path in paths:
+        meta = parse_config_metadata(path, repo_root)
+        source_kind = meta.get("source_kind", "Other")
+        model_family = meta.get("model_family", "")
+        mode = meta.get("mode", "")
+        basename = Path(path).name
+
+        if source_kind == "Optuna export":
+            trial = meta.get("best_trial", "")
+            obj = meta.get("best_objective", "")
+            if trial and obj:
+                try:
+                    obj_f = float(obj)
+                    label_core = f"trial {trial} · objective {obj_f:.6f}"
+                except ValueError:
+                    label_core = f"trial {trial} · {obj}"
+            elif trial:
+                label_core = f"trial {trial}"
+            else:
+                label_core = basename
+        else:
+            stem = Path(path).stem
+            desc = _stem_description(stem)
+            parts_l = []
+            if desc:
+                parts_l.append(desc)
+            label_core = " ".join(parts_l) if parts_l else stem
+
+        if label_core in seen_labels:
+            seen_labels[label_core] += 1
+            label_core = f"{label_core} ({seen_labels[label_core]})"
+        else:
+            seen_labels[label_core] = 1
+
+        options.append(
+            ConfigCascadeOption(
+                path=path,
+                source_kind=source_kind,
+                model_family=model_family,
+                mode=mode,
+                display_label=label_core,
+                basename=basename,
+            )
+        )
+    return options
+
+
+def cascade_available_sources(options: list[ConfigCascadeOption]) -> list[str]:
+    seen: list[str] = []
+    for opt in options:
+        if opt.source_kind not in seen:
+            seen.append(opt.source_kind)
+    return seen
+
+
+def cascade_available_models(
+    options: list[ConfigCascadeOption], source: str
+) -> list[str]:
+    seen: list[str] = []
+    for opt in options:
+        if opt.source_kind != source:
+            continue
+        if opt.model_family and opt.model_family not in seen:
+            seen.append(opt.model_family)
+    return seen
+
+
+def cascade_available_modes(
+    options: list[ConfigCascadeOption], source: str, model: str
+) -> list[str]:
+    seen: list[str] = []
+    for opt in options:
+        if opt.source_kind != source or opt.model_family != model:
+            continue
+        if opt.mode and opt.mode not in seen:
+            seen.append(opt.mode)
+    return seen
+
+
+def cascade_filter_configs(
+    options: list[ConfigCascadeOption],
+    source: str,
+    model: str,
+    mode: str,
+) -> list[ConfigCascadeOption]:
+    return [
+        opt
+        for opt in options
+        if opt.source_kind == source and opt.model_family == model and opt.mode == mode
+    ]
+
+
+def source_human_label(source_kind: str) -> str:
+    return _SOURCE_LABEL_MAP.get(source_kind, source_kind)
+
+
+def model_human_label(model_family: str) -> str:
+    return _MODEL_LABEL_MAP.get(model_family, model_family)
+
+
+def mode_human_label(mode: str) -> str:
+    return _MODE_LABEL_MAP.get(mode, mode)

@@ -41,16 +41,21 @@ from src.churn_ml.control_panel.launch import (  # noqa: E402
 )
 from src.churn_ml.control_panel.formatting import human_duration  # noqa: E402
 from src.churn_ml.control_panel.presentation import (  # noqa: E402
+    build_cascade_options,
     build_pre_run_summary,
-    config_badge,
+    cascade_available_models,
+    cascade_available_modes,
+    cascade_available_sources,
+    cascade_filter_configs,
     format_date,
     format_time,
     job_primary_label,
     mode_badge,
-    normalize_mode,
-    normalize_source_kind,
+    mode_human_label,
+    model_human_label,
     parse_config_metadata,
     readable_config_label,
+    source_human_label,
 )
 from src.churn_ml.control_panel.jobs import JobError, JobManager  # noqa: E402
 from src.churn_ml.control_panel.placeholder_suggestions import (  # noqa: E402
@@ -230,6 +235,7 @@ def run_page() -> None:
     st.session_state["_last_action_id"] = action_id
 
     built = None
+    pre_run: dict[str, str] = {}
     try:
         if action.enabled:
             built = build_command(
@@ -247,21 +253,16 @@ def run_page() -> None:
                 values,
                 REPOSITORY_ROOT,
             )
-            with st.expander("Pre-run summary"):
-                if pre_run:
-                    st.dataframe(
-                        [{"field": k, "value": v} for k, v in pre_run.items()],
-                        width="stretch",
-                        hide_index=True,
-                    )
-                else:
-                    st.caption("No metadata available.")
-            st.code(display_argv(built.redacted_argv), language="python")
+            if pre_run:
+                st.markdown("  \n".join(f"**{k}:** {v}" for k, v in pre_run.items()))
+            with st.expander("Technical command", expanded=False):
+                st.code(display_argv(built.redacted_argv), language="python")
         else:
-            st.code(
-                display_argv(command.argv_prefix + action.argv),
-                language="python",
-            )
+            with st.expander("Technical command (action disabled)", expanded=False):
+                st.code(
+                    display_argv(command.argv_prefix + action.argv),
+                    language="python",
+                )
     except CommandBuildError as error:
         st.error(str(error))
 
@@ -365,19 +366,20 @@ def jobs_page() -> None:
     status = record.status
     columns = st.columns(4)
     columns[0].metric("Status", str(status["state"]))
-    columns[1].metric("PID", status.get("pid") or "—")
-    columns[2].metric("Elapsed", human_duration(status.get("elapsed_seconds")))
-    columns[3].metric(
-        "Exit code",
-        status.get("exit_code") if status.get("exit_code") is not None else "—",
-    )
+    columns[1].metric("Elapsed", human_duration(status.get("elapsed_seconds")))
     created = record.job.get("created_at_utc")
-    st.write(f"**Date:** {format_date(created)}  **Time:** {format_time(created)}")
-    with st.expander("Technical details"):
-        st.json(dict(record.job), expanded=False)
+    columns[2].metric("Date", format_date(created))
+    columns[3].metric("Time", format_time(created))
     if status.get("diagnostic"):
         st.warning(str(status["diagnostic"]))
-    st.code(display_argv(tuple(record.command["argv"])), language="python")
+    with st.expander("Technical details", expanded=False):
+        st.json(dict(record.job), expanded=False)
+        st.caption(
+            f"PID: {status.get('pid') or '—'}  |  "
+            f"Exit code: {status.get('exit_code') if status.get('exit_code') is not None else '—'}"
+        )
+    with st.expander("Technical command", expanded=False):
+        st.code(display_argv(tuple(record.command["argv"])), language="python")
     stdout, stderr = st.tabs(["stdout", "stderr"])
     with stdout:
         st.code(
@@ -423,14 +425,71 @@ def results_page() -> None:
         st.info("No artifacts match this configured reader.")
         return
     artifact_paths = [item.relative_path for item in artifacts]
+    cascade_arts = build_cascade_options(artifact_paths, REPOSITORY_ROOT)
 
-    def artifact_option_label(path: str) -> str:
-        return readable_config_label(path, REPOSITORY_ROOT) if path else path
-
+    # Cascading artifact selection: Model → Mode → Artifact
+    art_models = [m for m in dict.fromkeys(o.model_family for o in cascade_arts) if m]
+    art_mdl_key = f"results-{reader_id}-model"
+    if st.session_state.get(art_mdl_key) not in art_models and art_models:
+        st.session_state[art_mdl_key] = art_models[0]
+    if art_models:
+        if len(art_models) > 1:
+            sel_art_model = st.selectbox(
+                "Model",
+                art_models,
+                key=art_mdl_key,
+                format_func=model_human_label,
+            )
+        else:
+            sel_art_model = art_models[0]
+            st.caption(f"Model: **{model_human_label(sel_art_model)}**")
+        art_modes = [
+            m
+            for m in dict.fromkeys(
+                o.mode for o in cascade_arts if o.model_family == sel_art_model
+            )
+            if m
+        ]
+    else:
+        sel_art_model = ""
+        art_modes = []
+    art_mode_key = f"results-{reader_id}-mode"
+    if st.session_state.get(art_mode_key) not in art_modes and art_modes:
+        st.session_state[art_mode_key] = art_modes[0]
+    if art_modes:
+        if len(art_modes) > 1:
+            sel_art_mode = st.selectbox(
+                "Mode",
+                art_modes,
+                key=art_mode_key,
+                format_func=mode_human_label,
+            )
+        else:
+            sel_art_mode = art_modes[0]
+            st.caption(f"Mode: **{mode_human_label(sel_art_mode)}**")
+    else:
+        sel_art_mode = ""
+    filtered_arts = [
+        o
+        for o in cascade_arts
+        if (not sel_art_model or o.model_family == sel_art_model)
+        and (not sel_art_mode or o.mode == sel_art_mode)
+    ]
+    filtered_paths = [o.path for o in filtered_arts]
+    filtered_labels = {o.path: o.display_label for o in filtered_arts}
+    if not filtered_paths:
+        filtered_paths = artifact_paths
+        filtered_labels = {
+            p: readable_config_label(p, REPOSITORY_ROOT) for p in artifact_paths
+        }
+    art_cfg_key = f"results-{reader_id}-artifact"
+    if st.session_state.get(art_cfg_key) not in filtered_paths:
+        st.session_state[art_cfg_key] = filtered_paths[0]
     selected_path = st.selectbox(
         "Artifact",
-        artifact_paths,
-        format_func=artifact_option_label,
+        filtered_paths,
+        key=art_cfg_key,
+        format_func=lambda v: filtered_labels.get(v, v),
     )
     if selected_path:
         st.caption(f"`{selected_path}`")
@@ -486,9 +545,21 @@ def results_page() -> None:
             or st.session_state[right_key] not in paths
         ):
             st.session_state[right_key] = paths[1]
-        left, right = st.columns(2)
-        left_path = left.selectbox("Left", paths, key=left_key)
-        right_path = right.selectbox("Right", paths, key=right_key)
+        left_col, right_col = st.columns(2)
+        _compare_arts = build_cascade_options(paths, REPOSITORY_ROOT)
+        _compare_labels = {o.path: o.display_label for o in _compare_arts}
+        left_path = left_col.selectbox(
+            "Left model · mode · artifact",
+            paths,
+            key=left_key,
+            format_func=lambda v: _compare_labels.get(v, v),
+        )
+        right_path = right_col.selectbox(
+            "Right model · mode · artifact",
+            paths,
+            key=right_key,
+            format_func=lambda v: _compare_labels.get(v, v),
+        )
         left_item = next(item for item in artifacts if item.relative_path == left_path)
         right_item = next(
             item for item in artifacts if item.relative_path == right_path
@@ -640,43 +711,7 @@ def _placeholder_widget(
     if spec.type == "integer":
         return int(st.number_input(label, step=1, key=widget_key))
     if spec.role == "config":
-        option_pairs = _config_options(loaded, config_globs)
-        if not option_pairs:
-            st.warning("No allowed configuration files were found.")
-            st.session_state.pop(widget_key, None)
-            return None
-        options = [path for path, _label in option_pairs]
-        labels = dict(option_pairs)
-        current = st.session_state.get(widget_key)
-        if current not in options:
-            st.session_state[widget_key] = options[0]
-        selected_value = st.selectbox(
-            label,
-            options,
-            key=widget_key,
-            format_func=lambda v: labels.get(v, v),
-        )
-        st.caption(f"`{selected_value}`")
-        if selected_value:
-            _stem = Path(str(selected_value)).stem
-            _parts = _stem.split("_")
-            _mode_raw = ""
-            for _part in reversed(_parts):
-                if _part in ("smoke", "development", "deployment"):
-                    _mode_raw = _part
-                    break
-            _source_kind = normalize_source_kind(str(selected_value))
-            _badge_src = config_badge(_source_kind)
-            _mode_display = normalize_mode(_mode_raw) if _mode_raw else ""
-            _badge_mode = mode_badge(_mode_display) if _mode_display else ""
-            badge_parts = []
-            if _badge_src:
-                badge_parts.append(f"[{_badge_src}]")
-            if _badge_mode:
-                badge_parts.append(f"[{_badge_mode}]")
-            if badge_parts:
-                st.caption(" ".join(badge_parts))
-        return selected_value
+        return _cascade_config_widget(loaded, config_globs, widget_key)
     if spec.artifact_reader_id is not None:
         return _artifact_path_widget(loaded, name, spec, widget_key)
     if spec.suggested_value_template is not None:
@@ -792,6 +827,160 @@ def _config_options(
     return [(p, readable_config_label(p, REPOSITORY_ROOT)) for p in sorted(paths)]
 
 
+def _cascade_config_widget(
+    loaded: ControlPanelRegistry,
+    config_globs: tuple[str, ...],
+    widget_key: str,
+) -> str | None:
+    """Four-level cascading config selector: Source → Model → Mode → Config."""
+    option_pairs = _config_options(loaded, config_globs)
+    if not option_pairs:
+        st.warning("No allowed configuration files were found.")
+        st.session_state.pop(widget_key, None)
+        return None
+
+    raw_paths = [path for path, _ in option_pairs]
+    cascade_opts = build_cascade_options(raw_paths, REPOSITORY_ROOT)
+
+    # --- Level 1: Source ---
+    sources = cascade_available_sources(cascade_opts)
+    src_key = f"{widget_key}__src"
+    if st.session_state.get(src_key) not in sources:
+        st.session_state[src_key] = sources[0]
+    if len(sources) > 1:
+        selected_source = st.selectbox(
+            "Source",
+            sources,
+            key=src_key,
+            format_func=source_human_label,
+        )
+    else:
+        selected_source = sources[0]
+        st.caption(f"Source: **{source_human_label(selected_source)}**")
+
+    # --- Level 2: Model ---
+    models = cascade_available_models(cascade_opts, selected_source)
+    mdl_key = f"{widget_key}__mdl"
+    if not models:
+        # No model metadata — fall back to flat selection within this source
+        source_paths = [
+            o.path for o in cascade_opts if o.source_kind == selected_source
+        ]
+        source_labels = {
+            o.path: o.display_label
+            for o in cascade_opts
+            if o.source_kind == selected_source
+        }
+        if not source_paths:
+            source_paths = raw_paths
+            source_labels = dict(option_pairs)
+        if st.session_state.get(widget_key) not in source_paths:
+            st.session_state[widget_key] = source_paths[0]
+        selected_value = st.selectbox(
+            "Config",
+            source_paths,
+            key=widget_key,
+            format_func=lambda v: source_labels.get(v, v),
+        )
+        if selected_value:
+            st.caption(f"`{selected_value}`")
+        return selected_value
+    if st.session_state.get(mdl_key) not in models:
+        st.session_state[mdl_key] = models[0]
+    if len(models) > 1:
+        selected_model = st.selectbox(
+            "Model",
+            models,
+            key=mdl_key,
+            format_func=model_human_label,
+        )
+    else:
+        selected_model = models[0]
+        st.caption(f"Model: **{model_human_label(selected_model)}**")
+
+    # --- Level 3: Mode ---
+    modes = cascade_available_modes(cascade_opts, selected_source, selected_model)
+    mode_key = f"{widget_key}__mode"
+    if not modes:
+        # No mode metadata — fall back to flat selection within source+model
+        model_paths = [
+            o.path
+            for o in cascade_opts
+            if o.source_kind == selected_source and o.model_family == selected_model
+        ]
+        model_labels = {
+            o.path: o.display_label
+            for o in cascade_opts
+            if o.source_kind == selected_source and o.model_family == selected_model
+        }
+        if not model_paths:
+            model_paths = raw_paths
+            model_labels = dict(option_pairs)
+        if st.session_state.get(widget_key) not in model_paths:
+            st.session_state[widget_key] = model_paths[0]
+        selected_value = st.selectbox(
+            "Config",
+            model_paths,
+            key=widget_key,
+            format_func=lambda v: model_labels.get(v, v),
+        )
+        if selected_value:
+            st.caption(f"`{selected_value}`")
+        return selected_value
+    if st.session_state.get(mode_key) not in modes:
+        st.session_state[mode_key] = modes[0]
+    if len(modes) > 1:
+        selected_mode = st.selectbox(
+            "Mode",
+            modes,
+            key=mode_key,
+            format_func=mode_human_label,
+        )
+    else:
+        selected_mode = modes[0]
+        st.caption(f"Mode: **{mode_human_label(selected_mode)}**")
+
+    # --- Level 4: Config ---
+    matching = cascade_filter_configs(
+        cascade_opts, selected_source, selected_model, selected_mode
+    )
+    if not matching:
+        st.warning("No configs match the selected Source / Model / Mode.")
+        st.session_state.pop(widget_key, None)
+        return None
+
+    cfg_paths = [opt.path for opt in matching]
+    cfg_labels = {opt.path: opt.display_label for opt in matching}
+    if st.session_state.get(widget_key) not in cfg_paths:
+        st.session_state[widget_key] = cfg_paths[0]
+
+    selected_value = st.selectbox(
+        "Config",
+        cfg_paths,
+        key=widget_key,
+        format_func=lambda v: cfg_labels.get(v, v),
+    )
+    if selected_value:
+        st.caption(f"`{selected_value}`")
+
+    with st.expander("Advanced: raw config path selector"):
+        all_paths = [path for path, _ in option_pairs]
+        all_labels = dict(option_pairs)
+        flat_key = f"{widget_key}__flat"
+        if st.session_state.get(flat_key) not in all_paths:
+            st.session_state[flat_key] = (
+                selected_value if selected_value in all_paths else all_paths[0]
+            )
+        st.selectbox(
+            "Raw config path (diagnostic)",
+            all_paths,
+            key=flat_key,
+            format_func=lambda v: all_labels.get(v, v),
+        )
+
+    return selected_value
+
+
 def _config_panel(loaded: ControlPanelRegistry, selected: Path) -> None:
     try:
         text, canonical = read_config(
@@ -806,13 +995,13 @@ def _config_panel(loaded: ControlPanelRegistry, selected: Path) -> None:
     except ConfigEditError as error:
         st.error(str(error))
         return
-    st.subheader("Configuration")
-    st.code(text, language="yaml" if canonical.suffix != ".json" else "json")
-    try:
-        parse_config_text(text, canonical.suffix)
-        st.success("YAML/JSON syntax is valid.")
-    except ConfigEditError as error:
-        st.error(str(error))
+    with st.expander("Config preview", expanded=False):
+        st.code(text, language="yaml" if canonical.suffix != ".json" else "json")
+        try:
+            parse_config_text(text, canonical.suffix)
+            st.success("YAML/JSON syntax is valid.")
+        except ConfigEditError as error:
+            st.error(str(error))
     if not loaded.settings.allow_config_copy_editing:
         return
     with st.expander("Advanced configuration editor"):

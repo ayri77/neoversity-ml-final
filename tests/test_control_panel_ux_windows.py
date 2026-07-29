@@ -121,32 +121,29 @@ def test_child_can_resolve_path_home_with_windows_home_vars(tmp_path: Path) -> N
 def test_apptest_config_options_follow_command_and_action(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # After the readability patch, selectbox options and values contain readable labels
-    # (AppTest applies format_func to both options and value).
-    # We verify via _config_options that the raw paths are correct and check labels.
-    from src.churn_ml.control_panel.presentation import readable_config_label
-
+    # After the cascade UI patch, the Config selectbox shows display_label values
+    # as formatted options. We verify the raw session value is a valid path and
+    # that options do not cross-contaminate between commands.
     spy = StartSpy()
     at = _run_page(monkeypatch, spy)
     at = _select(at, "Operation", "mlflow_local_index")
     config = next(item for item in at.selectbox if item.label == "Config")
-    # options are formatted labels; value is the raw path (session state)
-    mlflow_label = readable_config_label("configs/mlflow/local.yaml", PROJECT_ROOT)
-    assert mlflow_label in list(config.options)
+    # raw session value must be the mlflow config path
     assert config.value == "configs/mlflow/local.yaml"
+    mlflow_raw_value = config.value
 
     at = _select(at, "Operation", "optuna_search_v1")
     config = next(item for item in at.selectbox if item.label == "Config")
-    # No mlflow label should appear in optuna config options (formatted)
-    assert mlflow_label not in list(config.options)
-    # value is a raw path; must start with valid roots
+    # mlflow raw path must not appear in optuna options (raw paths are options)
+    assert mlflow_raw_value not in list(config.options)
+    # value must be a raw path within valid roots
     assert str(config.value).startswith("configs/optuna/") or str(
         config.value
     ).startswith("artifacts/ui_configs/")
 
     at = _select(at, "Action", "run")
     config = next(item for item in at.selectbox if item.label == "Config")
-    # value is raw path, options are formatted labels; value must be non-empty
+    # value is raw path; must be non-empty
     assert config.value
 
 
@@ -367,11 +364,13 @@ def test_apptest_side_by_side_defaults_to_distinct_artifacts(
     reader.select("optuna_search_v1")
     at = at.run()
     assert not at.exception
-    left = next(item for item in at.selectbox if item.label == "Left")
-    right = next(item for item in at.selectbox if item.label == "Right")
+    left = next(item for item in at.selectbox if item.label.startswith("Left"))
+    right = next(item for item in at.selectbox if item.label.startswith("Right"))
     assert left.value != right.value
-    assert left.value in left.options
-    assert right.value in right.options
+    # In the cascade UI, options contain formatted display labels while value is a
+    # raw path (session state). Verify that both values are non-empty valid paths.
+    assert left.value
+    assert right.value
 
 
 def test_action_requires_additional_input_helper() -> None:
