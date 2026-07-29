@@ -7,10 +7,24 @@ can reuse the same selection without trusting stale or forged paths.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 
 LOGICAL_SELECTION_KEY = "_cp_logical_selection"
+
+
+@dataclass(frozen=True)
+class CascadeReconciliation:
+    """Canonical path resolved from cascade parents in a single rerun."""
+
+    path: str | None
+    matched_paths: tuple[str, ...]
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.path is not None
 
 
 def logical_selection_key(operation: str, role: str, name: str) -> str:
@@ -100,15 +114,18 @@ def seed_widget_from_logical(
     allowed: Sequence[Any] | None,
     cascade_meta: Mapping[str, str] | None = None,
 ) -> Any | None:
-    """Seed a widget (and optional cascade parents) from logical state.
+    """Seed a widget from logical state without clobbering cascade parents.
 
     Stale or forged widget values that are not in ``allowed`` are discarded.
+    Cascade parent keys (``__src`` / ``__mdl`` / ``__mode``) are only filled when
+    missing so a parent change in the same rerun is not overwritten by an old
+    logical path. Parent→child reconciliation happens in the cascade selector.
     """
     current = session_state.get(widget_key)
     validated_current = validate_against_allowed(current, allowed)
     if validated_current is None and current not in (None, ""):
         session_state.pop(widget_key, None)
-        for suffix in ("__src", "__mdl", "__mode", "__flat"):
+        for suffix in ("__src", "__mdl", "__mode", "__flat", "__parent_fp"):
             session_state.pop(f"{widget_key}{suffix}", None)
 
     resolved = resolve_logical_selection(
@@ -124,17 +141,76 @@ def seed_widget_from_logical(
 
     if session_state.get(widget_key) != resolved:
         session_state[widget_key] = resolved
-        if cascade_meta:
-            source = cascade_meta.get("source_kind")
-            model = cascade_meta.get("model_family")
-            mode = cascade_meta.get("mode")
-            if source:
-                session_state[f"{widget_key}__src"] = source
-            if model:
-                session_state[f"{widget_key}__mdl"] = model
-            if mode:
-                session_state[f"{widget_key}__mode"] = mode
+    if cascade_meta:
+        _seed_missing_cascade_parent(
+            session_state, f"{widget_key}__src", cascade_meta.get("source_kind")
+        )
+        _seed_missing_cascade_parent(
+            session_state, f"{widget_key}__mdl", cascade_meta.get("model_family")
+        )
+        _seed_missing_cascade_parent(
+            session_state, f"{widget_key}__mode", cascade_meta.get("mode")
+        )
     return resolved
+
+
+def _seed_missing_cascade_parent(
+    session_state: Any, key: str, value: str | None
+) -> None:
+    if value in (None, ""):
+        return
+    if session_state.get(key) in (None, ""):
+        session_state[key] = value
+
+
+def reconcile_cascade_selection(
+    *,
+    allowed_paths: Sequence[str],
+    matched_paths: Sequence[str],
+    current_path: Any,
+    default_index: int = 0,
+) -> CascadeReconciliation:
+    """Resolve one canonical path from cascade parents; fail closed on mismatch.
+
+    The diagnostic raw selector must never override this result. Callers should
+    sync widget + ``__flat`` keys from ``path`` in the same rerun.
+    """
+    allowed = [path for path in allowed_paths if path]
+    matched = [path for path in matched_paths if path in allowed]
+    if not matched:
+        return CascadeReconciliation(
+            path=None,
+            matched_paths=(),
+            error="No configuration matches the selected Source / Model / Mode.",
+        )
+    if current_path in matched:
+        return CascadeReconciliation(
+            path=str(current_path), matched_paths=tuple(matched), error=None
+        )
+    index = min(max(default_index, 0), len(matched) - 1)
+    return CascadeReconciliation(
+        path=matched[index], matched_paths=tuple(matched), error=None
+    )
+
+
+def apply_cascade_reconciliation(
+    session_state: Any,
+    *,
+    widget_key: str,
+    reconciliation: CascadeReconciliation,
+    parent_fingerprint: tuple[str | None, ...],
+) -> str | None:
+    """Write canonical cascade path into widget + diagnostic keys atomically."""
+    if not reconciliation.ok or reconciliation.path is None:
+        session_state.pop(widget_key, None)
+        session_state.pop(f"{widget_key}__flat", None)
+        session_state[f"{widget_key}__parent_fp"] = parent_fingerprint
+        return None
+    canonical = reconciliation.path
+    session_state[widget_key] = canonical
+    session_state[f"{widget_key}__flat"] = canonical
+    session_state[f"{widget_key}__parent_fp"] = parent_fingerprint
+    return canonical
 
 
 def remember_widget_selection(

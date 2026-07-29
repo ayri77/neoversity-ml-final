@@ -193,10 +193,7 @@ commands:
     argv_prefix: ["$PYTHON", "-u", "scripts/sync_mlflow.py"]
     allowed_config_globs:
       - "configs/mlflow/*.yaml"
-      - "artifacts/ui_configs/*.yaml"
-      - "artifacts/ui_configs/*.yml"
-      - "artifacts/ui_configs/*.json"
-    allowed_input_roots: ["configs/mlflow", "artifacts/ui_configs"]
+    allowed_input_roots: ["configs/mlflow"]
     allowed_output_roots: []
     result_reader_id: null
     artifact_url: "http://127.0.0.1:5000"
@@ -211,7 +208,7 @@ commands:
             type: path
             role: config
             required: true
-            roots: ["configs/mlflow", "artifacts/ui_configs"]
+            roots: ["configs/mlflow"]
             must_exist: true
         confirmation: none
         enabled: true
@@ -233,7 +230,7 @@ commands:
             type: path
             role: config
             required: true
-            roots: ["configs/mlflow", "artifacts/ui_configs"]
+            roots: ["configs/mlflow"]
             must_exist: true
           source_type:
             type: enum
@@ -259,13 +256,36 @@ commands:
             type: path
             role: config
             required: true
-            roots: ["configs/mlflow", "artifacts/ui_configs"]
+            roots: ["configs/mlflow"]
             must_exist: true
           source_type:
             type: enum
             role: value
             required: true
             choices: ["research_v2", "autogluon", "all"]
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ['"has_failures": false']
+        failure_markers: ['"error"', '"has_failures": true']
+      - id: sync_all
+        title: Sync all
+        description: >
+          Synchronize all configured supported MLflow readers (Experiment Core v2
+          and AutoGluon) in one operation. Recovery/audit alternative to per-source sync.
+        argv:
+          - "sync"
+          - "--config"
+          - "{config}"
+          - "--source-type"
+          - "all"
+        placeholders:
+          config:
+            type: path
+            role: config
+            required: true
+            roots: ["configs/mlflow"]
+            must_exist: true
         confirmation: confirm
         enabled: true
         competition_test: false

@@ -312,17 +312,17 @@ def build_experiment_table_rows(
             )
             if not experiment:
                 experiment = Path(artifact.relative_path).name
+            model = meta.get("model_family") or "Not available"
+            mode = meta.get("mode") or "Not available"
+            created_date = format_date(created) if created else "Not available"
+            created_time = format_time(created) if created else "Not available"
             rows.append(
                 {
-                    "Model": meta.get("model_family") or "Not available",
-                    "Mode": meta.get("mode") or "Not available",
+                    "Model": model,
+                    "Mode": mode,
                     "Experiment": experiment,
-                    "Created date": format_date(created)
-                    if created
-                    else "Not available",
-                    "Created time": format_time(created)
-                    if created
-                    else "Not available",
+                    "Created date": created_date,
+                    "Created time": created_time,
                     "Balanced Accuracy": _summary_or_na(
                         artifact.summaries, "Balanced Accuracy mean"
                     ),
@@ -339,7 +339,14 @@ def build_experiment_table_rows(
                     "Status": artifact.state,
                     "Artifact path": artifact.relative_path,
                     "_created_sort": created or "",
-                    "_chart_label": experiment,
+                    # Unique per artifact so Plotly never sums duplicate labels.
+                    "_chart_key": artifact.relative_path,
+                    "_chart_label": _chart_tick_label(
+                        model=model,
+                        experiment=experiment,
+                        created_date=created_date,
+                        created_time=created_time,
+                    ),
                     "_ba": artifact.summaries.get("Balanced Accuracy mean"),
                     "_sensitivity": artifact.summaries.get("Sensitivity"),
                     "_specificity": artifact.summaries.get("Specificity"),
@@ -348,11 +355,12 @@ def build_experiment_table_rows(
                 }
             )
         except Exception:
+            fallback_name = Path(artifact.relative_path).name
             rows.append(
                 {
                     "Model": "Not available",
                     "Mode": "Not available",
-                    "Experiment": Path(artifact.relative_path).name,
+                    "Experiment": fallback_name,
                     "Created date": "Not available",
                     "Created time": "Not available",
                     "Balanced Accuracy": "Not available",
@@ -365,7 +373,8 @@ def build_experiment_table_rows(
                     "Status": artifact.state,
                     "Artifact path": artifact.relative_path,
                     "_created_sort": "",
-                    "_chart_label": Path(artifact.relative_path).name,
+                    "_chart_key": artifact.relative_path,
+                    "_chart_label": fallback_name,
                     "_ba": None,
                     "_sensitivity": None,
                     "_specificity": None,
@@ -375,6 +384,22 @@ def build_experiment_table_rows(
             )
     rows.sort(key=lambda item: str(item.get("_created_sort") or ""), reverse=True)
     return rows
+
+
+def _chart_tick_label(
+    *,
+    model: str,
+    experiment: str,
+    created_date: str,
+    created_time: str,
+) -> str:
+    """Readable bar tick/hover label: model, experiment, date, and time."""
+    parts = [part for part in (model, experiment) if part and part != "Not available"]
+    if created_date and created_date != "Not available":
+        parts.append(created_date)
+    if created_time and created_time != "Not available":
+        parts.append(created_time)
+    return " · ".join(parts) if parts else experiment
 
 
 def display_compatibility_summary(
@@ -414,6 +439,9 @@ def display_compatibility_summary(
     }
 
 
+COMPARISON_ID_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
 def default_comparison_id(
     left: ArtifactRecord,
     right: ArtifactRecord,
@@ -434,7 +462,20 @@ def default_comparison_id(
         if re.fullmatch(r"r\d+x\d+", token):
             short_plan = "-".join(tokens[index:])
             break
-    return f"{left_model}-vs-{right_model}-{mode}-{short_plan}"
+    return sanitize_comparison_id(f"{left_model}-vs-{right_model}-{mode}-{short_plan}")
+
+
+def sanitize_comparison_id(value: str) -> str:
+    """Normalize a comparison ID to the existing paired-comparison safe-slug rules."""
+    text = _slug(value)
+    if COMPARISON_ID_SAFE.fullmatch(text) is None:
+        text = re.sub(r"[^A-Za-z0-9_-]+", "-", text).strip("-_") or "compare"
+        if text[0] in "-_":
+            text = f"c{text}"
+        text = text[:128]
+    if COMPARISON_ID_SAFE.fullmatch(text) is None:
+        return "compare"
+    return text
 
 
 def _slug(value: str) -> str:

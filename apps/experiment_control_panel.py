@@ -30,6 +30,7 @@ from src.churn_ml.control_panel.artifacts import (  # noqa: E402
     default_comparison_id,
     discover_artifacts,
     display_compatibility_summary,
+    sanitize_comparison_id,
     text_tail,
 )
 from src.churn_ml.control_panel.command_builder import (  # noqa: E402
@@ -71,6 +72,10 @@ from src.churn_ml.control_panel.presentation import (  # noqa: E402
     source_human_label,
 )
 from src.churn_ml.control_panel.jobs import JobError, JobManager  # noqa: E402
+from src.churn_ml.control_panel.mlflow_post_index import (  # noqa: E402
+    DEFAULT_MLFLOW_CONFIG,
+    maybe_index_successful_job,
+)
 from src.churn_ml.control_panel.placeholder_suggestions import (  # noqa: E402
     SuggestionError,
     render_suggested_value_template,
@@ -85,6 +90,8 @@ from src.churn_ml.control_panel.schemas import (  # noqa: E402
     SchemaError,
 )
 from src.churn_ml.control_panel.selection_state import (  # noqa: E402
+    apply_cascade_reconciliation,
+    reconcile_cascade_selection,
     remember_widget_selection,
     seed_widget_from_logical,
     widget_selection_key,
@@ -409,6 +416,23 @@ def jobs_page() -> None:
     columns[3].metric("Time", format_time(created))
     if status.get("diagnostic"):
         st.warning(str(status["diagnostic"]))
+    index_result = _maybe_post_index_job(loaded, record)
+    if index_result is not None and index_result.attempted:
+        if index_result.status in {"succeeded", "idempotent", "unchanged"}:
+            st.caption(
+                f"MLflow index: `{index_result.status}`"
+                + (
+                    f" · `{index_result.artifact_path}`"
+                    if index_result.artifact_path
+                    else ""
+                )
+            )
+        elif index_result.status == "failed":
+            st.info(
+                "Training succeeded; MLflow indexing failed and was recorded "
+                "separately without changing job status."
+                + (f" ({index_result.message})" if index_result.message else "")
+            )
     with st.expander("Technical details", expanded=False):
         st.json(dict(record.job), expanded=False)
         st.caption(
@@ -448,9 +472,33 @@ def jobs_page() -> None:
                 st.error(str(error))
 
 
+def _maybe_post_index_job(loaded: ControlPanelRegistry, record: Any) -> Any:
+    """Best-effort MLflow indexing after successful Experiment Core / AutoGluon jobs."""
+    try:
+        stdout_text = (record.root / "stdout.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        stdout_text = ""
+    argv = record.command.get("argv") if isinstance(record.command, Mapping) else None
+    argv_list = [str(item) for item in argv] if isinstance(argv, (list, tuple)) else []
+    return maybe_index_successful_job(
+        job_root=record.root,
+        command_id=str(record.job.get("command_id") or ""),
+        action_id=str(record.job.get("action_id") or ""),
+        argv=argv_list,
+        job_status=str(record.status.get("state") or ""),
+        stdout_text=stdout_text,
+        repository_root=REPOSITORY_ROOT,
+        mlflow_config_path=DEFAULT_MLFLOW_CONFIG,
+    )
+
+
 def results_page() -> None:
     loaded = registry()
     st.title("Results")
+    if loaded.settings.mlflow_url:
+        st.link_button("Open MLflow", loaded.settings.mlflow_url)
     experiments_tab, inspect_tab, compare_tab = st.tabs(
         ["Experiments", "Inspect result", "Compare experiments"]
     )
@@ -571,9 +619,14 @@ def _render_experiment_charts(rows: list[dict[str, Any]]) -> None:
 
     chart_frame = []
     for row in rows:
+        chart_key = (
+            row.get("_chart_key") or row.get("Artifact path") or row.get("Experiment")
+        )
+        chart_label = row.get("_chart_label") or row.get("Experiment")
         chart_frame.append(
             {
-                "Experiment": row.get("_chart_label") or row.get("Experiment"),
+                "Experiment key": chart_key,
+                "Experiment": chart_label,
                 "Model": row.get("Model"),
                 "Mode": row.get("Mode"),
                 "Created date": row.get("Created date"),
@@ -586,7 +639,14 @@ def _render_experiment_charts(rows: list[dict[str, Any]]) -> None:
             }
         )
     frame = pd.DataFrame(chart_frame)
-    hover = ["Model", "Mode", "Created date", "Created time", "Balanced Accuracy"]
+    hover = [
+        "Experiment",
+        "Model",
+        "Mode",
+        "Created date",
+        "Created time",
+        "Balanced Accuracy",
+    ]
 
     if px is None:
         st.warning("Plotly is unavailable; showing tabular chart data instead.")
@@ -599,12 +659,24 @@ def _render_experiment_charts(rows: list[dict[str, Any]]) -> None:
     else:
         fig_ba = px.bar(
             ba_frame,
-            x="Experiment",
+            x="Experiment key",
             y="Balanced Accuracy",
             hover_data=hover,
             title="Balanced Accuracy by experiment",
         )
-        fig_ba.update_layout(xaxis_title="Experiment", yaxis_title="Balanced Accuracy")
+        tick_text = [str(label) for label in ba_frame["Experiment"].tolist()]
+        tick_vals = [str(key) for key in ba_frame["Experiment key"].tolist()]
+        fig_ba.update_layout(
+            xaxis_title="Experiment",
+            yaxis_title="Balanced Accuracy",
+            xaxis={"tickmode": "array", "tickvals": tick_vals, "ticktext": tick_text},
+        )
+        ba_values = [float(value) for value in ba_frame["Balanced Accuracy"].tolist()]
+        if ba_values:
+            low = min(ba_values)
+            high = max(ba_values)
+            pad = max(0.02, (high - low) * 0.15) if high > low else 0.05
+            fig_ba.update_yaxes(range=[max(0.0, low - pad), min(1.05, high + pad)])
         st.plotly_chart(fig_ba, width="stretch")
 
     sens_frame = frame.dropna(subset=["Sensitivity", "Specificity"])
@@ -814,13 +886,37 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
         )
 
     if reader_id == "research_v2":
-        default_id = default_comparison_id(
-            left_item, right_item, repo_root=REPOSITORY_ROOT
+        default_id = sanitize_comparison_id(
+            default_comparison_id(left_item, right_item, repo_root=REPOSITORY_ROOT)
         )
         id_key = f"results-comparison-id-{reader_id}"
-        if st.session_state.get(id_key) in (None, "", "ui-paired-comparison"):
+        suggested_key = f"{id_key}__suggested"
+        manual_key = f"{id_key}__manual"
+        sides_key = f"{id_key}__sides"
+        reset_flag = f"{id_key}__do_reset"
+        sides_fp = (left_item.relative_path, right_item.relative_path)
+        previous_sides = st.session_state.get(sides_key)
+        st.session_state[suggested_key] = default_id
+        if st.session_state.pop(reset_flag, False):
+            st.session_state[id_key] = default_id
+            st.session_state[manual_key] = False
+            st.session_state[sides_key] = sides_fp
+        elif previous_sides != sides_fp:
+            if not st.session_state.get(manual_key):
+                st.session_state[id_key] = default_id
+            st.session_state[sides_key] = sides_fp
+        elif st.session_state.get(id_key) in (None, "", "ui-paired-comparison"):
             st.session_state[id_key] = default_id
         comparison_id = st.text_input("New comparison ID", key=id_key)
+        if comparison_id != st.session_state.get(suggested_key):
+            st.session_state[manual_key] = True
+        reset_cols = st.columns([1, 3])
+        with reset_cols[0]:
+            if st.button("Reset to suggested ID", key=f"{id_key}__reset"):
+                st.session_state[reset_flag] = True
+                st.rerun()
+        with reset_cols[1]:
+            st.caption(f"Suggested: `{st.session_state.get(suggested_key)}`")
         comparison_ready = (
             left_item.state == "completed" and right_item.state == "completed"
         )
@@ -994,6 +1090,14 @@ def _placeholder_widget(
             )
         return number_value
     if spec.role == "config":
+        if operation == "mlflow_local_index":
+            return _mlflow_config_widget(
+                loaded,
+                widget_key,
+                operation=operation,
+                name=name,
+                role=spec.role,
+            )
         return _cascade_config_widget(
             loaded,
             config_globs,
@@ -1252,6 +1356,54 @@ def _config_options(
     return [(p, readable_config_label(p, REPOSITORY_ROOT)) for p in sorted(paths)]
 
 
+def _mlflow_config_widget(
+    loaded: ControlPanelRegistry,
+    widget_key: str,
+    *,
+    operation: str,
+    name: str = "config",
+    role: str = "config",
+) -> str | None:
+    """MLflow Local Index uses only configs/mlflow/local.yaml — no experiment cascade."""
+    del loaded
+    canonical = DEFAULT_MLFLOW_CONFIG
+    allowed = [canonical] if (REPOSITORY_ROOT / canonical).is_file() else []
+    if not allowed:
+        st.error("MLflow local configuration is missing: configs/mlflow/local.yaml")
+        st.session_state.pop(widget_key, None)
+        return None
+    seed_widget_from_logical(
+        st.session_state,
+        operation=operation,
+        role=role,
+        name=name,
+        widget_key=widget_key,
+        allowed=allowed,
+        cascade_meta=None,
+    )
+    st.session_state[widget_key] = canonical
+    # Clear any inherited experiment cascade parent keys from other operations.
+    for suffix in ("__src", "__mdl", "__mode", "__flat", "__parent_fp"):
+        st.session_state.pop(f"{widget_key}{suffix}", None)
+    selected = st.selectbox(
+        "Config",
+        allowed,
+        key=widget_key,
+        format_func=lambda path: Path(path).name,
+    )
+    st.caption(f"Basename: `{Path(selected).name}`")
+    st.caption(f"`{selected}`")
+    remember_widget_selection(
+        st.session_state,
+        operation=operation,
+        role=role,
+        name=name,
+        value=selected,
+        allowed=allowed,
+    )
+    return selected
+
+
 def _cascade_config_widget(
     loaded: ControlPanelRegistry,
     config_globs: tuple[str, ...],
@@ -1390,15 +1542,27 @@ def _cascade_item_selector(
         selected_model or None,
         selected_mode or None,
     )
-    # When model/mode metadata is sparse, still restrict to selected source.
-    if not matching and selected_source is not None:
-        matching = [o for o in cascade_opts if o.source_kind == selected_source]
-    if not matching:
-        matching = cascade_opts
-
     item_paths = [opt.path for opt in matching if opt.path in path_set]
-    if not item_paths:
-        item_paths = [p for p in paths]
+    parent_fp = (selected_source, selected_model, selected_mode)
+    reconciliation = reconcile_cascade_selection(
+        allowed_paths=paths,
+        matched_paths=item_paths,
+        current_path=st.session_state.get(widget_key),
+        default_index=default_index,
+    )
+    canonical = apply_cascade_reconciliation(
+        st.session_state,
+        widget_key=widget_key,
+        reconciliation=reconciliation,
+        parent_fingerprint=parent_fp,
+    )
+    if canonical is None:
+        st.error(
+            reconciliation.error
+            or "Cascade selection could not be reconciled; refusing to use a stale path."
+        )
+        return None
+
     labels = {
         opt.path: opt.display_label for opt in cascade_opts if opt.path in item_paths
     }
@@ -1410,18 +1574,21 @@ def _cascade_item_selector(
         ):
             labels[path] = readable_path_label(path, REPOSITORY_ROOT)
 
-    if st.session_state.get(widget_key) not in item_paths:
-        index = min(max(default_index, 0), len(item_paths) - 1)
-        st.session_state[widget_key] = item_paths[index]
     selected_value = st.selectbox(
         item_label,
-        item_paths,
+        list(reconciliation.matched_paths),
         key=widget_key,
         format_func=lambda v: labels.get(v, v),
     )
-    if selected_value:
-        st.caption(f"Basename: `{Path(selected_value).name}`")
-        st.caption(f"`{selected_value}`")
+    # Fail closed: diagnostic selector never overrides the visible cascade.
+    if selected_value not in reconciliation.matched_paths:
+        final_value = canonical
+    else:
+        final_value = str(selected_value)
+
+    if final_value:
+        st.caption(f"Basename: `{Path(final_value).name}`")
+        st.caption(f"`{final_value}`")
 
     if show_advanced:
         with st.expander(advanced_label):
@@ -1430,17 +1597,19 @@ def _cascade_item_selector(
                 for opt in cascade_opts
             }
             flat_key = f"{widget_key}__flat"
-            if st.session_state.get(flat_key) not in paths:
-                st.session_state[flat_key] = (
-                    selected_value if selected_value in paths else paths[0]
-                )
+            # Keep diagnostic selector aligned with the visible cascade; never
+            # feed __flat back into the returned / submitted path.
+            st.session_state[flat_key] = final_value
             st.selectbox(
                 f"Raw {item_label.lower()} path (diagnostic)",
                 paths,
                 key=flat_key,
                 format_func=lambda v: all_labels.get(v, v),
             )
-    return selected_value
+            st.caption(
+                "Diagnostic only. Submitted path follows the cascade selectors above."
+            )
+    return final_value
 
 
 def _config_panel(loaded: ControlPanelRegistry, selected: Path) -> None:
