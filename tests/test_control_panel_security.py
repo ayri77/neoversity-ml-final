@@ -125,9 +125,19 @@ def test_apptest_missing_high_risk_acknowledgement_never_starts(
 
 
 def test_apptest_failed_build_and_stale_action_never_start(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spy = StartSpy()
+    # Empty repository root so paired-comparison inputs cannot be auto-selected.
+    monkeypatch.setattr(control_panel_app, "REPOSITORY_ROOT", tmp_path)
+    original_load = control_panel_app.load_registry
+
+    def load_project_registry(root: Path):
+        del root
+        return original_load(PROJECT_ROOT)
+
+    monkeypatch.setattr(control_panel_app, "load_registry", load_project_registry)
+    control_panel_app.registry.clear()
     at = _run_page(monkeypatch, spy)
     at = _select(at, "Operation", "paired_comparison")
     _click(at, "Start background job")

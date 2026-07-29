@@ -91,9 +91,15 @@ from src.churn_ml.control_panel.schemas import (  # noqa: E402
 )
 from src.churn_ml.control_panel.selection_state import (  # noqa: E402
     apply_cascade_reconciliation,
-    reconcile_cascade_selection,
+    get_durable_value,
+    remember_durable_value,
     remember_widget_selection,
+    reconcile_cascade_selection,
     seed_widget_from_logical,
+    set_durable_value,
+    set_logical_selection,
+    sync_widget_with_durable,
+    ui_durable_key,
     widget_selection_key,
 )
 
@@ -195,31 +201,65 @@ def dashboard_page() -> None:
 def run_page() -> None:
     loaded = registry()
     st.title("Run")
-    prefill = st.session_state.get("run_prefill", {})
+    # Consume explicit Results→Run overrides once so they win over older durable
+    # state without permanently locking the Operation selector.
+    prefill = st.session_state.pop("run_prefill", None) or {}
+    if not isinstance(prefill, dict):
+        prefill = {}
     command_ids = list(loaded.commands)
+    command_widget_key = "run-command"
+    command_durable_key = ui_durable_key("run", "command")
     preferred_command = prefill.get("command_id")
+    if preferred_command in command_ids:
+        st.session_state[command_widget_key] = preferred_command
+        set_durable_value(st.session_state, command_durable_key, preferred_command)
+    else:
+        sync_widget_with_durable(
+            st.session_state,
+            widget_key=command_widget_key,
+            durable_key=command_durable_key,
+            allowed=command_ids,
+            default=command_ids[0] if command_ids else None,
+        )
     command_id = st.selectbox(
         "Operation",
         command_ids,
-        index=(
-            command_ids.index(preferred_command)
-            if preferred_command in command_ids
-            else 0
-        ),
-        key="run-command",
+        key=command_widget_key,
         format_func=lambda value: loaded.commands[value].title,
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=command_durable_key,
+        value=command_id,
+        allowed=command_ids,
     )
     command = loaded.commands[command_id]
     action_ids = list(command.actions)
+    action_widget_key = f"run-action-{command_id}"
+    action_durable_key = ui_durable_key("run", "action", command_id)
     preferred_action = prefill.get("action_id")
+    if preferred_action in action_ids:
+        st.session_state[action_widget_key] = preferred_action
+        set_durable_value(st.session_state, action_durable_key, preferred_action)
+    else:
+        sync_widget_with_durable(
+            st.session_state,
+            widget_key=action_widget_key,
+            durable_key=action_durable_key,
+            allowed=action_ids,
+            default=action_ids[0] if action_ids else None,
+        )
     action_id = st.selectbox(
         "Action",
         action_ids,
-        index=(
-            action_ids.index(preferred_action) if preferred_action in action_ids else 0
-        ),
-        key=f"run-action-{command_id}",
+        key=action_widget_key,
         format_func=lambda value: command.actions[value].title,
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=action_durable_key,
+        value=action_id,
+        allowed=action_ids,
     )
     action = command.actions[action_id]
     st.write(action.description)
@@ -244,9 +284,11 @@ def run_page() -> None:
         placeholder = action.placeholders.get(name)
         role = placeholder.role if placeholder is not None else "value"
         shared_key = widget_selection_key(command_id, role, name)
-        st.session_state.setdefault(shared_key, value)
+        # Force override older durable/widget state from Results prepare actions.
+        st.session_state[shared_key] = value
+        set_logical_selection(st.session_state, command_id, role, name, value)
         # Keep legacy per-action key in sync for older session handoffs.
-        st.session_state.setdefault(f"value-{command_id}-{action_id}-{name}", value)
+        st.session_state[f"value-{command_id}-{action_id}-{name}"] = value
 
     for name, placeholder in action.placeholders.items():
         widget_key = widget_selection_key(command_id, placeholder.role, name)
@@ -397,13 +439,30 @@ def jobs_page() -> None:
     if not jobs:
         st.info("No UI jobs have been started.")
         return
+    job_ids = [item.job_id for item in jobs]
+    job_widget_key = "jobs-selected"
+    job_durable_key = ui_durable_key("jobs", "selected")
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=job_widget_key,
+        durable_key=job_durable_key,
+        allowed=job_ids,
+        default=job_ids[0],
+    )
     selected = st.selectbox(
         "Job",
-        [item.job_id for item in jobs],
+        job_ids,
+        key=job_widget_key,
         format_func=lambda value: _job_label(
             next(item for item in jobs if item.job_id == value),
             commands=loaded.commands,
         ),
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=job_durable_key,
+        value=selected,
+        allowed=job_ids,
     )
     st.caption(f"Job ID: `{selected}`")
     record = manager.refresh(selected)
@@ -512,12 +571,27 @@ def results_page() -> None:
 
 def _results_reader_select(loaded: ControlPanelRegistry, key: str) -> Any:
     reader_ids = list(loaded.readers)
-    return st.selectbox(
+    durable_key = ui_durable_key("results", "reader", key)
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=key,
+        durable_key=durable_key,
+        allowed=reader_ids,
+        default=reader_ids[0] if reader_ids else None,
+    )
+    selected = st.selectbox(
         "Artifact type",
         reader_ids,
         key=key,
         format_func=lambda value: loaded.readers[value].title,
     )
+    remember_durable_value(
+        st.session_state,
+        durable_key=durable_key,
+        value=selected,
+        allowed=reader_ids,
+    )
+    return selected
 
 
 def _results_experiments_tab(loaded: ControlPanelRegistry) -> None:
@@ -536,24 +610,83 @@ def _results_experiments_tab(loaded: ControlPanelRegistry) -> None:
     statuses = sorted({str(row["Status"]) for row in rows})
 
     filter_cols = st.columns(4)
+    model_key = f"results-exp-filter-model-{reader_id}"
+    mode_key = f"results-exp-filter-mode-{reader_id}"
+    status_key = f"results-exp-filter-status-{reader_id}"
+    search_key = f"results-exp-filter-search-{reader_id}"
+    model_options = ["All", *models]
+    mode_options = ["All", *modes]
+    status_options = ["All", *statuses]
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=model_key,
+        durable_key=ui_durable_key("results", "filter", reader_id, "model"),
+        allowed=model_options,
+        default="All",
+    )
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=mode_key,
+        durable_key=ui_durable_key("results", "filter", reader_id, "mode"),
+        allowed=mode_options,
+        default="All",
+    )
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=status_key,
+        durable_key=ui_durable_key("results", "filter", reader_id, "status"),
+        allowed=status_options,
+        default="All",
+    )
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=search_key,
+        durable_key=ui_durable_key("results", "filter", reader_id, "search"),
+        allowed=None,
+        default="",
+    )
     selected_model = filter_cols[0].selectbox(
         "Model",
-        ["All", *models],
-        key=f"results-exp-filter-model-{reader_id}",
+        model_options,
+        key=model_key,
     )
     selected_mode = filter_cols[1].selectbox(
         "Mode",
-        ["All", *modes],
-        key=f"results-exp-filter-mode-{reader_id}",
+        mode_options,
+        key=mode_key,
     )
     selected_status = filter_cols[2].selectbox(
         "Status",
-        ["All", *statuses],
-        key=f"results-exp-filter-status-{reader_id}",
+        status_options,
+        key=status_key,
     )
     search = filter_cols[3].text_input(
         "Search experiment/config",
-        key=f"results-exp-filter-search-{reader_id}",
+        key=search_key,
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=ui_durable_key("results", "filter", reader_id, "model"),
+        value=selected_model,
+        allowed=model_options,
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=ui_durable_key("results", "filter", reader_id, "mode"),
+        value=selected_mode,
+        allowed=mode_options,
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=ui_durable_key("results", "filter", reader_id, "status"),
+        value=selected_status,
+        allowed=status_options,
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=ui_durable_key("results", "filter", reader_id, "search"),
+        value=search,
+        allowed=None,
     )
 
     filtered = []
@@ -722,12 +855,42 @@ def _results_inspect_tab(loaded: ControlPanelRegistry) -> None:
         opt.source_kind
         for opt in build_cascade_options(artifact_paths, REPOSITORY_ROOT)
     }
+    inspect_key = f"results-inspect-{reader_id}"
+    seed_widget_from_logical(
+        st.session_state,
+        operation="__results__",
+        role="inspect",
+        name=reader_id,
+        widget_key=inspect_key,
+        allowed=artifact_paths,
+        cascade_meta=None,
+    )
+    seeded_inspect = st.session_state.get(inspect_key)
+    if seeded_inspect not in (None, "") and seeded_inspect in artifact_paths:
+        seed_widget_from_logical(
+            st.session_state,
+            operation="__results__",
+            role="inspect",
+            name=reader_id,
+            widget_key=inspect_key,
+            allowed=artifact_paths,
+            cascade_meta=parse_config_metadata(str(seeded_inspect), REPOSITORY_ROOT),
+        )
     selected_path = _cascade_item_selector(
         artifact_paths,
-        widget_key=f"results-inspect-{reader_id}",
+        widget_key=inspect_key,
         item_label="Experiment",
         include_source=len(source_kinds) > 1,
         advanced_label="Advanced: raw artifact path",
+    )
+    remember_widget_selection(
+        st.session_state,
+        operation="__results__",
+        role="inspect",
+        name=reader_id,
+        value=selected_path,
+        allowed=artifact_paths,
+        widget_key=inspect_key,
     )
     if not selected_path:
         return
@@ -781,6 +944,27 @@ def _results_inspect_tab(loaded: ControlPanelRegistry) -> None:
         ):
             st.session_state["run-command"] = "final_deployment_v1"
             st.session_state["run-action-final_deployment_v1"] = "inspect"
+            set_durable_value(
+                st.session_state, ui_durable_key("run", "command"), "final_deployment_v1"
+            )
+            set_durable_value(
+                st.session_state,
+                ui_durable_key("run", "action", "final_deployment_v1"),
+                "inspect",
+            )
+            deployment_key = widget_selection_key(
+                "final_deployment_v1", "input", "deployment_dir"
+            )
+            st.session_state[deployment_key] = selected.relative_path
+            remember_widget_selection(
+                st.session_state,
+                operation="final_deployment_v1",
+                role="input",
+                name="deployment_dir",
+                value=selected.relative_path,
+                allowed=None,
+                widget_key=deployment_key,
+            )
             st.session_state["run_prefill"] = {
                 "command_id": "final_deployment_v1",
                 "action_id": "inspect",
@@ -814,9 +998,30 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
     left_col, right_col = st.columns(2)
     with left_col:
         st.markdown("**Left**")
+        left_key = f"compare-left-{reader_id}"
+        seed_widget_from_logical(
+            st.session_state,
+            operation="__results__",
+            role="compare_left",
+            name=reader_id,
+            widget_key=left_key,
+            allowed=artifact_paths,
+            cascade_meta=None,
+        )
+        seeded_left = st.session_state.get(left_key)
+        if seeded_left not in (None, "") and seeded_left in artifact_paths:
+            seed_widget_from_logical(
+                st.session_state,
+                operation="__results__",
+                role="compare_left",
+                name=reader_id,
+                widget_key=left_key,
+                allowed=artifact_paths,
+                cascade_meta=parse_config_metadata(str(seeded_left), REPOSITORY_ROOT),
+            )
         left_path = _cascade_item_selector(
             artifact_paths,
-            widget_key=f"compare-left-{reader_id}",
+            widget_key=left_key,
             item_label="Experiment",
             include_source=include_source,
             model_label="Model",
@@ -824,17 +1029,56 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
             show_advanced=False,
             default_index=0,
         )
+        remember_widget_selection(
+            st.session_state,
+            operation="__results__",
+            role="compare_left",
+            name=reader_id,
+            value=left_path,
+            allowed=artifact_paths,
+            widget_key=left_key,
+        )
     with right_col:
         st.markdown("**Right**")
+        right_key = f"compare-right-{reader_id}"
+        seed_widget_from_logical(
+            st.session_state,
+            operation="__results__",
+            role="compare_right",
+            name=reader_id,
+            widget_key=right_key,
+            allowed=artifact_paths,
+            cascade_meta=None,
+        )
+        seeded_right = st.session_state.get(right_key)
+        if seeded_right not in (None, "") and seeded_right in artifact_paths:
+            seed_widget_from_logical(
+                st.session_state,
+                operation="__results__",
+                role="compare_right",
+                name=reader_id,
+                widget_key=right_key,
+                allowed=artifact_paths,
+                cascade_meta=parse_config_metadata(str(seeded_right), REPOSITORY_ROOT),
+            )
         right_path = _cascade_item_selector(
             artifact_paths,
-            widget_key=f"compare-right-{reader_id}",
+            widget_key=right_key,
             item_label="Experiment",
             include_source=include_source,
             model_label="Model",
             mode_label="Mode",
             show_advanced=False,
             default_index=1,
+        )
+        remember_widget_selection(
+            st.session_state,
+            operation="__results__",
+            role="compare_right",
+            name=reader_id,
+            value=right_path,
+            allowed=artifact_paths,
+            widget_key=right_key,
         )
     if not left_path or not right_path:
         return
@@ -894,6 +1138,7 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
         manual_key = f"{id_key}__manual"
         sides_key = f"{id_key}__sides"
         reset_flag = f"{id_key}__do_reset"
+        id_durable_key = ui_durable_key("results", "comparison_id", reader_id)
         sides_fp = (left_item.relative_path, right_item.relative_path)
         previous_sides = st.session_state.get(sides_key)
         st.session_state[suggested_key] = default_id
@@ -901,13 +1146,25 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
             st.session_state[id_key] = default_id
             st.session_state[manual_key] = False
             st.session_state[sides_key] = sides_fp
+            set_durable_value(st.session_state, id_durable_key, default_id)
         elif previous_sides != sides_fp:
             if not st.session_state.get(manual_key):
                 st.session_state[id_key] = default_id
+                set_durable_value(st.session_state, id_durable_key, default_id)
             st.session_state[sides_key] = sides_fp
         elif st.session_state.get(id_key) in (None, "", "ui-paired-comparison"):
-            st.session_state[id_key] = default_id
+            durable_id = get_durable_value(st.session_state, id_durable_key)
+            if durable_id not in (None, "", "ui-paired-comparison"):
+                st.session_state[id_key] = durable_id
+            else:
+                st.session_state[id_key] = default_id
         comparison_id = st.text_input("New comparison ID", key=id_key)
+        remember_durable_value(
+            st.session_state,
+            durable_key=id_durable_key,
+            value=comparison_id,
+            allowed=None,
+        )
         if comparison_id != st.session_state.get(suggested_key):
             st.session_state[manual_key] = True
         reset_cols = st.columns([1, 3])
@@ -930,15 +1187,53 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
         ):
             st.session_state["run-command"] = "paired_comparison"
             st.session_state["run-action-paired_comparison"] = "run"
-            st.session_state[
-                widget_selection_key("paired_comparison", "input", "baseline_run_dir")
-            ] = left_item.relative_path
-            st.session_state[
-                widget_selection_key("paired_comparison", "input", "candidate_run_dir")
-            ] = right_item.relative_path
-            st.session_state[
-                widget_selection_key("paired_comparison", "value", "comparison_id")
-            ] = comparison_id
+            set_durable_value(
+                st.session_state, ui_durable_key("run", "command"), "paired_comparison"
+            )
+            set_durable_value(
+                st.session_state,
+                ui_durable_key("run", "action", "paired_comparison"),
+                "run",
+            )
+            baseline_key = widget_selection_key(
+                "paired_comparison", "input", "baseline_run_dir"
+            )
+            candidate_key = widget_selection_key(
+                "paired_comparison", "input", "candidate_run_dir"
+            )
+            comparison_value_key = widget_selection_key(
+                "paired_comparison", "value", "comparison_id"
+            )
+            st.session_state[baseline_key] = left_item.relative_path
+            st.session_state[candidate_key] = right_item.relative_path
+            st.session_state[comparison_value_key] = comparison_id
+            remember_widget_selection(
+                st.session_state,
+                operation="paired_comparison",
+                role="input",
+                name="baseline_run_dir",
+                value=left_item.relative_path,
+                allowed=None,
+                widget_key=baseline_key,
+            )
+            remember_widget_selection(
+                st.session_state,
+                operation="paired_comparison",
+                role="input",
+                name="candidate_run_dir",
+                value=right_item.relative_path,
+                allowed=None,
+                widget_key=candidate_key,
+            )
+            remember_widget_selection(
+                st.session_state,
+                operation="paired_comparison",
+                role="value",
+                name="comparison_id",
+                value=comparison_id,
+                allowed=None,
+                widget_key=comparison_value_key,
+            )
             st.session_state["run_prefill"] = {
                 "command_id": "paired_comparison",
                 "action_id": "run",
@@ -1061,6 +1356,15 @@ def _placeholder_widget(
 ) -> Any:
     label = name.replace("_", " ").title()
     if spec.type == "enum":
+        if operation is not None:
+            seed_widget_from_logical(
+                st.session_state,
+                operation=operation,
+                role=spec.role,
+                name=name,
+                widget_key=widget_key,
+                allowed=list(spec.choices),
+            )
         value = st.selectbox(
             label,
             spec.choices,
@@ -1075,9 +1379,19 @@ def _placeholder_widget(
                 name=name,
                 value=value,
                 allowed=list(spec.choices),
+                widget_key=widget_key,
             )
         return value
     if spec.type == "integer":
+        if operation is not None:
+            seed_widget_from_logical(
+                st.session_state,
+                operation=operation,
+                role=spec.role,
+                name=name,
+                widget_key=widget_key,
+                allowed=None,
+            )
         number_value = int(st.number_input(label, step=1, key=widget_key))
         if operation is not None:
             remember_widget_selection(
@@ -1087,6 +1401,7 @@ def _placeholder_widget(
                 name=name,
                 value=number_value,
                 allowed=None,
+                widget_key=widget_key,
             )
         return number_value
     if spec.role == "config":
@@ -1173,6 +1488,7 @@ def _placeholder_widget(
                     name=name,
                     value=selected,
                     allowed=discovered,
+                    widget_key=widget_key,
                 )
             return selected
     if spec.suggested_value_template is not None:
@@ -1188,12 +1504,21 @@ def _placeholder_widget(
         path_help = f"Repository-relative path within: {', '.join(spec.roots)}"
     else:
         path_help = "Safe identifier"
+    if operation is not None and not spec.sensitive:
+        seed_widget_from_logical(
+            st.session_state,
+            operation=operation,
+            role=spec.role,
+            name=name,
+            widget_key=widget_key,
+            allowed=None,
+        )
     value = st.text_input(
         label,
         help=path_help,
         key=widget_key,
     )
-    if operation is not None:
+    if operation is not None and not spec.sensitive:
         remember_widget_selection(
             st.session_state,
             operation=operation,
@@ -1201,6 +1526,7 @@ def _placeholder_widget(
             name=name,
             value=value,
             allowed=None,
+            widget_key=widget_key,
         )
     return value
 
@@ -1270,6 +1596,7 @@ def _artifact_path_widget(
                 name=name,
                 value=selected,
                 allowed=paths,
+                widget_key=widget_key,
             )
     if spec.allow_manual_advanced:
         with st.expander("Advanced / manual path"):
@@ -1400,6 +1727,7 @@ def _mlflow_config_widget(
         name=name,
         value=selected,
         allowed=allowed,
+        widget_key=widget_key,
     )
     return selected
 
@@ -1463,6 +1791,7 @@ def _cascade_config_widget(
             name=name,
             value=selected,
             allowed=raw_paths,
+            widget_key=widget_key,
         )
     return selected
 
@@ -1636,10 +1965,37 @@ def _config_panel(loaded: ControlPanelRegistry, selected: Path) -> None:
     if not loaded.settings.allow_config_copy_editing:
         return
     with st.expander("Advanced configuration editor"):
-        edited = st.text_area("Configuration copy", value=text, height=360)
-        copy_name = st.text_input(
-            "New copy filename",
-            value=f"{canonical.stem}_copy{canonical.suffix}",
+        rel_path = selected.relative_to(REPOSITORY_ROOT).as_posix()
+        draft_key = f"config-editor-draft-{rel_path}"
+        copy_key = f"config-editor-copy-name-{rel_path}"
+        draft_durable = ui_durable_key("config_editor", "draft", rel_path)
+        copy_durable = ui_durable_key("config_editor", "copy_name", rel_path)
+        if st.session_state.get(draft_key) in (None, ""):
+            durable_draft = get_durable_value(st.session_state, draft_durable)
+            st.session_state[draft_key] = (
+                durable_draft if durable_draft not in (None, "") else text
+            )
+        default_copy_name = f"{canonical.stem}_copy{canonical.suffix}"
+        if st.session_state.get(copy_key) in (None, ""):
+            durable_copy = get_durable_value(st.session_state, copy_durable)
+            st.session_state[copy_key] = (
+                durable_copy
+                if durable_copy not in (None, "")
+                else default_copy_name
+            )
+        edited = st.text_area("Configuration copy", height=360, key=draft_key)
+        copy_name = st.text_input("New copy filename", key=copy_key)
+        remember_durable_value(
+            st.session_state,
+            durable_key=draft_durable,
+            value=edited,
+            allowed=None,
+        )
+        remember_durable_value(
+            st.session_state,
+            durable_key=copy_durable,
+            value=copy_name,
+            allowed=None,
         )
         if st.button("Save as new copy"):
             try:

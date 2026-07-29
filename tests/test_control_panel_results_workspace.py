@@ -435,6 +435,8 @@ def test_validate_run_preserves_same_valid_config(
     at = _select(at, "Operation", "experiment_core_v2")
     at = _select(at, "Action", "validate")
     config_key = widget_selection_key("experiment_core_v2", "config", "config")
+    if "Source" in [item.label for item in at.selectbox]:
+        at = _select(at, "Source", "Canonical config")
     if "Model" in [item.label for item in at.selectbox]:
         at = _select(at, "Model", "LightGBM")
     if "Mode" in [item.label for item in at.selectbox]:

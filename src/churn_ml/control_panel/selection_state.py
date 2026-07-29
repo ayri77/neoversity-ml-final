@@ -3,6 +3,10 @@
 Widget keys remain Streamlit-owned; this module stores validated values keyed by
 operation + semantic placeholder role (+ name) so Validate/Run and navigation
 can reuse the same selection without trusting stale or forged paths.
+
+Streamlit removes widget values when those widgets are not rendered (for example
+after leaving the Run page). Durable entries under ``LOGICAL_SELECTION_KEY`` are
+non-widget session state and survive in-session navigation.
 """
 
 from __future__ import annotations
@@ -12,6 +16,14 @@ from typing import Any, Mapping, Sequence
 
 
 LOGICAL_SELECTION_KEY = "_cp_logical_selection"
+
+# Non-widget keys that must survive simulated / real page navigation.
+DURABLE_SESSION_KEYS = frozenset(
+    {
+        LOGICAL_SELECTION_KEY,
+        "run_prefill",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -32,9 +44,68 @@ def logical_selection_key(operation: str, role: str, name: str) -> str:
     return f"{operation}::{role}:{name}"
 
 
+def ui_durable_key(*parts: str) -> str:
+    """Return a durable key for non-placeholder UI state (Run/Results/Jobs/editor)."""
+    if not parts:
+        raise ValueError("ui_durable_key requires at least one part")
+    return "__ui__::" + ":".join(str(part) for part in parts)
+
+
 def widget_selection_key(operation: str, role: str, name: str) -> str:
     """Shared Streamlit widget key across actions of the same operation."""
     return f"value-{operation}-{role}-{name}"
+
+
+def cascade_parents_durable_key(operation: str, role: str, name: str) -> str:
+    return f"{logical_selection_key(operation, role, name)}::cascade_parents"
+
+
+def get_durable_value(session_state: Any, key: str) -> Any | None:
+    store = _session_mapping_get(session_state, LOGICAL_SELECTION_KEY)
+    if not isinstance(store, dict):
+        return None
+    return store.get(key)
+
+
+def set_durable_value(session_state: Any, key: str, value: Any) -> None:
+    store = _session_mapping_get(session_state, LOGICAL_SELECTION_KEY)
+    if not isinstance(store, dict):
+        store = {}
+        _session_mapping_set(session_state, LOGICAL_SELECTION_KEY, store)
+    if value in (None, ""):
+        store.pop(key, None)
+        _session_mapping_set(session_state, LOGICAL_SELECTION_KEY, store)
+        return
+    store[key] = value
+    _session_mapping_set(session_state, LOGICAL_SELECTION_KEY, store)
+
+
+def _session_mapping_get(session_state: Any, key: str, default: Any = None) -> Any:
+    """Read a key from dict-like or Streamlit SafeSessionState."""
+    if isinstance(session_state, dict):
+        return session_state.get(key, default)
+    inner = getattr(getattr(session_state, "_state", None), "_new_session_state", None)
+    if isinstance(inner, dict) and key in inner:
+        return inner[key]
+    try:
+        return session_state[key]
+    except Exception:
+        return default
+
+
+def _session_mapping_set(session_state: Any, key: str, value: Any) -> None:
+    if isinstance(session_state, dict):
+        session_state[key] = value
+        return
+    inner = getattr(getattr(session_state, "_state", None), "_new_session_state", None)
+    if isinstance(inner, dict):
+        inner[key] = value
+    try:
+        session_state[key] = value
+    except Exception:
+        if isinstance(inner, dict):
+            return
+        raise
 
 
 def get_logical_selection(
@@ -43,7 +114,7 @@ def get_logical_selection(
     role: str,
     name: str,
 ) -> Any | None:
-    store = session_state.get(LOGICAL_SELECTION_KEY)
+    store = _session_mapping_get(session_state, LOGICAL_SELECTION_KEY)
     if not isinstance(store, dict):
         return None
     return store.get(logical_selection_key(operation, role, name))
@@ -56,15 +127,11 @@ def set_logical_selection(
     name: str,
     value: Any,
 ) -> None:
-    store = session_state.setdefault(LOGICAL_SELECTION_KEY, {})
-    if not isinstance(store, dict):
-        store = {}
-        session_state[LOGICAL_SELECTION_KEY] = store
-    key = logical_selection_key(operation, role, name)
-    if value in (None, ""):
-        store.pop(key, None)
-        return
-    store[key] = value
+    set_durable_value(
+        session_state,
+        logical_selection_key(operation, role, name),
+        value,
+    )
 
 
 def validate_against_allowed(
@@ -104,6 +171,19 @@ def resolve_logical_selection(
     return default
 
 
+def _session_mapping_pop(session_state: Any, key: str) -> None:
+    if isinstance(session_state, dict):
+        session_state.pop(key, None)
+        return
+    inner = getattr(getattr(session_state, "_state", None), "_new_session_state", None)
+    if isinstance(inner, dict):
+        inner.pop(key, None)
+    try:
+        del session_state[key]
+    except Exception:
+        return
+
+
 def seed_widget_from_logical(
     session_state: Any,
     *,
@@ -116,17 +196,36 @@ def seed_widget_from_logical(
 ) -> Any | None:
     """Seed a widget from logical state without clobbering cascade parents.
 
-    Stale or forged widget values that are not in ``allowed`` are discarded.
+    A currently valid widget value is the latest user interaction and takes
+    precedence over an older logical value. Logical state seeds the widget only
+    when the widget value is missing/blank (for example after page navigation)
+    or invalid/forged.
+
     Cascade parent keys (``__src`` / ``__mdl`` / ``__mode``) are only filled when
     missing so a parent change in the same rerun is not overwritten by an old
     logical path. Parent→child reconciliation happens in the cascade selector.
     """
-    current = session_state.get(widget_key)
+    current = _session_mapping_get(session_state, widget_key)
     validated_current = validate_against_allowed(current, allowed)
     if validated_current is None and current not in (None, ""):
-        session_state.pop(widget_key, None)
+        _session_mapping_pop(session_state, widget_key)
         for suffix in ("__src", "__mdl", "__mode", "__flat", "__parent_fp"):
-            session_state.pop(f"{widget_key}{suffix}", None)
+            _session_mapping_pop(session_state, f"{widget_key}{suffix}")
+
+    if validated_current is not None:
+        # Latest valid widget interaction wins over older logical state.
+        set_logical_selection(
+            session_state, operation, role, name, validated_current
+        )
+        _restore_cascade_parents(
+            session_state,
+            operation=operation,
+            role=role,
+            name=name,
+            widget_key=widget_key,
+            cascade_meta=cascade_meta,
+        )
+        return validated_current
 
     resolved = resolve_logical_selection(
         session_state,
@@ -134,24 +233,80 @@ def seed_widget_from_logical(
         role=role,
         name=name,
         allowed=allowed,
-        default=validated_current,
+        default=None,
     )
     if resolved is None:
         return None
 
-    if session_state.get(widget_key) != resolved:
-        session_state[widget_key] = resolved
-    if cascade_meta:
-        _seed_missing_cascade_parent(
-            session_state, f"{widget_key}__src", cascade_meta.get("source_kind")
-        )
-        _seed_missing_cascade_parent(
-            session_state, f"{widget_key}__mdl", cascade_meta.get("model_family")
-        )
-        _seed_missing_cascade_parent(
-            session_state, f"{widget_key}__mode", cascade_meta.get("mode")
-        )
+    if _session_mapping_get(session_state, widget_key) != resolved:
+        _session_mapping_set(session_state, widget_key, resolved)
+    _restore_cascade_parents(
+        session_state,
+        operation=operation,
+        role=role,
+        name=name,
+        widget_key=widget_key,
+        cascade_meta=cascade_meta,
+    )
     return resolved
+
+
+def sync_widget_with_durable(
+    session_state: Any,
+    *,
+    widget_key: str,
+    durable_key: str,
+    allowed: Sequence[Any] | None,
+    default: Any | None = None,
+) -> Any | None:
+    """Bidirectional sync for non-placeholder widgets before they render.
+
+    Prefer a currently valid widget value; otherwise seed from durable state;
+    otherwise fall back to ``default`` / first allowed option.
+    """
+    current = _session_mapping_get(session_state, widget_key)
+    validated_current = validate_against_allowed(current, allowed)
+    if validated_current is None and current not in (None, ""):
+        _session_mapping_pop(session_state, widget_key)
+
+    if validated_current is not None:
+        set_durable_value(session_state, durable_key, validated_current)
+        return validated_current
+
+    durable = get_durable_value(session_state, durable_key)
+    validated_durable = validate_against_allowed(durable, allowed)
+    if validated_durable is None and durable not in (None, ""):
+        set_durable_value(session_state, durable_key, None)
+
+    resolved = validated_durable
+    if resolved is None:
+        if allowed is not None and allowed:
+            if default is not None and default in allowed:
+                resolved = default
+            else:
+                resolved = allowed[0]
+        elif default not in (None, ""):
+            resolved = default
+
+    if resolved in (None, ""):
+        return None
+    _session_mapping_set(session_state, widget_key, resolved)
+    set_durable_value(session_state, durable_key, resolved)
+    return resolved
+
+
+def remember_durable_value(
+    session_state: Any,
+    *,
+    durable_key: str,
+    value: Any,
+    allowed: Sequence[Any] | None,
+) -> Any | None:
+    validated = validate_against_allowed(value, allowed)
+    if validated is None:
+        return None
+    set_durable_value(session_state, durable_key, validated)
+    return validated
 
 
 def _seed_missing_cascade_parent(
@@ -159,8 +314,67 @@ def _seed_missing_cascade_parent(
 ) -> None:
     if value in (None, ""):
         return
-    if session_state.get(key) in (None, ""):
-        session_state[key] = value
+    if _session_mapping_get(session_state, key) in (None, ""):
+        _session_mapping_set(session_state, key, value)
+
+
+def _restore_cascade_parents(
+    session_state: Any,
+    *,
+    operation: str,
+    role: str,
+    name: str,
+    widget_key: str,
+    cascade_meta: Mapping[str, str] | None,
+) -> None:
+    stored = get_durable_value(
+        session_state, cascade_parents_durable_key(operation, role, name)
+    )
+    parents: dict[str, str] = {}
+    if isinstance(stored, Mapping):
+        for key in ("source_kind", "model_family", "mode"):
+            value = stored.get(key)
+            if value not in (None, ""):
+                parents[key] = str(value)
+    if cascade_meta:
+        for key in ("source_kind", "model_family", "mode"):
+            value = cascade_meta.get(key)
+            if key not in parents and value not in (None, ""):
+                parents[key] = str(value)
+    _seed_missing_cascade_parent(
+        session_state, f"{widget_key}__src", parents.get("source_kind")
+    )
+    _seed_missing_cascade_parent(
+        session_state, f"{widget_key}__mdl", parents.get("model_family")
+    )
+    _seed_missing_cascade_parent(
+        session_state, f"{widget_key}__mode", parents.get("mode")
+    )
+
+
+def remember_cascade_parents(
+    session_state: Any,
+    *,
+    operation: str,
+    role: str,
+    name: str,
+    widget_key: str,
+) -> None:
+    parents = {
+        "source_kind": _session_mapping_get(session_state, f"{widget_key}__src"),
+        "model_family": _session_mapping_get(session_state, f"{widget_key}__mdl"),
+        "mode": _session_mapping_get(session_state, f"{widget_key}__mode"),
+    }
+    cleaned = {
+        key: str(value)
+        for key, value in parents.items()
+        if value not in (None, "")
+    }
+    set_durable_value(
+        session_state,
+        cascade_parents_durable_key(operation, role, name),
+        cleaned or None,
+    )
 
 
 def reconcile_cascade_selection(
@@ -221,10 +435,95 @@ def remember_widget_selection(
     name: str,
     value: Any,
     allowed: Sequence[Any] | None,
+    widget_key: str | None = None,
 ) -> Any | None:
     """Persist a widget value into logical state only when currently allowed."""
     validated = validate_against_allowed(value, allowed)
     if validated is None:
         return None
     set_logical_selection(session_state, operation, role, name, validated)
+    if widget_key is not None:
+        remember_cascade_parents(
+            session_state,
+            operation=operation,
+            role=role,
+            name=name,
+            widget_key=widget_key,
+        )
     return validated
+
+
+def _session_state_keys(session_state: Any) -> list[str]:
+    """Enumerate keys for both plain dicts and Streamlit SafeSessionState."""
+    if isinstance(session_state, dict):
+        return [str(key) for key in session_state]
+    inner = getattr(session_state, "_state", None)
+    keys: set[str] = set()
+    for attr in ("_new_session_state", "_old_state"):
+        candidate = getattr(inner, attr, None)
+        if isinstance(candidate, dict):
+            keys.update(str(key) for key in candidate)
+    filtered = getattr(inner, "filtered_state", None)
+    if isinstance(filtered, dict):
+        keys.update(str(key) for key in filtered)
+    if keys:
+        return sorted(keys)
+    to_dict = getattr(session_state, "to_dict", None)
+    if callable(to_dict):
+        try:
+            mapping = to_dict()
+            if isinstance(mapping, dict):
+                return [str(key) for key in mapping]
+        except Exception:
+            pass
+    return []
+
+
+def snapshot_durable_session(session_state: Any) -> dict[str, Any]:
+    """Capture durable non-widget session entries for navigation simulations."""
+    snapshot: dict[str, Any] = {}
+    for key_str in _session_state_keys(session_state):
+        if key_str not in DURABLE_SESSION_KEYS and not key_str.startswith("_cp_"):
+            continue
+        inner = getattr(getattr(session_state, "_state", None), "_new_session_state", None)
+        try:
+            if isinstance(inner, dict) and key_str in inner:
+                snapshot[key_str] = inner[key_str]
+            elif isinstance(session_state, dict):
+                snapshot[key_str] = session_state[key_str]
+            else:
+                snapshot[key_str] = session_state[key_str]
+        except Exception:
+            continue
+    return snapshot
+
+
+def restore_durable_session(session_state: Any, snapshot: Mapping[str, Any]) -> None:
+    """Replace session contents with durable snapshot only (widget keys cleared)."""
+    inner = getattr(getattr(session_state, "_state", None), "_new_session_state", None)
+    if isinstance(inner, dict):
+        for key in list(inner.keys()):
+            if str(key).startswith("$$"):
+                continue
+            inner.pop(key, None)
+        for key, value in snapshot.items():
+            inner[str(key)] = value
+        return
+    if isinstance(session_state, dict):
+        for key in list(session_state.keys()):
+            session_state.pop(key, None)
+        session_state.update({str(key): value for key, value in snapshot.items()})
+
+
+def drop_transient_widget_keys(session_state: Any) -> list[str]:
+    """Remove Streamlit widget keys while retaining durable backing state.
+
+    Used by tests to simulate navigation away from a page (Streamlit deletes
+    values for widgets that are not rendered). Safety confirmations and other
+    transient keys are intentionally dropped.
+    """
+    before = set(_session_state_keys(session_state))
+    snapshot = snapshot_durable_session(session_state)
+    restore_durable_session(session_state, snapshot)
+    after = set(_session_state_keys(session_state))
+    return sorted(before - after)

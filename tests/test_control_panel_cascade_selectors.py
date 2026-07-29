@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from streamlit.testing.v1 import AppTest
 
 import apps.experiment_control_panel as control_panel_app
 from src.churn_ml.control_panel.presentation import (
@@ -22,6 +23,16 @@ from src.churn_ml.control_panel.registry import load_registry
 from tests.test_control_panel_security import StartSpy, _run_page, _select
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _session_get(at, key: str, default: object = None) -> object:
+    try:
+        inner = getattr(getattr(at.session_state, "_state", None), "_new_session_state", None)
+        if isinstance(inner, dict) and key in inner:
+            return inner[key]
+        return at.session_state[key]
+    except Exception:
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -241,14 +252,36 @@ def test_canonical_lightgbm_development_selects_correctly(
 def test_state_persists_after_navigation_to_jobs_then_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Selecting experiment_core_v2 and then switching away and back keeps state."""
+    """Widget cleanup simulation: durable Run state survives leaving the page."""
+    from src.churn_ml.control_panel.selection_state import (
+        LOGICAL_SELECTION_KEY,
+        snapshot_durable_session,
+        ui_durable_key,
+        widget_selection_key,
+    )
+    from tests.test_control_panel_security import _apptest_run_page
+
     spy = StartSpy()
     at = _run_page(monkeypatch, spy)
     at = _select(at, "Operation", "experiment_core_v2")
-    # Simulate page rerun (jobs → run navigation is a session re-run in AppTest)
+    at = _select(at, "Action", "validate")
+    config_key = widget_selection_key("experiment_core_v2", "config", "config")
+    selected = _session_get(at, config_key)
+    assert selected
+    snapshot = snapshot_durable_session(at.session_state)
+    at = AppTest.from_function(_apptest_run_page, default_timeout=10)
+    for key, value in snapshot.items():
+        at.session_state[key] = value
     at = at.run()
     op_box = next(item for item in at.selectbox if item.label == "Operation")
     assert op_box.value == "experiment_core_v2"
+    action_box = next(item for item in at.selectbox if item.label == "Action")
+    assert action_box.value == "validate"
+    assert _session_get(at, config_key) == selected
+    store = _session_get(at, LOGICAL_SELECTION_KEY, {})
+    assert isinstance(store, dict)
+    assert store.get(ui_durable_key("run", "command")) == "experiment_core_v2"
+    assert store.get("experiment_core_v2::config:config") == selected
 
 
 def test_forged_stale_path_cannot_be_launched(

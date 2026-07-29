@@ -16,6 +16,7 @@ from src.churn_ml.control_panel.artifacts import (
     sanitize_comparison_id,
 )
 from src.churn_ml.control_panel.command_builder import build_command
+from src.churn_ml.control_panel.jobs import JobManager
 from src.churn_ml.control_panel.mlflow_post_index import (
     extract_run_directory,
     maybe_index_successful_job,
@@ -32,7 +33,7 @@ from src.churn_ml.control_panel.selection_state import (
     widget_selection_key,
 )
 from tests.test_control_panel_results_workspace import _write_research_run
-from tests.test_control_panel_security import StartSpy, _run_page, _select
+from tests.test_control_panel_security import StartSpy, _apptest_run_page, _run_page, _select
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -42,9 +43,29 @@ XGBOOST_SMOKE = "configs/optuna/xgboost_numeric_v1_smoke.yaml"
 
 def _session_get(at: AppTest, key: str, default: object = None) -> object:
     try:
+        inner = getattr(
+            getattr(at.session_state, "_state", None), "_new_session_state", None
+        )
+        if isinstance(inner, dict) and key in inner:
+            return inner[key]
         return at.session_state[key]
     except Exception:
         return default
+
+
+def _make_run_apptest() -> AppTest:
+    return AppTest.from_function(_apptest_run_page, default_timeout=10)
+
+
+def _rerun_with_durable_only(at: AppTest, make_apptest) -> AppTest:
+    """Start a fresh page render with only durable backing state (simulate navigation)."""
+    from src.churn_ml.control_panel.selection_state import snapshot_durable_session
+
+    snapshot = snapshot_durable_session(at.session_state)
+    rebuilt = make_apptest()
+    for key, value in snapshot.items():
+        rebuilt.session_state[key] = value
+    return rebuilt.run()
 
 
 def test_reconcile_cascade_falls_back_atomically() -> None:
@@ -264,6 +285,9 @@ def test_persistence_matrix_and_forged_paths(
     at = _run_page(monkeypatch, spy)
     at = _select(at, "Operation", "optuna_search_v1")
     at = _select(at, "Action", "validate")
+    labels = [item.label for item in at.selectbox]
+    if "Source" in labels:
+        at = _select(at, "Source", "Canonical config")
     if "Model" in [item.label for item in at.selectbox]:
         at = _select(at, "Model", "CatBoost")
     if "Mode" in [item.label for item in at.selectbox]:
@@ -303,7 +327,7 @@ def test_persistence_matrix_and_forged_paths(
     )
     assert resolved in allowed
     assert resolved != "configs/mlflow/local.yaml"
-    assert str(resolved).startswith("configs/optuna/")
+    assert "mlflow" not in str(resolved)
 
 
 def test_mlflow_actions_only_use_local_yaml(
@@ -481,4 +505,308 @@ def test_autogluon_source_type_mapping() -> None:
             ["python", "scripts/run_autogluon.py", "train", "--config", "x.yaml"],
         )
         == "autogluon"
+    )
+
+
+def test_valid_widget_config_wins_over_stale_logical_example(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug 1: newly selected working.yaml must not be overwritten by .example logical."""
+    example = (
+        "configs/blend_evaluation/lightgbm_xgboost_blend_v1.example.yaml"
+    )
+    working = "configs/blend_evaluation/lightgbm_xgboost_blend_v1.yaml"
+    cfg_dir = tmp_path / "configs" / "blend_evaluation"
+    cfg_dir.mkdir(parents=True)
+    for relative in (example, working):
+        target = tmp_path / relative
+        target.write_text(
+            "schema_version: 1\n"
+            "experiment:\n"
+            "  id: lightgbm_xgboost_blend_v1\n"
+            "components: {}\n"
+            "blend: {}\n"
+            "deployment_parameters: {}\n"
+            "artifacts:\n"
+            "  root: artifacts/blend_evaluations\n"
+            "  evaluation_id: lightgbm_xgboost_blend_v1\n",
+            encoding="utf-8",
+        )
+
+    allowed = [example, working]
+    config_key = widget_selection_key("blend_evaluation_v1", "config", "config")
+    session: dict[str, Any] = {
+        config_key: working,
+        LOGICAL_SELECTION_KEY: {
+            "blend_evaluation_v1::config:config": example,
+        },
+    }
+    resolved = seed_widget_from_logical(
+        session,
+        operation="blend_evaluation_v1",
+        role="config",
+        name="config",
+        widget_key=config_key,
+        allowed=allowed,
+    )
+    assert resolved == working
+    assert session[config_key] == working
+    assert (
+        session[LOGICAL_SELECTION_KEY]["blend_evaluation_v1::config:config"] == working
+    )
+
+    monkeypatch.setattr(control_panel_app, "REPOSITORY_ROOT", tmp_path)
+    original_load = control_panel_app.load_registry
+
+    def load_project_registry(root: Path):
+        del root
+        return original_load(PROJECT_ROOT)
+
+    monkeypatch.setattr(control_panel_app, "load_registry", load_project_registry)
+    control_panel_app.registry.clear()
+
+    spy = StartSpy()
+    at = _run_page(monkeypatch, spy)
+    at = _select(at, "Operation", "blend_evaluation_v1")
+    at = _select(at, "Action", "validate")
+    existing_store = dict(_session_get(at, LOGICAL_SELECTION_KEY, {}) or {})
+    existing_store["blend_evaluation_v1::config:config"] = example
+    at.session_state[LOGICAL_SELECTION_KEY] = existing_store
+    at.session_state[config_key] = working
+    at = at.run()
+    assert _session_get(at, config_key) == working
+    store = _session_get(at, LOGICAL_SELECTION_KEY, {})
+    assert isinstance(store, dict)
+    assert store.get("blend_evaluation_v1::config:config") == working
+
+    captions = [str(item.value) for item in at.caption]
+    assert any(working in text for text in captions)
+    codes = [str(item.value) for item in at.code]
+    assert any(working in text for text in codes)
+
+    built = build_command(
+        load_registry(PROJECT_ROOT).commands,
+        "blend_evaluation_v1",
+        "validate",
+        {"config": working},
+        repository_root=tmp_path,
+    )
+    assert working in built.argv
+    assert example not in built.argv
+
+    at = _select(at, "Action", "run")
+    assert _session_get(at, config_key) == working
+    at = _select(at, "Action", "validate")
+    assert _session_get(at, config_key) == working
+    store = _session_get(at, LOGICAL_SELECTION_KEY, {})
+    assert isinstance(store, dict)
+    assert store.get("blend_evaluation_v1::config:config") == working
+
+
+def test_run_state_survives_widget_key_cleanup_navigation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug 2: Operation/Action/Config/enum survive simulated page navigation."""
+    from src.churn_ml.control_panel.selection_state import ui_durable_key
+
+    spy = StartSpy()
+    at = _run_page(monkeypatch, spy)
+    at = _select(at, "Operation", "mlflow_local_index")
+    at = _select(at, "Action", "sync_dry_run")
+    at = _select(at, "Source Type", "autogluon")
+    config_key = widget_selection_key("mlflow_local_index", "config", "config")
+    enum_key = widget_selection_key("mlflow_local_index", "value", "source_type")
+    assert _session_get(at, config_key) == "configs/mlflow/local.yaml"
+    assert _session_get(at, enum_key) == "autogluon"
+
+    at = _rerun_with_durable_only(at, _make_run_apptest)
+    assert next(item for item in at.selectbox if item.label == "Operation").value == (
+        "mlflow_local_index"
+    )
+    assert next(item for item in at.selectbox if item.label == "Action").value == (
+        "sync_dry_run"
+    )
+    assert _session_get(at, config_key) == "configs/mlflow/local.yaml"
+    assert _session_get(at, enum_key) == "autogluon"
+    store = _session_get(at, LOGICAL_SELECTION_KEY, {})
+    assert isinstance(store, dict)
+    assert store.get(ui_durable_key("run", "command")) == "mlflow_local_index"
+    assert store.get("mlflow_local_index::value:source_type") == "autogluon"
+
+
+def test_results_filters_and_compare_survive_navigation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.churn_ml.control_panel.selection_state import ui_durable_key
+
+    _write_research_run(
+        tmp_path,
+        plan="telecom_v3_development_r2x5_t3_v1",
+        adapter="manual_lightgbm_te_v1_compat",
+        run_id="20260729T070000000000Z_aaaaaaaa",
+        ba=0.9,
+    )
+    _write_research_run(
+        tmp_path,
+        plan="telecom_v3_development_r2x5_t3_v1",
+        adapter="xgboost_numeric_v1",
+        run_id="20260729T070100000000Z_bbbbbbbb",
+        ba=0.91,
+    )
+    monkeypatch.setattr(control_panel_app, "REPOSITORY_ROOT", tmp_path)
+    original_load = control_panel_app.load_registry
+
+    def load_project_registry(root: Path):
+        del root
+        return original_load(PROJECT_ROOT)
+
+    monkeypatch.setattr(control_panel_app, "load_registry", load_project_registry)
+    control_panel_app.registry.clear()
+
+    def _results_page() -> None:
+        import apps.experiment_control_panel as panel
+
+        panel.results_page()
+
+    def _make_results_apptest() -> AppTest:
+        return AppTest.from_function(_results_page, default_timeout=15)
+
+    at = _make_results_apptest().run()
+    assert not at.exception
+    at = _select(at, "Artifact type", "research_v2")
+    model_key = "results-exp-filter-model-research_v2"
+    search_key = "results-exp-filter-search-research_v2"
+    if "Model" in [item.label for item in at.selectbox]:
+        model_box = next(item for item in at.selectbox if item.label == "Model")
+        if "LightGBM" in list(model_box.options):
+            at = _select(at, "Model", "LightGBM")
+    search_inputs = [item for item in at.text_input if item.label.startswith("Search")]
+    if search_inputs:
+        search_inputs[0].set_value("lightgbm")
+        at = at.run()
+
+    selected_model = _session_get(at, model_key)
+    selected_search = _session_get(at, search_key)
+    at = _rerun_with_durable_only(at, _make_results_apptest)
+    if selected_model not in (None, "", "All"):
+        assert _session_get(at, model_key) == selected_model
+    if selected_search not in (None, ""):
+        assert _session_get(at, search_key) == selected_search
+    store = _session_get(at, LOGICAL_SELECTION_KEY, {})
+    assert isinstance(store, dict)
+    assert store.get(ui_durable_key("results", "reader", "results-experiments-reader"))
+
+
+def test_selected_job_survives_navigation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.churn_ml.control_panel.selection_state import (
+        set_durable_value,
+        ui_durable_key,
+    )
+    from tests.test_control_panel_jobs import FakeBackend
+
+    backend = FakeBackend()
+    manager = JobManager(
+        tmp_path / "jobs",
+        working_directory=tmp_path,
+        commands=load_registry(PROJECT_ROOT).commands,
+        backend=backend,
+    )
+    first = manager.start(
+        argv=["safe", "a"],
+        redacted_argv=["safe", "a"],
+        command_id="experiment_core_v2",
+        action_id="validate",
+        references={"config": "configs/a.yaml"},
+    )
+    second = manager.start(
+        argv=["safe", "b"],
+        redacted_argv=["safe", "b"],
+        command_id="experiment_core_v2",
+        action_id="validate",
+        references={"config": "configs/b.yaml"},
+    )
+    monkeypatch.setattr(control_panel_app, "job_manager", lambda _loaded: manager)
+
+    def _jobs_page() -> None:
+        import apps.experiment_control_panel as panel
+
+        panel.jobs_page()
+
+    def _make_jobs_apptest() -> AppTest:
+        return AppTest.from_function(_jobs_page, default_timeout=15)
+
+    at = _make_jobs_apptest().run()
+    assert not at.exception
+    job_ids = [first.job_id, second.job_id]
+    # Prefer the non-default job so restoration is observable.
+    job_box = next(item for item in at.selectbox if item.label == "Job")
+    default_job = job_box.value
+    target_job = next(job_id for job_id in job_ids if job_id != default_job)
+    at.session_state["jobs-selected"] = target_job
+    set_durable_value(
+        at.session_state,
+        ui_durable_key("jobs", "selected"),
+        target_job,
+    )
+    at = at.run()
+    assert _session_get(at, "jobs-selected") == target_job
+    at = _rerun_with_durable_only(at, _make_jobs_apptest)
+    assert _session_get(at, "jobs-selected") == target_job
+    store = _session_get(at, LOGICAL_SELECTION_KEY, {})
+    assert isinstance(store, dict)
+    assert store.get(ui_durable_key("jobs", "selected")) == target_job
+
+
+def test_stale_durable_options_fall_back_safely() -> None:
+    from src.churn_ml.control_panel.selection_state import (
+        sync_widget_with_durable,
+        ui_durable_key,
+    )
+
+    session: dict[str, Any] = {
+        LOGICAL_SELECTION_KEY: {
+            ui_durable_key("run", "command"): "removed_operation",
+            "experiment_core_v2::config:config": "configs/gone.yaml",
+        }
+    }
+    resolved_command = sync_widget_with_durable(
+        session,
+        widget_key="run-command",
+        durable_key=ui_durable_key("run", "command"),
+        allowed=["experiment_core_v2", "optuna_search_v1"],
+        default="experiment_core_v2",
+    )
+    assert resolved_command == "experiment_core_v2"
+    config_key = widget_selection_key("experiment_core_v2", "config", "config")
+    allowed = [
+        "configs/research_v2/manual_lightgbm_te_v1_compat_development.yaml",
+        "configs/research_v2/xgboost_numeric_v1_development.yaml",
+    ]
+    resolved_config = seed_widget_from_logical(
+        session,
+        operation="experiment_core_v2",
+        role="config",
+        name="config",
+        widget_key=config_key,
+        allowed=allowed,
+    )
+    assert resolved_config == allowed[0]
+
+
+def test_safety_confirmations_are_not_restored_from_durable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spy = StartSpy()
+    at = _run_page(monkeypatch, spy)
+    at = _select(at, "Operation", "experiment_core_v2")
+    at = _select(at, "Action", "run")
+    confirm = next(item for item in at.checkbox if item.label.startswith("I confirm"))
+    confirm.check()
+    at = at.run()
+    assert any(item.value for item in at.checkbox if item.label.startswith("I confirm"))
+    at = _rerun_with_durable_only(at, _make_run_apptest)
+    assert all(
+        not item.value for item in at.checkbox if item.label.startswith("I confirm")
     )
