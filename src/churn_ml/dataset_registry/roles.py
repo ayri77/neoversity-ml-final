@@ -9,6 +9,7 @@ from src.churn_ml.dataset_registry.constants import (
     V1_ENGINEERED_FEATURES,
     V2_SUMMARY_FEATURES,
     V3_ENGINEERED_FEATURES,
+    V4_SUMMARY_FEATURES,
 )
 from src.churn_ml.dataset_registry.errors import DatasetRegistryError
 from src.churn_ml.dataset_registry.schema import FeatureRole
@@ -70,6 +71,12 @@ def legacy_role_catalog(dataset_id: str) -> RoleCatalog:
         return RoleCatalog(
             summary_features=frozenset(V1_ENGINEERED_FEATURES),
             binary_indicator_features=frozenset(V3_ENGINEERED_FEATURES),
+            use_missing_suffix=False,
+        )
+    if dataset_id == "v4_zero_value_summary":
+        return RoleCatalog(
+            summary_features=frozenset(V4_SUMMARY_FEATURES),
+            binary_indicator_features=frozenset(),
             use_missing_suffix=False,
         )
     raise DatasetRegistryError(

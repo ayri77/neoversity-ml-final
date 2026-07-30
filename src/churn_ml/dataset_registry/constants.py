@@ -62,6 +62,13 @@ V3_ENGINEERED_FEATURES = (
     "Var192_is_missing",
 )
 
+V4_SUMMARY_FEATURES = (
+    "zero_count_numeric",
+    "zero_rate_observed_numeric",
+    "zero_count_supported_numeric",
+    "zero_rate_observed_supported_numeric",
+)
+
 LEGACY_CATALOG: Mapping[str, Mapping[str, Any]] = {
     "v0_raw_minimal": {
         "parent_dataset_id": None,
@@ -78,6 +85,9 @@ LEGACY_CATALOG: Mapping[str, Mapping[str, Any]] = {
                 ),
             }
         ],
+        "summary_features": (),
+        "binary_indicator_features": (),
+        "use_missing_suffix": False,
     },
     "v1_missingness_summary": {
         "parent_dataset_id": "v0_raw_minimal",
@@ -92,6 +102,9 @@ LEGACY_CATALOG: Mapping[str, Mapping[str, Any]] = {
                 "added_features": list(V1_ENGINEERED_FEATURES),
             }
         ],
+        "summary_features": V1_ENGINEERED_FEATURES,
+        "binary_indicator_features": (),
+        "use_missing_suffix": False,
     },
     "v2_missingness_indicators": {
         "parent_dataset_id": "v0_raw_minimal",
@@ -107,6 +120,9 @@ LEGACY_CATALOG: Mapping[str, Mapping[str, Any]] = {
                 "indicator_suffix": "_is_missing",
             }
         ],
+        "summary_features": V2_SUMMARY_FEATURES,
+        "binary_indicator_features": (),
+        "use_missing_suffix": True,
     },
     "v3_targeted_missingness": {
         "parent_dataset_id": "v1_missingness_summary",
@@ -130,8 +146,40 @@ LEGACY_CATALOG: Mapping[str, Mapping[str, Any]] = {
                 ),
             }
         ],
+        "summary_features": V1_ENGINEERED_FEATURES,
+        "binary_indicator_features": V3_ENGINEERED_FEATURES,
+        "use_missing_suffix": False,
     },
 }
+
+NATIVE_CATALOG: Mapping[str, Mapping[str, Any]] = {
+    **LEGACY_CATALOG,
+    "v4_zero_value_summary": {
+        "parent_dataset_id": "v0_raw_minimal",
+        "hypothesis": (
+            "Target-independent row-level zero-value summaries add signal over "
+            "raw minimal features."
+        ),
+        "target_dependency": "none",
+        "transformations": [
+            {
+                "type": "additive_zero_value_summary",
+                "added_features": list(V4_SUMMARY_FEATURES),
+            }
+        ],
+        "summary_features": V4_SUMMARY_FEATURES,
+        "binary_indicator_features": (),
+        "use_missing_suffix": False,
+    },
+}
+
+NATIVE_CANONICAL_IDS = (
+    "v0_raw_minimal",
+    "v1_missingness_summary",
+    "v2_missingness_indicators",
+    "v3_targeted_missingness",
+    "v4_zero_value_summary",
+)
 
 # Assumption documented for legacy row-identity proof:
 # All four implemented packages retain the ordered v0_raw_minimal feature

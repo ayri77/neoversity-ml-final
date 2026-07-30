@@ -14,12 +14,24 @@ Each registered package is a directory under a registry `--root`:
   X_train.parquet
   y_train.parquet
   X_test.parquet
-  metadata.json
-  dataset_manifest.json   # registry contract; immutable once written
+  metadata.json              # detailed feature-engineering + git provenance
+  dataset_manifest.json      # sole canonical Registry contract
 ```
 
-Legacy prepared datasets already use the four parquet/metadata files under
-`data/processed/<dataset_id>/`. Registry v1 adds only `dataset_manifest.json`.
+`dataset_manifest.json` is the only persisted reproducibility/lineage contract.
+Generator-owned `manifest.json` is not written, not trusted, and not a Registry
+contract. Author-supplied fields are represented by `DatasetBuildSpec`; all
+calculated fields are produced by Registry code.
+
+## Native generation versus legacy backfill
+
+- **Native generation** (`features.save_dataset`): writes the four package
+  artifacts, then materializes `dataset_manifest.json` through Registry
+  hashing, role assignment, alignment proof, and strict validation.
+- **Legacy backfill** (`dataset_registry` CLI `backfill`): adds
+  `dataset_manifest.json` to existing four-file packages after proving
+  lineage/alignment. Dry-run by default; never overwrites an existing
+  Registry manifest; never modifies parquet/`metadata.json`.
 
 ## Manifest fields and semantics
 
@@ -48,7 +60,7 @@ Exact allowed roles:
 - `numeric` — retained numeric/bool source columns after catalog checks
 - `categorical` — retained object/category/string source columns
 - `binary_indicator` — declared or catalog-known missingness indicator columns
-- `summary` — declared missingness summary columns
+- `summary` — declared missingness / zero-value summary columns
 
 Role assignment is deterministic and never inspects `y_train` values, `X_test`
 values, correlations, or cardinality. Precedence (highest first):
@@ -64,11 +76,20 @@ Unsupported dtypes fail classification. Stale roles such as `feature` or
 Roles are part of the immutable schema hash. Reordering columns, changing a
 dtype, or changing a role requires a new `dataset_id`.
 
+Native engineered roles:
+
+- v1: eight missingness summaries → `summary`
+- v2: four count summaries → `summary`; generated `_is_missing` → `binary_indicator`
+- v3: eight missingness summaries → `summary`; four targeted indicators → `binary_indicator`
+- v4: four zero-value aggregates → `summary` (`parent=v0_raw_minimal`, `target_dependency=none`)
+
 ## `target_dependency` meanings
 
 - `none`: package construction does not depend on the training target
 - `exploratory`: construction used a prior full-train / exploratory target-informed choice (legacy `v3_targeted_missingness`)
-- `fold_local`: reserved for future fold-local target-dependent transforms
+- `fold_local`: recognized by the Registry schema, but **not** materializable by
+  `save_dataset()`. Fold-local target-dependent transforms belong inside a CV
+  pipeline, not a ready prepared Parquet package.
 
 ## Immutability
 
@@ -83,19 +104,23 @@ manifest:
 - metadata file content
 - row-identity / alignment hashes
 
-A modified package must receive a new `dataset_id`. Backfill never overwrites an
-existing `dataset_manifest.json` and never modifies parquet or `metadata.json`.
+A modified package must receive a new `dataset_id`. `save_dataset()` refuses to
+overwrite a registered package even when `overwrite=True`. Backfill never
+overwrites an existing `dataset_manifest.json` and never modifies parquet or
+`metadata.json`. Git provenance is stored under `metadata.json` as
+`created_from_git` (commit + dirty flag), not as an unknown Registry manifest
+field.
 
 ## Row-identity proof
 
 A manually authored “aligned” flag is never trusted.
 
 Train row identity is derived from ordered feature values, **not** from `y`
-alone. For the four implemented legacy packages
+alone. For the implemented native packages
 (`v0_raw_minimal`, `v1_missingness_summary`, `v2_missingness_indicators`,
-`v3_targeted_missingness`), the ordered `v0_raw_minimal` feature projection is
-the alignment anchor because those packages retain that projection with
-unchanged values and row order.
+`v3_targeted_missingness`, `v4_zero_value_summary`), the ordered
+`v0_raw_minimal` feature projection is the alignment anchor because those
+packages retain that projection with unchanged values and row order.
 
 Legacy `metadata.json` stores lineage under nested
 `source` / `base_version` (and baseline docs use `parent`). It does **not**

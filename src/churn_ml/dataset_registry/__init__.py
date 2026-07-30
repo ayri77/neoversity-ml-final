@@ -10,11 +10,17 @@ from src.churn_ml.dataset_registry.api import (
     resolve_dataset_package,
     validate_dataset_package,
 )
+from src.churn_ml.dataset_registry.build_spec import (
+    DatasetBuildSpec,
+    native_build_spec,
+    parse_build_spec,
+)
 from src.churn_ml.dataset_registry.errors import (
     DatasetRegistryError,
     OverwriteRefusedError,
     UnverifiableAlignmentError,
 )
+from src.churn_ml.dataset_registry.materialize import dataset_manifest_sha256
 from src.churn_ml.dataset_registry.schema import (
     SCHEMA_VERSION,
     DatasetManifest,
@@ -24,6 +30,7 @@ from src.churn_ml.dataset_registry.schema import (
 
 __all__ = [
     "SCHEMA_VERSION",
+    "DatasetBuildSpec",
     "DatasetManifest",
     "DatasetPackage",
     "DatasetRegistryError",
@@ -32,8 +39,11 @@ __all__ = [
     "TargetSpec",
     "UnverifiableAlignmentError",
     "ValidationResult",
+    "dataset_manifest_sha256",
     "list_dataset_packages",
     "load_dataset_manifest",
+    "native_build_spec",
+    "parse_build_spec",
     "resolve_dataset_package",
     "validate_dataset_package",
 ]
