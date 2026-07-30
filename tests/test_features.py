@@ -22,9 +22,12 @@ from src.churn_ml.dataset_registry.errors import (
 from src.churn_ml.dataset_registry.materialize import dataset_manifest_sha256
 from src.churn_ml.features import (
     PreparedDataset,
+    add_missingness_pattern_feature,
     add_missingness_summary_features,
     add_selected_missing_indicators,
+    add_selected_zero_indicators,
     add_zero_value_summary_features,
+    deduplicate_missingness_mask_features,
     deduplicate_zero_mask_features,
     load_dataset,
     native_build_spec,
@@ -106,6 +109,110 @@ def test_deduplicate_zero_mask_features() -> None:
     )
     assert representatives == ["feature_a", "feature_c", "feature_d"]
     assert groups == [["feature_a", "feature_b"], ["feature_c"], ["feature_d"]]
+
+
+def test_deduplicate_missingness_mask_features() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "feature_a": [1.0, None, 3.0, None],
+            "feature_b": ["a", None, "b", None],
+            "feature_c": [None, 2.0, 3.0, None],
+            "feature_d": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+
+    representatives, groups = deduplicate_missingness_mask_features(
+        dataframe,
+        features=[
+            "feature_a",
+            "feature_b",
+            "feature_c",
+            "feature_d",
+        ],
+    )
+
+    assert representatives == [
+        "feature_a",
+        "feature_c",
+        "feature_d",
+    ]
+
+    assert groups == [
+        ["feature_a", "feature_b"],
+        ["feature_c"],
+        ["feature_d"],
+    ]
+
+
+def test_add_missingness_pattern_feature() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "feature_a": [1.0, None, None],
+            "feature_b": [None, None, 2.0],
+            "feature_c": [10, 20, 30],
+        }
+    )
+
+    result = add_missingness_pattern_feature(
+        dataframe,
+        source_features=[
+            "feature_a",
+            "feature_b",
+        ],
+    )
+
+    assert list(result["missingness_pattern_id"]) == [
+        "02",
+        "03",
+        "01",
+    ]
+
+    assert str(result["missingness_pattern_id"].dtype) == "string"
+
+    pd.testing.assert_frame_equal(
+        result[dataframe.columns],
+        dataframe,
+    )
+
+
+def test_add_selected_zero_indicators() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "feature_a": [0.0, 1.0, None, -1.0],
+            "feature_b": [2, 0, 3, 0],
+            "other_feature": ["a", "b", "c", "d"],
+        }
+    )
+
+    result = add_selected_zero_indicators(
+        dataframe,
+        indicator_features=[
+            "feature_a",
+            "feature_b",
+        ],
+    )
+
+    assert result["feature_a_is_zero"].tolist() == [
+        1,
+        0,
+        0,
+        0,
+    ]
+
+    assert result["feature_b_is_zero"].tolist() == [
+        0,
+        1,
+        0,
+        1,
+    ]
+
+    assert str(result["feature_a_is_zero"].dtype) == "int8"
+    assert str(result["feature_b_is_zero"].dtype) == "int8"
+
+    pd.testing.assert_frame_equal(
+        result[dataframe.columns],
+        dataframe,
+    )
 
 
 def test_native_save_load_round_trip_registry_valid(tmp_path: Path) -> None:
