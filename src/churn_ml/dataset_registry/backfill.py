@@ -14,9 +14,6 @@ from src.churn_ml.dataset_registry.constants import (
     LEGACY_CANONICAL_IDS,
     LEGACY_CATALOG,
     LEGACY_UNREGISTERED_IDS,
-    V1_ENGINEERED_FEATURES,
-    V2_SUMMARY_FEATURES,
-    V3_ENGINEERED_FEATURES,
 )
 from src.churn_ml.dataset_registry.errors import (
     DatasetRegistryError,
@@ -33,6 +30,7 @@ from src.churn_ml.dataset_registry.package import (
     package_dir_for,
     validate_basic_shapes,
 )
+from src.churn_ml.dataset_registry.roles import legacy_role_catalog
 from src.churn_ml.dataset_registry.schema import (
     DatasetManifest,
     TargetDependency,
@@ -61,25 +59,6 @@ class BackfillResult:
         if self.manifest is not None:
             payload["manifest"] = self.manifest.to_dict()
         return payload
-
-
-def engineered_features_for(dataset_id: str, feature_names: Sequence[str]) -> tuple[str, ...]:
-    names = set(feature_names)
-    if dataset_id == "v0_raw_minimal":
-        return ()
-    if dataset_id == "v1_missingness_summary":
-        return tuple(name for name in V1_ENGINEERED_FEATURES if name in names)
-    if dataset_id == "v2_missingness_indicators":
-        engineered = [name for name in V2_SUMMARY_FEATURES if name in names]
-        engineered.extend(
-            name for name in feature_names if str(name).endswith("_is_missing")
-        )
-        return tuple(dict.fromkeys(engineered))
-    if dataset_id == "v3_targeted_missingness":
-        engineered = [name for name in V1_ENGINEERED_FEATURES if name in names]
-        engineered.extend(name for name in V3_ENGINEERED_FEATURES if name in names)
-        return tuple(dict.fromkeys(engineered))
-    return ()
 
 
 def backfill_legacy_dataset(
@@ -149,10 +128,6 @@ def backfill_legacy_dataset(
             parent_artifacts=parent_artifacts,
             root=root,
         )
-        engineered = engineered_features_for(
-            dataset_id,
-            artifacts.X_train.columns.tolist(),
-        )
         manifest = build_manifest(
             artifacts,
             hypothesis=str(catalog["hypothesis"]),
@@ -160,7 +135,7 @@ def backfill_legacy_dataset(
             target_dependency=catalog["target_dependency"],  # type: ignore[arg-type]
             transformations=list(catalog["transformations"]),
             alignment=alignment,
-            engineered_features=engineered,
+            role_catalog=legacy_role_catalog(dataset_id),
         )
     except UnverifiableAlignmentError as error:
         return BackfillResult(

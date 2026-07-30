@@ -43,8 +43,23 @@ required keys fail validation.
 
 ## Feature roles
 
-- `feature`: retained base/source column
-- `engineered`: additive derived column (summaries, indicators, …)
+Exact allowed roles:
+
+- `numeric` — retained numeric/bool source columns after catalog checks
+- `categorical` — retained object/category/string source columns
+- `binary_indicator` — declared or catalog-known missingness indicator columns
+- `summary` — declared missingness summary columns
+
+Role assignment is deterministic and never inspects `y_train` values, `X_test`
+values, correlations, or cardinality. Precedence (highest first):
+
+1. `summary` (declared name set)
+2. `binary_indicator` (declared name set, or legacy v2 `_is_missing` suffix rule)
+3. `categorical` (train dtype is object/category/string)
+4. `numeric` (remaining supported numeric/bool train dtypes)
+
+Unsupported dtypes fail classification. Stale roles such as `feature` or
+`engineered` fail strict manifest parsing.
 
 Roles are part of the immutable schema hash. Reordering columns, changing a
 dtype, or changing a role requires a new `dataset_id`.

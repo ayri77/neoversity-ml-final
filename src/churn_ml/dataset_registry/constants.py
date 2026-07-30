@@ -15,7 +15,9 @@ PACKAGE_FILES = (
 )
 
 TARGET_DEPENDENCY_VALUES = frozenset({"none", "exploratory", "fold_local"})
-FEATURE_ROLE_VALUES = frozenset({"feature", "engineered"})
+FEATURE_ROLE_VALUES = frozenset(
+    {"numeric", "categorical", "binary_indicator", "summary"}
+)
 
 # Canonical implemented legacy datasets eligible for safe backfill.
 LEGACY_CANONICAL_IDS = (

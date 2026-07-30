@@ -12,7 +12,7 @@ from src.churn_ml.dataset_registry.constants import (
 )
 from src.churn_ml.dataset_registry.errors import DatasetRegistryError
 
-FeatureRole = Literal["feature", "engineered"]
+FeatureRole = Literal["numeric", "categorical", "binary_indicator", "summary"]
 TargetDependency = Literal["none", "exploratory", "fold_local"]
 AlignmentStatus = Literal["proven", "unverifiable"]
 

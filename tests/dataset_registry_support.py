@@ -117,7 +117,9 @@ def register_package(
     hypothesis: str,
     target_dependency: str = "none",
     transformations: Sequence[Mapping[str, Any]] | None = None,
-    engineered_features: Sequence[str] | None = None,
+    summary_features: Sequence[str] | None = None,
+    binary_indicator_features: Sequence[str] | None = None,
+    use_missing_suffix: bool = False,
 ) -> Path:
     package_dir = root / dataset_id
     artifacts = load_package_artifacts(package_dir, dataset_id=dataset_id)
@@ -139,7 +141,9 @@ def register_package(
         target_dependency=target_dependency,  # type: ignore[arg-type]
         transformations=list(transformations or [{"type": "synthetic"}]),
         alignment=alignment,
-        engineered_features=engineered_features,
+        summary_features=summary_features,
+        binary_indicator_features=binary_indicator_features,
+        use_missing_suffix=use_missing_suffix,
     )
     write_manifest(package_dir / MANIFEST_FILENAME, manifest)
     assert manifest.schema_version == SCHEMA_VERSION

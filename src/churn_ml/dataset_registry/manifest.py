@@ -23,9 +23,13 @@ from src.churn_ml.dataset_registry.package import (
     PackageArtifacts,
     validate_basic_shapes,
 )
+from src.churn_ml.dataset_registry.roles import (
+    RoleCatalog,
+    classify_feature_role_with_catalog,
+    role_catalog_from_sets,
+)
 from src.churn_ml.dataset_registry.schema import (
     DatasetManifest,
-    FeatureRole,
     FeatureSpec,
     TargetDependency,
     TargetSpec,
@@ -36,12 +40,19 @@ from src.churn_ml.dataset_registry.schema import (
 def build_feature_specs(
     artifacts: PackageArtifacts,
     *,
-    engineered_features: Sequence[str] | None = None,
+    role_catalog: RoleCatalog | None = None,
+    summary_features: Sequence[str] | None = None,
+    binary_indicator_features: Sequence[str] | None = None,
+    use_missing_suffix: bool = False,
 ) -> tuple[FeatureSpec, ...]:
-    engineered = set(engineered_features or ())
+    catalog = role_catalog or role_catalog_from_sets(
+        summary_features=summary_features,
+        binary_indicator_features=binary_indicator_features,
+        use_missing_suffix=use_missing_suffix,
+    )
     specs: list[FeatureSpec] = []
     for name, dtype in artifacts.X_train.dtypes.items():
-        role: FeatureRole = "engineered" if str(name) in engineered else "feature"
+        role = classify_feature_role_with_catalog(str(name), str(dtype), catalog)
         specs.append(FeatureSpec(name=str(name), dtype=str(dtype), role=role))
     return tuple(specs)
 
@@ -54,7 +65,10 @@ def build_manifest(
     target_dependency: TargetDependency,
     transformations: Sequence[Mapping[str, Any]],
     alignment: AlignmentProof,
-    engineered_features: Sequence[str] | None = None,
+    role_catalog: RoleCatalog | None = None,
+    summary_features: Sequence[str] | None = None,
+    binary_indicator_features: Sequence[str] | None = None,
+    use_missing_suffix: bool = False,
 ) -> DatasetManifest:
     validate_basic_shapes(artifacts)
     if alignment.status != "proven":
@@ -64,7 +78,10 @@ def build_manifest(
         )
     features = build_feature_specs(
         artifacts,
-        engineered_features=engineered_features,
+        role_catalog=role_catalog,
+        summary_features=summary_features,
+        binary_indicator_features=binary_indicator_features,
+        use_missing_suffix=use_missing_suffix,
     )
     content_hashes = {
         "X_train": file_content_sha256(artifacts.paths["X_train"]),
@@ -109,7 +126,10 @@ def recompute_manifest_from_disk(
     parent_dataset_id: str | None,
     target_dependency: TargetDependency,
     transformations: Sequence[Mapping[str, Any]],
-    engineered_features: Sequence[str] | None = None,
+    role_catalog: RoleCatalog | None = None,
+    summary_features: Sequence[str] | None = None,
+    binary_indicator_features: Sequence[str] | None = None,
+    use_missing_suffix: bool = False,
     anchor_feature_names: tuple[str, ...] | None = None,
     parent_artifacts: PackageArtifacts | None = None,
     root: Path | None = None,
@@ -127,7 +147,10 @@ def recompute_manifest_from_disk(
         target_dependency=target_dependency,
         transformations=transformations,
         alignment=alignment,
-        engineered_features=engineered_features,
+        role_catalog=role_catalog,
+        summary_features=summary_features,
+        binary_indicator_features=binary_indicator_features,
+        use_missing_suffix=use_missing_suffix,
     )
 
 
