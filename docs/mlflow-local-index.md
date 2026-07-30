@@ -250,12 +250,55 @@ summaries, thresholds, and duration. Failed mappings expose only validated failu
 diagnostics and fields from optional artifacts that passed the failed-run validator;
 raw optional files never provide fallback mapping values.
 
+Completed research `resolved_config.yaml` payloads may include exactly one optional
+top-level key beyond the Experiment Core v2 base set: `search_provenance`. That block
+is validated with the production research_v2 helper (exact keys, schema version 1,
+safe slugs, SHA-256 digests, and
+`evidence_scope=tuning_only_not_unbiased_final_evidence`). Unknown extra keys and
+malformed provenance remain rejected. Failed-run resolved-config validation uses the
+same optional-key rule. Full `validate_research_v2_run()` semantic validation is
+unchanged for completed sources.
+
+### Deterministic MLflow run names
+
+Sync always sets a stable UI name and reconciles it in place via `mlflow.runName`:
+
+- AutoGluon: `{source_run_id}`
+- research_v2: `{adapter_id}__{source_run_id}`
+
+Lookup identity remains `mlflow_index.source_key`. Renaming never allocates a second
+row for the same key. After create or rename reconciliation, a following sync is
+`unchanged`.
+
+### AutoGluon metrics and tags
+
 AutoGluon parameters include config/profile/dataset/seed/resource identities and
 validated status diagnostics. `predictor_classification` is a tag, not a parameter.
 Model count, best model, decision threshold, and worker-completion-derived predictor
 metadata are populated only when terminal status is completed, read-only classification
 is `complete`, and completion validation succeeded. A failed run cannot expose stale
 `worker_result.json` completion fields. A valid duration of `0.0` is preserved.
+
+For completed AutoGluon runs, native quality comes from the already validated
+`inspection/summary.json`, with `inspection/leaderboard.csv` used only to
+cross-check or fall back for the exported best model. Logged values when present and
+finite:
+
+- metrics: `score_val`, `best_model_fit_time_seconds`,
+  `best_model_pred_time_val_seconds`, and `duration_seconds`;
+- parameter: `eval_metric`;
+- tags: `best_model` and, when the metric is a known AutoGluon direction,
+  `metric_direction` (`higher_is_better` or `lower_is_better`).
+
+Only the best-model row is mapped; the full leaderboard stays an optional metadata
+artifact for detailed review. Failed or incomplete AutoGluon runs keep
+status/duration handling and do not receive quality metrics they did not produce.
+
+### In-place backfill
+
+Repeated sync locates the existing MLflow run by `mlflow_index.source_key`, adds only
+missing params/metrics/tags (including `mlflow.runName`), and refuses undeletable
+unexpected metrics or conflicting immutable state. No duplicate rows are created.
 
 ## Strict artifact-copy policy
 

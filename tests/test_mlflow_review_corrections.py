@@ -897,6 +897,52 @@ def test_valid_full_native_failed_research_metadata(tmp_path: Path) -> None:
     assert record.params["candidate_sha256"] == "4" * 64
 
 
+def test_failed_research_resolved_config_accepts_search_provenance(
+    tmp_path: Path,
+) -> None:
+    config = load_mlflow_config(
+        write_config(tmp_path, valid_payload()), repository_root=tmp_path
+    )
+    run = config.paths.research_v2_root / "plan" / "candidate" / "full-failure"
+    _write_full_failed_research(run)
+    path = run / "resolved_config.yaml"
+    resolved = yaml.safe_load(path.read_text(encoding="utf-8"))
+    resolved["search_provenance"] = {
+        "schema_version": 1,
+        "search_id": "xgboost_numeric_v1_development_search_v1_8d4b222440f3867f",
+        "study_name": "xgboost_numeric_v1_development_search_v1",
+        "best_trial_number": 45,
+        "search_identity_sha256": (
+            "8d4b222440f3867fa3cbb3a0e1b38953f421344e0f1def80f25d3f8d183fb6fd"
+        ),
+        "search_space_id": "xgboost_numeric_v1_space_v1",
+        "search_space_sha256": (
+            "0edd02a742106f4e9f91c748131ca942d75044b73cb9365ee0ac13b4ed82d7ba"
+        ),
+        "evidence_scope": "tuning_only_not_unbiased_final_evidence",
+    }
+    path.write_text(yaml.safe_dump(resolved, sort_keys=False), encoding="utf-8")
+    record = ResearchV2SourceAdapter().prepare(run, config)
+    assert record.terminal_status == "failed"
+    assert record.params["adapter_id"] == resolved["candidate_adapter"]["id"]
+
+
+def test_failed_research_resolved_config_rejects_malformed_search_provenance(
+    tmp_path: Path,
+) -> None:
+    config = load_mlflow_config(
+        write_config(tmp_path, valid_payload()), repository_root=tmp_path
+    )
+    run = config.paths.research_v2_root / "plan" / "candidate" / "full-failure"
+    _write_full_failed_research(run)
+    path = run / "resolved_config.yaml"
+    resolved = yaml.safe_load(path.read_text(encoding="utf-8"))
+    resolved["search_provenance"] = {"schema_version": 1, "unexpected": True}
+    path.write_text(yaml.safe_dump(resolved, sort_keys=False), encoding="utf-8")
+    with pytest.raises(SourceValidationError):
+        ResearchV2SourceAdapter().prepare(run, config)
+
+
 def test_full_failed_research_rejects_corrupt_runtime_context(tmp_path: Path) -> None:
     config = load_mlflow_config(
         write_config(tmp_path, valid_payload()), repository_root=tmp_path

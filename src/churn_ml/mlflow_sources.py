@@ -32,7 +32,11 @@ from src.churn_ml.mlflow_mapping import (
 from src.churn_ml.research_v2_artifact_validation import (
     validate_research_v2_run,
 )
-from src.churn_ml.research_v2_config import ResearchV2Config
+from src.churn_ml.research_v2_config import (
+    ResearchV2Config,
+    ResearchV2ConfigurationError,
+    _validate_search_provenance,
+)
 
 
 class SourceError(RuntimeError):
@@ -572,7 +576,8 @@ def _persisted_research_config(
         "tracking",
         "evaluation_plan",
     }
-    if set(resolved) != expected:
+    actual = set(resolved)
+    if actual not in (expected, expected | {"search_provenance"}):
         raise SourceValidationError(
             "resolved_config_schema_invalid",
             "Persisted research resolved_config.yaml has missing or extra keys",
@@ -591,6 +596,14 @@ def _persisted_research_config(
             "evaluation_plan_invalid",
             "Persisted research evaluation_plan must be a mapping",
         )
+    if "search_provenance" in resolved:
+        try:
+            _validate_search_provenance(resolved["search_provenance"])
+        except ResearchV2ConfigurationError as error:
+            raise SourceValidationError(
+                "search_provenance_invalid",
+                f"Persisted research search_provenance is invalid: {error}",
+            ) from error
     payload = {
         key: value for key, value in resolved.items() if key != "evaluation_plan"
     }

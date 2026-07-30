@@ -24,6 +24,7 @@ from src.churn_ml.mlflow_sources import (
     ResearchV2SourceAdapter,
     SourceAdapterRegistry,
     SourceValidationError,
+    _persisted_research_config,
     default_source_registry,
 )
 from tests.test_mlflow_config import valid_payload, write_config
@@ -94,6 +95,7 @@ def test_completed_and_failed_research_mapping() -> None:
     assert completed.metrics["balanced_accuracy"] == 0.9
     assert completed.metrics["threshold_range"] == pytest.approx(0.3)
     assert completed.tags["metric_direction.brier_score"] == "lower_is_better"
+    assert completed.run_name == "adapter__run-1"
 
     failed = build_research_mapping(
         run_dir=Path("run-2"),
@@ -107,11 +109,29 @@ def test_completed_and_failed_research_mapping() -> None:
     assert failed.mlflow_status == "FAILED"
     assert failed.metrics == {}
     assert failed.tags["failure_type"] == "RuntimeError"
+    assert failed.run_name == "adapter__run-2"
 
 
-def test_completed_and_failed_autogluon_mapping() -> None:
+def test_completed_and_failed_autogluon_mapping(tmp_path: Path) -> None:
+    run_dir = tmp_path / "ag-run"
+    inspection_dir = run_dir / "inspection"
+    inspection_dir.mkdir(parents=True)
+    leaderboard_row = {
+        "model": "WeightedEnsemble_L2",
+        "score_val": 0.8041330398630472,
+        "eval_metric": "balanced_accuracy",
+        "fit_time": 374.2762141227722,
+        "pred_time_val": 0.1534740924835205,
+    }
+    (inspection_dir / "leaderboard.csv").write_text(
+        "model,score_val,eval_metric,pred_time_val,fit_time\n"
+        "CatBoost_c1_BAG_L1,0.8,balanced_accuracy,0.14,374.0\n"
+        "WeightedEnsemble_L2,0.8041330398630472,balanced_accuracy,"
+        "0.1534740924835205,374.2762141227722\n",
+        encoding="utf-8",
+    )
     common = {
-        "run_dir": Path("ag-run"),
+        "run_dir": run_dir,
         "source_relative_path": "ag-run",
         "metadata": {
             "schema_version": 1,
@@ -129,7 +149,20 @@ def test_completed_and_failed_autogluon_mapping() -> None:
         },
         "resolved_config": {},
         "profile_resolution": {"resolved_families": ["GBM_PREP"]},
-        "inspection_summary": {"effective_seed_status": "verified"},
+        "inspection_summary": {
+            "effective_seed_status": "verified",
+            "best_model": "WeightedEnsemble_L2",
+            "leaderboard": [
+                {
+                    "model": "CatBoost_c1_BAG_L1",
+                    "score_val": 0.8,
+                    "eval_metric": "balanced_accuracy",
+                    "fit_time": 374.0,
+                    "pred_time_val": 0.14,
+                },
+                leaderboard_row,
+            ],
+        },
     }
     completed = build_autogluon_mapping(
         **common,
@@ -147,7 +180,19 @@ def test_completed_and_failed_autogluon_mapping() -> None:
     assert completed.mlflow_status == "FINISHED"
     assert completed.params["model_count"] == 2
     assert completed.params["decision_threshold"] == 0.117
+    assert completed.params["eval_metric"] == "balanced_accuracy"
     assert completed.tags["predictor_loading_attempted"] == "false"
+    assert completed.tags["best_model"] == "WeightedEnsemble_L2"
+    assert completed.tags["metric_direction"] == "higher_is_better"
+    assert completed.metrics["duration_seconds"] == 3.0
+    assert completed.metrics["score_val"] == pytest.approx(0.8041330398630472)
+    assert completed.metrics["best_model_fit_time_seconds"] == pytest.approx(
+        374.2762141227722
+    )
+    assert completed.metrics["best_model_pred_time_val_seconds"] == pytest.approx(
+        0.1534740924835205
+    )
+    assert completed.run_name == "ag-run"
 
     failed = build_autogluon_mapping(
         **common,
@@ -165,6 +210,122 @@ def test_completed_and_failed_autogluon_mapping() -> None:
     assert failed.mlflow_status == "FAILED"
     assert failed.params["child_process_exit_code"] == 23
     assert failed.tags["failure_codes"] == "worker_exit_code:23"
+    assert failed.metrics == {"duration_seconds": 4.0}
+    assert "score_val" not in failed.metrics
+    assert "best_model" not in failed.tags
+    assert "eval_metric" not in failed.params
+    assert failed.run_name == "ag-run"
+
+
+def test_research_run_name_uses_adapter_and_source_id() -> None:
+    record = build_research_mapping(
+        run_dir=Path("20260729T070702417916Z_38bbefe2"),
+        source_relative_path="plan/component/20260729T070702417916Z_38bbefe2",
+        metadata={
+            "schema_version": 2,
+            "plan_id": "plan",
+            "feature_pipeline_id": "pipeline",
+            "candidate_adapter_id": "xgboost_numeric_v1",
+            "hashes": {"candidate": "4" * 64},
+            "evaluation_duration_seconds": 1.0,
+        },
+        status={},
+        resolved_config={"dataset": {"version": "v3"}, "evaluation_plan": {}},
+        terminal_status="completed",
+        source_identity="a" * 64,
+        aggregate={"metrics": {}},
+        threshold_summary={},
+        threshold_standard_deviation=0.0,
+    )
+    assert record.run_name == "xgboost_numeric_v1__20260729T070702417916Z_38bbefe2"
+
+
+def test_persisted_research_config_accepts_valid_search_provenance(
+    tmp_path: Path,
+) -> None:
+    resolved = _minimal_resolved_research()
+    resolved["search_provenance"] = _valid_search_provenance()
+    config = _persisted_research_config(tmp_path / "run", resolved, tmp_path)
+    assert config.payload["search_provenance"]["best_trial_number"] == 45
+
+
+def test_persisted_research_config_rejects_unknown_and_malformed_provenance(
+    tmp_path: Path,
+) -> None:
+    unknown = _minimal_resolved_research()
+    unknown["unexpected"] = True
+    with pytest.raises(SourceValidationError, match="missing or extra keys"):
+        _persisted_research_config(tmp_path / "run", unknown, tmp_path)
+
+    malformed = _minimal_resolved_research()
+    malformed["search_provenance"] = _valid_search_provenance()
+    malformed["search_provenance"]["evidence_scope"] = "not_allowed"
+    with pytest.raises(SourceValidationError, match="search_provenance"):
+        _persisted_research_config(tmp_path / "run", malformed, tmp_path)
+
+    incomplete = _minimal_resolved_research()
+    incomplete["search_provenance"] = {"schema_version": 1}
+    with pytest.raises(SourceValidationError, match="search_provenance"):
+        _persisted_research_config(tmp_path / "run", incomplete, tmp_path)
+
+
+def test_optuna_xgboost_resolved_shape_passes_persisted_gate(tmp_path: Path) -> None:
+    resolved = _minimal_resolved_research()
+    resolved["experiment"]["id"] = "xgboost_numeric_v1_optuna_8d4b222440f3_t45"
+    resolved["candidate_adapter"]["id"] = "xgboost_numeric_v1"
+    resolved["search_provenance"] = {
+        "schema_version": 1,
+        "search_id": "xgboost_numeric_v1_development_search_v1_8d4b222440f3867f",
+        "study_name": "xgboost_numeric_v1_development_search_v1",
+        "best_trial_number": 45,
+        "search_identity_sha256": (
+            "8d4b222440f3867fa3cbb3a0e1b38953f421344e0f1def80f25d3f8d183fb6fd"
+        ),
+        "search_space_id": "xgboost_numeric_v1_space_v1",
+        "search_space_sha256": (
+            "0edd02a742106f4e9f91c748131ca942d75044b73cb9365ee0ac13b4ed82d7ba"
+        ),
+        "evidence_scope": "tuning_only_not_unbiased_final_evidence",
+    }
+    config = _persisted_research_config(tmp_path / "run", resolved, tmp_path)
+    assert config.adapter_id == "xgboost_numeric_v1"
+    assert "search_provenance" in config.payload
+
+
+def test_prepare_with_search_provenance_still_requires_semantic_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_mlflow_config(
+        write_config(tmp_path, valid_payload()), repository_root=tmp_path
+    )
+    run = config.paths.research_v2_root / "plan" / "candidate" / "xgb-run"
+    run.mkdir(parents=True)
+    resolved = _minimal_resolved_research()
+    resolved["search_provenance"] = _valid_search_provenance()
+    (run / "resolved_config.yaml").write_text(
+        yaml.safe_dump(resolved, sort_keys=False), encoding="utf-8"
+    )
+    _write_json(
+        run / "execution_status.json",
+        {"status": "completed", "run_id": "xgb-run"},
+    )
+    _write_json(
+        run / "run_metadata.json",
+        {
+            "run_id": "xgb-run",
+            "status": "completed",
+            "hashes": {"candidate": "1" * 64},
+        },
+    )
+    (run / "_SUCCESS").touch()
+
+    def reject(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("predictions corrupt")
+
+    monkeypatch.setattr("src.churn_ml.mlflow_sources.validate_research_v2_run", reject)
+    with pytest.raises(SourceValidationError, match="semantic validation"):
+        ResearchV2SourceAdapter().prepare(run, config)
 
 
 def test_failed_research_artifact_policy_and_no_source_mutation(
@@ -434,6 +595,19 @@ def _minimal_resolved_research() -> dict[str, Any]:
         },
         "tracking": {"enabled": False},
         "evaluation_plan": {"schema_version": 1},
+    }
+
+
+def _valid_search_provenance() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "search_id": "xgboost_numeric_v1_development_search_v1_8d4b222440f3867f",
+        "study_name": "xgboost_numeric_v1_development_search_v1",
+        "best_trial_number": 45,
+        "search_identity_sha256": "8d4b222440f3867fa3cbb3a0e1b38953f421344e0f1def80f25d3f8d183fb6fd",
+        "search_space_id": "xgboost_numeric_v1_space_v1",
+        "search_space_sha256": "0edd02a742106f4e9f91c748131ca942d75044b73cb9365ee0ac13b4ed82d7ba",
+        "evidence_scope": "tuning_only_not_unbiased_final_evidence",
     }
 
 

@@ -38,8 +38,10 @@ from src.churn_ml.research_v2_config import (
     ROOT_KEYS,
     SAFE_SLUG,
     SECTION_KEYS,
+    ResearchV2ConfigurationError,
     _load_mapping as load_research_v2_plan_mapping,
     _repo_path as resolve_research_v2_repository_path,
+    _validate_search_provenance,
     load_research_v2_config,
 )
 from src.churn_ml.research_v2_identity import (
@@ -382,7 +384,10 @@ def _validate_research_resolved_config(
     repository_root: Path,
 ) -> dict[str, Any]:
     """Apply the production v2 loader contract to a persisted resolved payload."""
-    _exact_keys(config, ROOT_KEYS | {"evaluation_plan"}, "research resolved config")
+    base_keys = ROOT_KEYS | {"evaluation_plan"}
+    actual_keys = set(config)
+    if actual_keys not in (base_keys, base_keys | {"search_provenance"}):
+        _exact_keys(config, base_keys, "research resolved config")
     payload = {key: value for key, value in config.items() if key != "evaluation_plan"}
     for name, keys in SECTION_KEYS.items():
         section = _mapping(payload.get(name), f"research config {name}")
@@ -501,6 +506,13 @@ def _validate_research_resolved_config(
         raise FailedLifecycleError("Research model persistence must be disabled")
     if _mapping(payload["tracking"], "research tracking")["enabled"] is not False:
         raise FailedLifecycleError("Research tracking must remain disabled")
+    if "search_provenance" in payload:
+        try:
+            _validate_search_provenance(payload["search_provenance"])
+        except ResearchV2ConfigurationError as error:
+            raise FailedLifecycleError(
+                f"Research search_provenance differs: {error}"
+            ) from error
     try:
         validate_portable_payload_paths(
             config,

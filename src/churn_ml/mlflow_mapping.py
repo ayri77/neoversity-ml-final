@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Mapping
 
+import pandas as pd
+
 from src.churn_ml.mlflow_artifacts import IndexedArtifact
 
 
@@ -17,6 +19,44 @@ SourceType = str
 TerminalStatus = Literal["completed", "failed"]
 MLflowTerminalStatus = Literal["FINISHED", "FAILED"]
 SOURCE_KEY_SCHEMA_VERSION = 3
+_AUTOGLUON_HIGHER_IS_BETTER = frozenset(
+    {
+        "accuracy",
+        "average_precision",
+        "balanced_accuracy",
+        "f1",
+        "f1_macro",
+        "f1_micro",
+        "f1_weighted",
+        "mcc",
+        "precision",
+        "precision_macro",
+        "precision_micro",
+        "precision_weighted",
+        "r2",
+        "recall",
+        "recall_macro",
+        "recall_micro",
+        "recall_weighted",
+        "roc_auc",
+        "roc_auc_ovo_macro",
+    }
+)
+_AUTOGLUON_LOWER_IS_BETTER = frozenset(
+    {
+        "log_loss",
+        "mae",
+        "mape",
+        "mean_absolute_error",
+        "mean_squared_error",
+        "median_absolute_error",
+        "mse",
+        "rmse",
+        "root_mean_squared_error",
+        "root_mean_squared_percentage_error",
+        "symmetric_mean_absolute_percentage_error",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -59,9 +99,30 @@ class IndexedRun:
         return canonical_sha256(self.source_key_payload)
 
     @property
+    def run_name(self) -> str:
+        """Return the deterministic MLflow UI run name for this source."""
+        return deterministic_mlflow_run_name(
+            source_type=self.source_type,
+            source_run_id=self.source_run_id,
+            adapter_id=self.params.get("adapter_id"),
+        )
+
+    @property
     def artifact_relative_paths(self) -> tuple[str, ...]:
         """Return portable paths for display and compatibility."""
         return tuple(artifact.relative_path for artifact in self.artifacts)
+
+
+def deterministic_mlflow_run_name(
+    *,
+    source_type: str,
+    source_run_id: str,
+    adapter_id: Any = None,
+) -> str:
+    """Build the stable MLflow run name from portable source identity fields."""
+    if source_type == "research_v2" and type(adapter_id) is str and adapter_id:
+        return f"{adapter_id}__{source_run_id}"
+    return source_run_id
 
 
 def canonical_sha256(value: Any) -> str:
@@ -292,7 +353,17 @@ def build_autogluon_mapping(
         reason = status.get("failure_reason")
         if type(reason) is str:
             tags["failure_reason"] = reason[:5000]
-    if terminal_status == "completed":
+    if completion_is_valid:
+        quality = _autogluon_quality_fields(
+            run_dir=run_dir,
+            inspection=inspection,
+            completion=completion,
+        )
+        for key, value in quality["metrics"].items():
+            metrics[key] = value
+        for key, value in quality["params"].items():
+            params[key] = value
+        tags.update(quality["tags"])
         tags["effective_seed_status"] = str(
             inspection.get("effective_seed_status", "unknown")
         )
@@ -309,6 +380,118 @@ def build_autogluon_mapping(
         artifacts=artifacts,
         local_source_path=run_dir,
     )
+
+
+def _autogluon_quality_fields(
+    *,
+    run_dir: Path,
+    inspection: Mapping[str, Any],
+    completion: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Map native AutoGluon inspection quality for the exported best model only."""
+    metrics: dict[str, float] = {}
+    params: dict[str, Any] = {}
+    tags: dict[str, str] = {}
+    best_model = inspection.get("best_model")
+    if type(best_model) is not str or not best_model:
+        best_model = completion.get("best_model")
+    if type(best_model) is not str or not best_model:
+        return {"metrics": metrics, "params": params, "tags": tags}
+    tags["best_model"] = best_model
+    row = _best_model_leaderboard_row(
+        run_dir=run_dir,
+        inspection=inspection,
+        best_model=best_model,
+    )
+    if row is None:
+        return {"metrics": metrics, "params": params, "tags": tags}
+    _metric(metrics, "score_val", row.get("score_val"))
+    _metric(metrics, "best_model_fit_time_seconds", row.get("fit_time"))
+    _metric(metrics, "best_model_pred_time_val_seconds", row.get("pred_time_val"))
+    eval_metric = row.get("eval_metric")
+    if type(eval_metric) is not str or not eval_metric:
+        eval_metric = inspection.get("eval_metric")
+    if type(eval_metric) is str and eval_metric:
+        params["eval_metric"] = eval_metric
+        direction = _autogluon_metric_direction(eval_metric)
+        if direction is not None:
+            tags["metric_direction"] = direction
+    return {"metrics": metrics, "params": params, "tags": tags}
+
+
+def _best_model_leaderboard_row(
+    *,
+    run_dir: Path,
+    inspection: Mapping[str, Any],
+    best_model: str,
+) -> dict[str, Any] | None:
+    summary_rows = _leaderboard_rows(inspection.get("leaderboard"))
+    summary_row = _row_for_model(summary_rows, best_model)
+    csv_path = run_dir / "inspection" / "leaderboard.csv"
+    csv_rows = _read_leaderboard_csv(csv_path) if csv_path.is_file() else ()
+    csv_row = _row_for_model(csv_rows, best_model)
+    if summary_row is not None and csv_row is not None:
+        for key in ("score_val", "fit_time", "pred_time_val", "eval_metric"):
+            left = summary_row.get(key)
+            right = csv_row.get(key)
+            if left is None or right is None:
+                continue
+            if type(left) is str or type(right) is str:
+                if str(left) != str(right):
+                    return None
+                continue
+            left_number = _finite_float(left)
+            right_number = _finite_float(right)
+            if left_number is None or right_number is None:
+                return None
+            if not math.isclose(left_number, right_number, rel_tol=0.0, abs_tol=0.0):
+                return None
+        return summary_row
+    if summary_row is not None:
+        return summary_row
+    return csv_row
+
+
+def _leaderboard_rows(value: Any) -> tuple[dict[str, Any], ...]:
+    if type(value) is not list:
+        return ()
+    rows: list[dict[str, Any]] = []
+    for item in value:
+        if type(item) is dict:
+            rows.append(item)
+    return tuple(rows)
+
+
+def _row_for_model(
+    rows: tuple[dict[str, Any], ...],
+    best_model: str,
+) -> dict[str, Any] | None:
+    matches = [row for row in rows if row.get("model") == best_model]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _read_leaderboard_csv(path: Path) -> tuple[dict[str, Any], ...]:
+    try:
+        frame = pd.read_csv(path)
+    except (OSError, UnicodeError, ValueError, pd.errors.ParserError):
+        return ()
+    if "model" not in frame.columns:
+        return ()
+    rows: list[dict[str, Any]] = []
+    for record in frame.to_dict(orient="records"):
+        if type(record) is dict:
+            rows.append(record)
+    return tuple(rows)
+
+
+def _autogluon_metric_direction(eval_metric: str) -> str | None:
+    if eval_metric in _AUTOGLUON_HIGHER_IS_BETTER:
+        return "higher_is_better"
+    if eval_metric in _AUTOGLUON_LOWER_IS_BETTER:
+        return "lower_is_better"
+    return None
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:

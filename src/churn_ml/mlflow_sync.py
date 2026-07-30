@@ -242,7 +242,11 @@ def _sync_one(client: Any, experiment_id: str, record: IndexedRun) -> SyncItem:
         "mlflow_index.source_identity": record.source_identity,
         "mlflow_index.source_relative_path": record.source_relative_path,
     }
-    expected_tags = {**record.tags, **immutable_tags}
+    expected_tags = {
+        **record.tags,
+        **immutable_tags,
+        "mlflow.runName": record.run_name,
+    }
     expected_params = {
         key: _parameter_value(value) for key, value in sorted(record.params.items())
     }
@@ -288,7 +292,13 @@ def _sync_one(client: Any, experiment_id: str, record: IndexedRun) -> SyncItem:
             "mlflow_index.sync_complete": "false",
             "mlflow_index.local_source_path_nonportable": str(record.local_source_path),
         }
-        run_id = str(client.create_run(experiment_id, tags=initial_tags).info.run_id)
+        run_id = str(
+            client.create_run(
+                experiment_id,
+                tags=initial_tags,
+                run_name=record.run_name,
+            ).info.run_id
+        )
         created = True
 
     try:
