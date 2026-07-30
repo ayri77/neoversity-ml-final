@@ -30,6 +30,8 @@ data/processed/*
 !data/raw/.gitkeep
 !data/interim/.gitkeep
 !data/processed/.gitkeep
+data/orange_small_reference/*
+!data/orange_small_reference/.gitkeep
 
 # Experiment artifacts
 artifacts/
