@@ -20,6 +20,11 @@ from src.churn_ml.dataset_registry.errors import (
     OverwriteRefusedError,
     UnverifiableAlignmentError,
 )
+from src.churn_ml.dataset_registry.experiment_discovery import (
+    RegisteredDatasetSummary,
+    build_dataset_provenance,
+    discover_registered_datasets,
+)
 from src.churn_ml.dataset_registry.materialize import dataset_manifest_sha256
 from src.churn_ml.dataset_registry.schema import (
     SCHEMA_VERSION,
@@ -36,10 +41,13 @@ __all__ = [
     "DatasetRegistryError",
     "FeatureSpec",
     "OverwriteRefusedError",
+    "RegisteredDatasetSummary",
     "TargetSpec",
     "UnverifiableAlignmentError",
     "ValidationResult",
+    "build_dataset_provenance",
     "dataset_manifest_sha256",
+    "discover_registered_datasets",
     "list_dataset_packages",
     "load_dataset_manifest",
     "native_build_spec",

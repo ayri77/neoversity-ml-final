@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
 import pandas as pd
 
@@ -12,9 +13,15 @@ from src.churn_ml.experiment_v2_contract import (
     first_exact_difference,
 )
 from src.churn_ml.experiment_v2_schema import FeatureSchema
+from src.churn_ml.target_encoding import (
+    categorical_feature_names,
+    numerical_feature_names,
+    unsupported_feature_names,
+)
 
 
 MANUAL_V3_PIPELINE_V1_COMPAT = "manual_v3_pipeline_v1_compat"
+REGISTERED_PREPARED_PASSTHROUGH_V1 = "registered_prepared_passthrough_v1"
 
 EXPECTED_DROPS = ["Var214", "Var220", "Var222", "Var218_is_missing"]
 EXPECTED_CATEGORICAL = [
@@ -66,6 +73,12 @@ EXPECTED_PIPELINE_CONTRACT = {
     ),
 }
 
+REGISTERED_PREPARED_PASSTHROUGH_CONTRACT = {
+    "mode": "registry_prepared_passthrough_v1",
+    "drop": [],
+    "keep_all_features": True,
+}
+
 
 class ExperimentV2PipelineContractError(ExperimentV2ContractError):
     """Raised when a v2 feature pipeline violates its frozen contract."""
@@ -75,6 +88,51 @@ class ExperimentV2PipelineContractError(ExperimentV2ContractError):
 class PipelineOutput:
     features: pd.DataFrame
     schema: FeatureSchema
+
+
+def _transformed_feature_name_sources(
+    *,
+    numerical: Sequence[str],
+    categorical: Sequence[str],
+) -> dict[str, list[str]]:
+    """Map each transformed name to the source features that produce it."""
+    sources: dict[str, list[str]] = {}
+    for name in numerical:
+        sources.setdefault(name, []).append(
+            f"passthrough numeric/bool source feature {name!r}"
+        )
+    for name in categorical:
+        transformed = f"{name}__te"
+        sources.setdefault(transformed, []).append(
+            f"target-encoded categorical source feature {name!r}"
+        )
+    return sources
+
+
+def _reject_transformed_feature_name_collisions(
+    *,
+    transformed: Sequence[str],
+    numerical: Sequence[str],
+    categorical: Sequence[str],
+) -> None:
+    """Fail closed when transformed feature names are not unique."""
+    counts = Counter(transformed)
+    colliding = sorted(name for name, count in counts.items() if count > 1)
+    if not colliding:
+        return
+    sources = _transformed_feature_name_sources(
+        numerical=numerical,
+        categorical=categorical,
+    )
+    details = [
+        f"{name!r} <- {'; '.join(sources.get(name, ['unknown source']))}"
+        for name in colliding
+    ]
+    raise ExperimentV2PipelineContractError(
+        "registered_prepared_passthrough_v1 transformed feature names collide: "
+        + "; ".join(details)
+        + "."
+    )
 
 
 class FeaturePipeline(Protocol):
@@ -120,17 +178,9 @@ class ManualV3PipelineV1Compat:
                 f"feature_pipeline.input.drop features are missing: {missing}."
             )
         model_features = features.drop(columns=drops)
-        categorical = model_features.select_dtypes(
-            include=["object", "category"]
-        ).columns.tolist()
-        numerical = model_features.select_dtypes(
-            include=["number", "bool"]
-        ).columns.tolist()
-        unsupported = [
-            name
-            for name in model_features.columns
-            if name not in categorical and name not in numerical
-        ]
+        categorical = categorical_feature_names(model_features)
+        numerical = numerical_feature_names(model_features)
+        unsupported = unsupported_feature_names(model_features)
         if unsupported:
             raise ExperimentV2PipelineContractError(
                 f"feature_pipeline.input has unsupported dtypes: {unsupported}."
@@ -169,8 +219,79 @@ class ManualV3PipelineV1Compat:
         return {"id": self.id, "contract": deepcopy(dict(contract))}
 
 
+class RegisteredPreparedPassthroughV1:
+    """
+    Preserve a Registry-validated prepared dataset without feature mutation.
+
+    Categorical detection includes object, category, and pandas string dtypes.
+    Transformed names follow the numeric adapter's fold-local TE naming rule.
+    """
+
+    id = REGISTERED_PREPARED_PASSTHROUGH_V1
+
+    def validate_contract(self, contract: Mapping[str, Any]) -> None:
+        difference = first_exact_difference(
+            contract,
+            REGISTERED_PREPARED_PASSTHROUGH_CONTRACT,
+            "feature_pipeline.contract",
+        )
+        if difference is not None:
+            raise ExperimentV2PipelineContractError(difference)
+
+    def transform(
+        self,
+        features: pd.DataFrame,
+        contract: Mapping[str, Any],
+    ) -> PipelineOutput:
+        self.validate_contract(contract)
+        drops = list(contract["drop"])
+        if drops:
+            raise ExperimentV2PipelineContractError(
+                "registered_prepared_passthrough_v1 must not drop features."
+            )
+        if not bool(contract["keep_all_features"]):
+            raise ExperimentV2PipelineContractError(
+                "registered_prepared_passthrough_v1 must keep all features."
+            )
+        model_features = features.copy()
+        categorical = categorical_feature_names(model_features)
+        numerical = numerical_feature_names(model_features)
+        unsupported = unsupported_feature_names(model_features)
+        if unsupported:
+            raise ExperimentV2PipelineContractError(
+                "registered_prepared_passthrough_v1 has unsupported dtypes: "
+                f"{unsupported}."
+            )
+        if set(categorical) | set(numerical) != set(model_features.columns):
+            raise ExperimentV2PipelineContractError(
+                "registered_prepared_passthrough_v1 feature partition is incomplete."
+            )
+        transformed = numerical + [f"{name}__te" for name in categorical]
+        _reject_transformed_feature_name_collisions(
+            transformed=transformed,
+            numerical=numerical,
+            categorical=categorical,
+        )
+        schema = FeatureSchema(
+            source_feature_names=features.columns.tolist(),
+            dropped_features=[],
+            model_feature_names=model_features.columns.tolist(),
+            categorical_features=categorical,
+            numerical_features=numerical,
+            transformed_feature_names=transformed,
+        )
+        return PipelineOutput(features=model_features, schema=schema)
+
+    def identity_inputs(self, contract: Mapping[str, Any]) -> dict[str, Any]:
+        self.validate_contract(contract)
+        return {"id": self.id, "contract": deepcopy(dict(contract))}
+
+
 _PIPELINES: Mapping[str, FeaturePipeline] = MappingProxyType(
-    {MANUAL_V3_PIPELINE_V1_COMPAT: ManualV3PipelineV1Compat()}
+    {
+        MANUAL_V3_PIPELINE_V1_COMPAT: ManualV3PipelineV1Compat(),
+        REGISTERED_PREPARED_PASSTHROUGH_V1: RegisteredPreparedPassthroughV1(),
+    }
 )
 
 

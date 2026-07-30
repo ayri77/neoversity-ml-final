@@ -7,6 +7,61 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 
+_CATEGORICAL_DTYPE_PREFIXES = ("object", "category", "string")
+_NUMERIC_DTYPE_PREFIXES = (
+    "int",
+    "uint",
+    "float",
+    "bool",
+    "boolean",
+    "Float",
+    "Int",
+    "UInt",
+)
+
+
+def _is_categorical_dtype_name(dtype: str) -> bool:
+    text = str(dtype)
+    return any(
+        text == prefix or text.startswith(f"{prefix}[")
+        for prefix in _CATEGORICAL_DTYPE_PREFIXES
+    )
+
+
+def _is_numeric_or_bool_dtype_name(dtype: str) -> bool:
+    text = str(dtype)
+    if text in {"bool", "boolean"}:
+        return True
+    return any(text.startswith(prefix) for prefix in _NUMERIC_DTYPE_PREFIXES)
+
+
+def categorical_feature_names(frame: pd.DataFrame) -> list[str]:
+    """Return source-ordered categorical columns including pandas string dtype."""
+    return [
+        name
+        for name, dtype in frame.dtypes.items()
+        if _is_categorical_dtype_name(str(dtype))
+    ]
+
+
+def numerical_feature_names(frame: pd.DataFrame) -> list[str]:
+    """Return source-ordered numeric/bool columns."""
+    return [
+        name
+        for name, dtype in frame.dtypes.items()
+        if _is_numeric_or_bool_dtype_name(str(dtype))
+    ]
+
+
+def unsupported_feature_names(frame: pd.DataFrame) -> list[str]:
+    categorical = set(categorical_feature_names(frame))
+    numerical = set(numerical_feature_names(frame))
+    return [
+        name
+        for name in frame.columns
+        if name not in categorical and name not in numerical
+    ]
+
 
 @dataclass
 class AutoGluonBinaryOOFTargetEncoder:
@@ -27,9 +82,7 @@ class AutoGluonBinaryOOFTargetEncoder:
         X: pd.DataFrame,
         y: pd.Series,
     ) -> pd.DataFrame:
-        self.categorical_columns_ = X.select_dtypes(
-            include=["object", "category"]
-        ).columns.tolist()
+        self.categorical_columns_ = categorical_feature_names(X)
 
         self.passthrough_columns_ = [
             column

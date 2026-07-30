@@ -46,7 +46,10 @@ TRAIN_PATH = PROJECT_ROOT / "data/processed/v3_targeted_missingness/X_train.parq
 
 
 def test_registries_are_explicit_read_only_and_reject_unknown_ids() -> None:
-    assert set(feature_pipeline_registry()) == {"manual_v3_pipeline_v1_compat"}
+    assert set(feature_pipeline_registry()) == {
+        "manual_v3_pipeline_v1_compat",
+        "registered_prepared_passthrough_v1",
+    }
     assert set(candidate_adapter_registry()) == {
         "manual_lightgbm_te_v1_compat",
         "xgboost_numeric_v1",

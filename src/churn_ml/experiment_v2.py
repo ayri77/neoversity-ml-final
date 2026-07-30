@@ -17,6 +17,7 @@ from src.churn_ml.experiment_v2_model_registry import (
 )
 from src.churn_ml.experiment_v2_pipeline import (
     MANUAL_V3_PIPELINE_V1_COMPAT,
+    REGISTERED_PREPARED_PASSTHROUGH_V1,
     ExperimentV2PipelineContractError,
     FeaturePipeline,
     PipelineOutput,
@@ -29,6 +30,7 @@ from src.churn_ml.experiment_v2_xgboost_adapter import XGBOOST_NUMERIC_V1
 __all__ = [
     "MANUAL_LIGHTGBM_TE_V1_COMPAT",
     "MANUAL_V3_PIPELINE_V1_COMPAT",
+    "REGISTERED_PREPARED_PASSTHROUGH_V1",
     "CATBOOST_NUMERIC_V1",
     "XGBOOST_NUMERIC_V1",
     "CandidateAdapter",

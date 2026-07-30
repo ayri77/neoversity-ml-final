@@ -95,11 +95,13 @@ class ResearchV2ArtifactStore:
         fingerprints: dict[str, Any],
         feature_schema: dict[str, Any],
         assignments: EvaluationAssignments,
+        dataset_provenance: Mapping[str, Any],
     ) -> None:
         self.write_json("run_metadata.json", metadata)
         for name, payload in identities.items():
             self.write_json(f"identities/{name}.json", payload)
         self.write_json("dataset_fingerprints.json", fingerprints)
+        self.write_json("dataset_provenance.json", dict(dataset_provenance))
         self.write_json("feature_schema.json", feature_schema)
         assignments.outer.to_parquet(
             self.root / "splits/outer_assignments.parquet", index=False

@@ -270,6 +270,7 @@ def build_production_loader_fixture(
         "competition_assets_accessed": False,
         "tracking_enabled": False,
         "run_id": store.run_id,
+        "dataset_provenance": training.dataset_provenance,
     }
     store.save_initial(
         metadata=metadata,
@@ -277,6 +278,7 @@ def build_production_loader_fixture(
         fingerprints=training.fingerprints,
         feature_schema=training.pipeline_output.schema.to_dict(),
         assignments=assignments,
+        dataset_provenance=training.dataset_provenance,
     )
 
     def fit_predict(

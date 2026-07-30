@@ -75,6 +75,7 @@ def build_persisted_v2_test_run(
         fingerprints=prepared.data.fingerprints,
         feature_schema=prepared.data.pipeline_output.schema.to_dict(),
         assignments=prepared.assignments,
+        dataset_provenance=prepared.data.dataset_provenance,
     )
     adapter = DeterministicV2TestAdapter()
 
@@ -160,4 +161,5 @@ def build_v2_metadata(
         "competition_assets_accessed": False,
         "tracking_enabled": False,
         "run_id": store.run_id,
+        "dataset_provenance": prepared.data.dataset_provenance,
     }

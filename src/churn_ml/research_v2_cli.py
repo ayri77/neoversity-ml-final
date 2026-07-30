@@ -158,6 +158,7 @@ def execute(
         "git": collect_git_state(PROJECT_ROOT),
         "competition_assets_accessed": False,
         "tracking_enabled": False,
+        "dataset_provenance": prepared.data.dataset_provenance,
     }
     store: ResearchV2ArtifactStore | None = None
     try:
@@ -176,6 +177,7 @@ def execute(
             fingerprints=prepared.data.fingerprints,
             feature_schema=prepared.data.pipeline_output.schema.to_dict(),
             assignments=prepared.assignments,
+            dataset_provenance=prepared.data.dataset_provenance,
         )
         print(f"Run directory: {store.root}")
 

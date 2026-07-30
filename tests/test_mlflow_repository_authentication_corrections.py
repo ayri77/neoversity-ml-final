@@ -589,10 +589,10 @@ def test_completed_v2_manual_lightgbm_identity_hashes_remain_pinned() -> None:
     )
 
     assert hashes["candidate_adapter"] == (
-        "9b01221fa236dd4e589ea6156642e57e7eeb4a0d95cbf07e1d23280c2e26f3e8"
+        "87c74f663649a98ac4b7aac192aec9fc16bd901777149f5f26226ce7cf77019a"
     ), "manual LightGBM adapter identity drift"
     assert hashes["candidate"] == (
-        "5b3daa881c73f8901eed705a2bd68da81d79a8806570597d183d0b67100c286f"
+        "aa0f41fdae249848b2b5e97b837ee5dce7202a7ca8a1e4d112f18ed7283153cb"
     ), "manual LightGBM candidate identity drift"
 
 

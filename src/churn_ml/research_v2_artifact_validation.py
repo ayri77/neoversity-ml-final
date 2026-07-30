@@ -196,6 +196,13 @@ def validate_research_v2_run(
         data.fingerprints,
         "dataset fingerprints",
     )
+    provenance = _read_json(root / "dataset_provenance.json")
+    _assert_json_equal(
+        provenance,
+        data.dataset_provenance,
+        "dataset provenance",
+    )
+    _validate_dataset_provenance(provenance, data.fingerprints, metadata)
     feature_schema = _read_json(root / "feature_schema.json")
     _assert_json_equal(
         feature_schema,
@@ -378,6 +385,7 @@ def _validate_terminal_records(
         "run_id",
         "finished_at_utc",
         "evaluation_duration_seconds",
+        "dataset_provenance",
     }
     if set(metadata) != required_metadata:
         raise ResearchV2SemanticValidationError(
@@ -589,6 +597,55 @@ def _validate_feature_schema(schema: Mapping[str, Any]) -> None:
             raise ResearchV2SemanticValidationError(
                 f"{label} ordered feature schema hash differs."
             )
+
+
+def _validate_dataset_provenance(
+    provenance: Mapping[str, Any],
+    fingerprints: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> None:
+    required = {
+        "dataset_id",
+        "parent_dataset_id",
+        "hypothesis",
+        "n_features",
+        "schema_hash",
+        "train_content_hash",
+        "target_hash",
+        "target_dependency",
+        "train_row_identity_hash",
+        "registry_schema_version",
+    }
+    missing = sorted(required - set(provenance))
+    if missing:
+        raise ResearchV2SemanticValidationError(
+            f"dataset_provenance is missing keys: {missing}."
+        )
+    if provenance.get("dataset_id") != fingerprints.get("dataset_version"):
+        raise ResearchV2SemanticValidationError(
+            "dataset_provenance.dataset_id disagrees with fingerprints."
+        )
+    embedded = fingerprints.get("dataset_provenance")
+    if embedded != dict(provenance):
+        raise ResearchV2SemanticValidationError(
+            "dataset_provenance disagrees with fingerprint embedding."
+        )
+    metadata_provenance = metadata.get("dataset_provenance")
+    if metadata_provenance != dict(provenance):
+        raise ResearchV2SemanticValidationError(
+            "run_metadata.dataset_provenance disagrees with dataset_provenance.json."
+        )
+    row_identity = fingerprints.get("row_position_identity")
+    if not isinstance(row_identity, Mapping):
+        raise ResearchV2SemanticValidationError(
+            "fingerprints.row_position_identity is malformed."
+        )
+    bound = row_identity.get("bound_train_row_identity_hash")
+    train_hash = provenance.get("train_row_identity_hash")
+    if train_hash is not None and bound != train_hash:
+        raise ResearchV2SemanticValidationError(
+            "row_position identity is not bound to train_row_identity_hash."
+        )
 
 
 def _validate_prediction_assignments(
@@ -904,6 +961,7 @@ def _required_artifact_paths(config: ResearchV2Config) -> set[str]:
         "run_metadata.json",
         "execution_status.json",
         "dataset_fingerprints.json",
+        "dataset_provenance.json",
         "feature_schema.json",
         "identities/evaluation_plan.json",
         "identities/feature_pipeline.json",
