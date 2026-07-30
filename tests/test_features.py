@@ -13,6 +13,9 @@ from src.churn_ml.features import (
     save_dataset,
     select_supported_zero_features,
     deduplicate_zero_mask_features,
+    add_missingness_pattern_feature,
+    deduplicate_missingness_mask_features,
+    add_selected_zero_indicators,
 )
 
 
@@ -218,3 +221,107 @@ def test_deduplicate_zero_mask_features() -> None:
         ["feature_c"],
         ["feature_d"],
     ]
+
+
+def test_deduplicate_missingness_mask_features() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "feature_a": [1.0, None, 3.0, None],
+            "feature_b": ["a", None, "b", None],
+            "feature_c": [None, 2.0, 3.0, None],
+            "feature_d": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+
+    representatives, groups = deduplicate_missingness_mask_features(
+        dataframe,
+        features=[
+            "feature_a",
+            "feature_b",
+            "feature_c",
+            "feature_d",
+        ],
+    )
+
+    assert representatives == [
+        "feature_a",
+        "feature_c",
+        "feature_d",
+    ]
+
+    assert groups == [
+        ["feature_a", "feature_b"],
+        ["feature_c"],
+        ["feature_d"],
+    ]
+
+
+def test_add_missingness_pattern_feature() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "feature_a": [1.0, None, None],
+            "feature_b": [None, None, 2.0],
+            "feature_c": [10, 20, 30],
+        }
+    )
+
+    result = add_missingness_pattern_feature(
+        dataframe,
+        source_features=[
+            "feature_a",
+            "feature_b",
+        ],
+    )
+
+    assert list(result["missingness_pattern_id"]) == [
+        "02",
+        "03",
+        "01",
+    ]
+
+    assert str(result["missingness_pattern_id"].dtype) == "string"
+
+    pd.testing.assert_frame_equal(
+        result[dataframe.columns],
+        dataframe,
+    )
+
+
+def test_add_selected_zero_indicators() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "feature_a": [0.0, 1.0, None, -1.0],
+            "feature_b": [2, 0, 3, 0],
+            "other_feature": ["a", "b", "c", "d"],
+        }
+    )
+
+    result = add_selected_zero_indicators(
+        dataframe,
+        indicator_features=[
+            "feature_a",
+            "feature_b",
+        ],
+    )
+
+    assert result["feature_a_is_zero"].tolist() == [
+        1,
+        0,
+        0,
+        0,
+    ]
+
+    assert result["feature_b_is_zero"].tolist() == [
+        0,
+        1,
+        0,
+        1,
+    ]
+
+    assert str(result["feature_a_is_zero"].dtype) == "int8"
+    assert str(result["feature_b_is_zero"].dtype) == "int8"
+
+    pd.testing.assert_frame_equal(
+        result[dataframe.columns],
+        dataframe,
+    )

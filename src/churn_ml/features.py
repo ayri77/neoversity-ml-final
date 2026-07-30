@@ -9,6 +9,7 @@ import subprocess
 from typing import Any, Literal
 
 import pandas as pd
+import numpy as np
 
 
 TargetDependency = Literal[
@@ -731,3 +732,153 @@ def load_dataset(
                 raise ValueError(f"Dataset manifest validation failed for '{field}'.")
 
     return dataset
+
+
+def deduplicate_missingness_mask_features(
+    dataframe: pd.DataFrame,
+    *,
+    features: Sequence[str],
+) -> tuple[list[str], list[list[str]]]:
+    """
+    Group features with identical missingness masks.
+
+    The first feature in each group is retained as the
+    representative. The operation does not use the target.
+    """
+    feature_list = list(features)
+
+    if not feature_list:
+        raise ValueError("features must contain at least one column.")
+
+    if len(feature_list) != len(set(feature_list)):
+        raise ValueError("features must not contain duplicate column names.")
+
+    missing_features = [
+        column for column in feature_list if column not in dataframe.columns
+    ]
+
+    if missing_features:
+        raise KeyError(f"Missing missingness-mask source columns: {missing_features}")
+
+    missing_masks = dataframe[feature_list].isna()
+
+    groups: list[list[str]] = []
+
+    for column in feature_list:
+        for group in groups:
+            representative = group[0]
+
+            if missing_masks[column].equals(missing_masks[representative]):
+                group.append(column)
+                break
+        else:
+            groups.append([column])
+
+    representatives = [group[0] for group in groups]
+
+    return representatives, groups
+
+
+def add_missingness_pattern_feature(
+    dataframe: pd.DataFrame,
+    *,
+    source_features: Sequence[str],
+    feature_name: str = "missingness_pattern_id",
+) -> pd.DataFrame:
+    """
+    Add a deterministic categorical identifier for the exact
+    row-level missingness pattern.
+
+    The pattern is calculated from a fixed ordered source-feature
+    list and does not use the target.
+    """
+    feature_list = list(source_features)
+
+    if not feature_list:
+        raise ValueError("source_features must contain at least one column.")
+
+    if len(feature_list) != len(set(feature_list)):
+        raise ValueError("source_features must not contain duplicate columns.")
+
+    missing_features = [
+        column for column in feature_list if column not in dataframe.columns
+    ]
+
+    if missing_features:
+        raise KeyError(f"Missing pattern source columns: {missing_features}")
+
+    if feature_name in dataframe.columns:
+        raise ValueError(f"Feature already exists: {feature_name}")
+
+    missing_matrix = dataframe[feature_list].isna().to_numpy(dtype="uint8")
+
+    packed_patterns = np.packbits(
+        missing_matrix,
+        axis=1,
+        bitorder="little",
+    )
+
+    pattern_values = [packed_row.tobytes().hex() for packed_row in packed_patterns]
+
+    result = dataframe.copy()
+
+    result[feature_name] = pd.Series(
+        pattern_values,
+        index=result.index,
+        dtype="string",
+    )
+
+    return result
+
+
+def add_selected_zero_indicators(
+    dataframe: pd.DataFrame,
+    *,
+    indicator_features: Sequence[str],
+) -> pd.DataFrame:
+    """
+    Add binary zero-value indicators for selected numeric features.
+
+    Missing values are treated as not zero. The feature list must
+    be selected using training data and then applied unchanged to
+    validation and test data.
+    """
+    feature_list = list(indicator_features)
+
+    if not feature_list:
+        raise ValueError("indicator_features must contain at least one column.")
+
+    if len(feature_list) != len(set(feature_list)):
+        raise ValueError("indicator_features must not contain duplicate columns.")
+
+    missing_source_columns = [
+        column for column in feature_list if column not in dataframe.columns
+    ]
+
+    if missing_source_columns:
+        raise KeyError(
+            f"Missing zero-indicator source columns: {missing_source_columns}"
+        )
+
+    non_numeric_features = [
+        column
+        for column in feature_list
+        if not pd.api.types.is_numeric_dtype(dataframe[column])
+    ]
+
+    if non_numeric_features:
+        raise TypeError(
+            f"Zero-indicator source columns must be numeric: {non_numeric_features}"
+        )
+
+    result = dataframe.copy()
+
+    for column in feature_list:
+        indicator_column = f"{column}_is_zero"
+
+        if indicator_column in result.columns:
+            raise ValueError(f"Generated column already exists: {indicator_column}")
+
+        result[indicator_column] = dataframe[column].eq(0).astype("int8")
+
+    return result
