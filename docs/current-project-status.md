@@ -12,7 +12,9 @@ the post-notebook audit before starting any model campaign. The Experiment
 Control Panel now supports a Registry-backed dataset-driven Experiment Core
 entry mode (prepare local config/plan, then Validate/Run) and end-to-end
 dataset-identity visibility across jobs, Results/Compare, and the optional
-MLflow searchable mirror.
+MLflow searchable mirror. Dashboard/Jobs use a restart-safe two-argument job
+label contract; official Paired Comparison readiness uses the authoritative
+compatibility loader rather than lightweight display tokens.
 
 ## 1. Purpose and maintenance policy
 

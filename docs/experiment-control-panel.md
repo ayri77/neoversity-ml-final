@@ -292,8 +292,25 @@ New Experiment Core Validate/Run jobs persist `dataset_id`, `experiment_id`,
 `plan_id`, `model_family`, `mode`, and `config` in the existing `job.json`
 `references` map (schema version 2). Values are derived only from the already
 authorized repository-contained config and never influence executable argv.
-Dashboard and Jobs labels include Dataset ID, model, mode, operation, timestamp,
-and a short job id fragment. Old jobs without these keys continue to load.
+Dashboard and Jobs call sites use the two-argument form
+`job_primary_label(job, commands)`. Repository-root resolution has one channel:
+`set_presentation_repository_root` / `presentation_repository_root` in
+`presentation.py`. The app sets that override at import and exposes a thin
+adapter that still accepts HEAD-era `repository_root=` without forwarding it
+into a second mechanism. After changing Control Panel presentation modules,
+fully restart Streamlit from the repository root using the project `.venv`:
+
+```powershell
+uv run --extra ui streamlit run apps/experiment_control_panel.py
+```
+
+### Safe metadata reading
+
+Dataset identity readers validate run roots and metadata files with the shared
+path-safety contract (no symlinks, junctions/reparse points, unsafe ancestors,
+or hard-linked metadata). Unsafe or contradictory preferred provenance fails
+visibly and never silently downgrades to a weaker source. Historical runs are
+never identified by consulting the live `data/processed` Registry.
 
 ### Results workspace
 
@@ -301,24 +318,20 @@ The Experiments table adds Dataset, Parent dataset, Target dependency, and
 Features; Dataset filter and text search include Dataset ID; chart labels and
 hover data include Dataset ID. Inspect shows a compact provenance summary
 (hashes may sit in an expander) and warns when `target_dependency` is
-`exploratory`. Selectors expose Dataset ID in cascade labels.
-
-Historical Experiment Core identity is read from run-local artifacts
-(`dataset_provenance.json` preferred, cross-checked against
-`resolved_config.yaml`, `run_metadata.json`, and `dataset_fingerprints.json`).
-The live `data/processed` Registry is never consulted to label historical runs.
-Conflicts surface as an explicit diagnostic rather than a silent merge.
+`exploratory`. Selectors expose Dataset ID in cascade labels. A read-only
+`scripts/audit_dataset_identity.py` command inventories persisted identity
+without mutating jobs or artifacts and never invents a blanket
+`v0_raw_minimal` mapping.
 
 ### Descriptive compare vs official Paired Comparison
 
 The Results comparison table may show metrics from two different datasets, but
 it always displays left/right Dataset IDs and the fingerprint match flag. When
-datasets differ, the UI labels the view as descriptive only and keeps
-**Prepare Paired Comparison action** disabled. Official Paired Comparison still
-requires completed runs plus the existing authoritative compatibility gate
-(CLI remains the final authority). Saved comparison Inspect views show baseline
-and candidate dataset versions from their reference files without changing the
-paired-comparison artifact schema.
+datasets differ, the UI labels the view as descriptive only. The lightweight
+display tokens alone never enable **Prepare Paired Comparison action**. Official
+readiness loads both completed runs through the validated completed-run loader
+and calls authoritative `build_compatibility_summary()`; the CLI remains the
+final gate. Cross-dataset paired inference is out of scope.
 
 ## MLflow integration
 

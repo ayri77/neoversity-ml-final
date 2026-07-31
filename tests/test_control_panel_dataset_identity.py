@@ -170,8 +170,8 @@ def test_job_labels_include_dataset_and_remain_distinct() -> None:
             "dataset_id": "v0_raw_minimal",
         },
     }
-    left_label = job_primary_label(left, repository_root=PROJECT_ROOT)
-    right_label = job_primary_label(right, repository_root=PROJECT_ROOT)
+    left_label = job_primary_label(left)
+    right_label = job_primary_label(right)
     assert "v7_compact_zero_indicators" in left_label
     assert "v0_raw_minimal" in right_label
     assert left_label != right_label
@@ -189,7 +189,7 @@ def test_old_jobs_without_dataset_reference_still_label() -> None:
             "config": "configs/research_v2/manual_lightgbm_te_v1_compat_smoke.yaml",
         },
     }
-    label = job_primary_label(job, repository_root=PROJECT_ROOT)
+    label = job_primary_label(job)
     assert "LightGBM" in label or "Experiment Core" in label or "Validate" in label
 
 

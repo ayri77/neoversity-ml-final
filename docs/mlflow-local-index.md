@@ -270,7 +270,9 @@ Sync always sets a stable UI name and reconciles it in place via `mlflow.runName
 Lookup identity remains `mlflow_index.source_key`. Renaming or backfilling an
 existing indexed source updates the same MLflow run in place and never allocates
 a second row for the same key. After create or rename reconciliation, a following
-sync is `unchanged`.
+sync is `unchanged`. Never overwrite a recorded `dataset_version` with an
+assumed canonical ID. Dry-run sync reports create/resume/unchanged/rejected
+without allocating storage.
 
 ### Research dataset provenance parameters and tags
 

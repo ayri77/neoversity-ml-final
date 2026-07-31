@@ -441,7 +441,13 @@ def test_compatibility_shown_before_paired_comparison(
         for button in at.button
         if button.label == "Prepare Paired Comparison action"
     )
-    assert prepare.disabled is False
+    # Incomplete synthetic fixtures pass the lightweight display check but must
+    # not authorize the official Paired Comparison action.
+    assert prepare.disabled is True
+    assert any(
+        "Official Paired Comparison readiness" in str(getattr(item, "value", item))
+        for item in at.subheader
+    )
 
 
 def test_cross_dataset_compare_is_descriptive_only(tmp_path: Path) -> None:

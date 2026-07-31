@@ -173,5 +173,7 @@ Generated files stay under `artifacts/ui_configs/` (plans under
 - Results → Experiments lists Dataset, Parent dataset, Target dependency, and
   Features and supports a Dataset filter.
 - Results → Compare shows left/right Dataset IDs. Cross-dataset rows are
-  descriptive only; official Paired Comparison preparation stays disabled until
-  the display compatibility check passes.
+  descriptive only. Official Paired Comparison preparation uses the
+  authoritative compatibility contract (not the lightweight display tokens)
+  and stays disabled until that contract passes. After changing Control Panel
+  presentation modules, fully restart Streamlit.

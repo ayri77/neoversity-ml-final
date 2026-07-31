@@ -3,17 +3,27 @@
 Historical Experiment Core results must be labeled from artifacts that travel
 with the run. This module never consults the live data/processed Registry to
 identify a past run.
+
+Unsafe preferred metadata fails visibly and must not silently downgrade to a
+weaker source.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 import yaml
 
+from src.churn_ml.control_panel.path_safety import (
+    PathSafetyError,
+    path_exists_nonfollowing,
+    require_regular_file,
+    require_safe_directory,
+)
 from src.churn_ml.control_panel.presentation import (
     normalize_mode,
     normalize_model_family,
@@ -27,6 +37,29 @@ _MAX_BYTES = 32 * 1024
 
 class DatasetIdentityConflictError(ValueError):
     """Raised when run-local dataset identities contradict each other."""
+
+
+class DatasetIdentityUnsafeError(ValueError):
+    """Raised when preferred run-local metadata is present but unsafe."""
+
+
+class DatasetIdentityMalformedError(ValueError):
+    """Raised when preferred run-local metadata is present but unreadable."""
+
+
+class MetadataReadStatus(str, Enum):
+    ABSENT = "absent"
+    OK = "ok"
+    UNSAFE = "unsafe"
+    MALFORMED = "malformed"
+    OVERSIZED = "oversized"
+
+
+@dataclass(frozen=True)
+class MetadataReadResult:
+    status: MetadataReadStatus
+    payload: dict[str, Any] | None = None
+    diagnostic: str | None = None
 
 
 @dataclass(frozen=True)
@@ -72,35 +105,64 @@ class ExperimentCoreLaunchIdentity:
 def read_dataset_identity(run_root: Path) -> DatasetIdentityView:
     """Extract dataset identity from a completed (or partial) run directory.
 
-    Preference order when consistent:
+    Preference order when consistent and safe:
     1. ``dataset_provenance.json``
     2. ``run_metadata.json → dataset_provenance``
     3. ``resolved_config.yaml → dataset.version``
     4. ``dataset_fingerprints.json → dataset_version``
 
     Conflicting non-empty identities raise ``DatasetIdentityConflictError``.
+    Unsafe or malformed preferred provenance raises explicitly and must not
+    silently fall back to a weaker source.
     """
-    root = Path(run_root)
+    root = _require_run_root(run_root)
     provenance = _read_json_mapping(root / "dataset_provenance.json")
     metadata = _read_json_mapping(root / "run_metadata.json")
     fingerprints = _read_json_mapping(root / "dataset_fingerprints.json")
     resolved = _read_yaml_mapping(root / "resolved_config.yaml")
 
+    _raise_if_preferred_unusable(
+        "dataset_provenance.json",
+        provenance,
+        preferred=True,
+    )
+
     embedded = None
-    if isinstance(metadata, dict):
-        candidate = metadata.get("dataset_provenance")
+    if metadata.status == MetadataReadStatus.OK and isinstance(metadata.payload, dict):
+        candidate = metadata.payload.get("dataset_provenance")
         if isinstance(candidate, dict):
             embedded = candidate
+    elif metadata.status in {
+        MetadataReadStatus.UNSAFE,
+        MetadataReadStatus.MALFORMED,
+        MetadataReadStatus.OVERSIZED,
+    }:
+        # run_metadata is a preferred cross-check source when provenance is
+        # absent; if provenance exists and is OK we already use it. When
+        # provenance is absent, unsafe run_metadata must not be ignored.
+        if provenance.status == MetadataReadStatus.ABSENT:
+            raise DatasetIdentityUnsafeError(
+                f"Unsafe or unreadable run_metadata.json: {metadata.diagnostic}"
+            )
 
     fingerprint_embedded = None
-    if isinstance(fingerprints, dict):
-        candidate = fingerprints.get("dataset_provenance")
+    if fingerprints.status == MetadataReadStatus.OK and isinstance(
+        fingerprints.payload, dict
+    ):
+        candidate = fingerprints.payload.get("dataset_provenance")
         if isinstance(candidate, dict):
             fingerprint_embedded = candidate
 
+    if provenance.status == MetadataReadStatus.ABSENT and embedded is None:
+        # Prefer provenance file when present; otherwise embedded provenance in
+        # run_metadata is the preferred Registry-backed form.
+        pass
+
     ids: dict[str, str] = {}
-    if isinstance(provenance, dict) and provenance.get("dataset_id"):
-        ids["dataset_provenance.json"] = str(provenance["dataset_id"])
+    if provenance.status == MetadataReadStatus.OK and provenance.payload:
+        dataset_id = provenance.payload.get("dataset_id")
+        if dataset_id:
+            ids["dataset_provenance.json"] = str(dataset_id)
     if isinstance(embedded, dict) and embedded.get("dataset_id"):
         ids["run_metadata.dataset_provenance"] = str(embedded["dataset_id"])
     if isinstance(fingerprint_embedded, dict) and fingerprint_embedded.get(
@@ -109,13 +171,41 @@ def read_dataset_identity(run_root: Path) -> DatasetIdentityView:
         ids["dataset_fingerprints.dataset_provenance"] = str(
             fingerprint_embedded["dataset_id"]
         )
-    resolved_version = _resolved_dataset_version(resolved)
-    if resolved_version:
-        ids["resolved_config.dataset.version"] = resolved_version
+
+    resolved_version = None
+    if resolved.status == MetadataReadStatus.OK:
+        resolved_version = _resolved_dataset_version(resolved.payload)
+        if resolved_version:
+            ids["resolved_config.dataset.version"] = resolved_version
+    elif resolved.status in {
+        MetadataReadStatus.UNSAFE,
+        MetadataReadStatus.MALFORMED,
+        MetadataReadStatus.OVERSIZED,
+    }:
+        if provenance.status == MetadataReadStatus.ABSENT and embedded is None:
+            raise DatasetIdentityUnsafeError(
+                f"Unsafe or unreadable resolved_config.yaml: {resolved.diagnostic}"
+            )
+
     fingerprint_version = None
-    if isinstance(fingerprints, dict) and fingerprints.get("dataset_version"):
-        fingerprint_version = str(fingerprints["dataset_version"])
-        ids["dataset_fingerprints.dataset_version"] = fingerprint_version
+    if fingerprints.status == MetadataReadStatus.OK and fingerprints.payload:
+        if fingerprints.payload.get("dataset_version"):
+            fingerprint_version = str(fingerprints.payload["dataset_version"])
+            ids["dataset_fingerprints.dataset_version"] = fingerprint_version
+    elif fingerprints.status in {
+        MetadataReadStatus.UNSAFE,
+        MetadataReadStatus.MALFORMED,
+        MetadataReadStatus.OVERSIZED,
+    }:
+        if (
+            provenance.status == MetadataReadStatus.ABSENT
+            and embedded is None
+            and resolved_version is None
+        ):
+            raise DatasetIdentityUnsafeError(
+                "Unsafe or unreadable dataset_fingerprints.json: "
+                f"{fingerprints.diagnostic}"
+            )
 
     unique_ids = sorted({value for value in ids.values() if value})
     if len(unique_ids) > 1:
@@ -124,7 +214,11 @@ def read_dataset_identity(run_root: Path) -> DatasetIdentityView:
             "Conflicting run-local dataset identities: " + detail
         )
 
-    primary = _first_mapping(provenance, embedded, fingerprint_embedded)
+    primary = _first_mapping(
+        provenance.payload if provenance.status == MetadataReadStatus.OK else None,
+        embedded,
+        fingerprint_embedded,
+    )
     dataset_id = unique_ids[0] if unique_ids else None
     if primary is not None:
         return DatasetIdentityView(
@@ -180,10 +274,20 @@ def read_dataset_identity(run_root: Path) -> DatasetIdentityView:
 
 
 def read_dataset_identity_safe(run_root: Path) -> DatasetIdentityView:
-    """Like ``read_dataset_identity`` but returns a diagnostic view on conflicts."""
+    """Like ``read_dataset_identity`` but returns a diagnostic view on failures."""
     try:
         return read_dataset_identity(run_root)
-    except DatasetIdentityConflictError as error:
+    except (
+        DatasetIdentityConflictError,
+        DatasetIdentityUnsafeError,
+        DatasetIdentityMalformedError,
+        PathSafetyError,
+    ) as error:
+        source = "conflict"
+        if isinstance(error, DatasetIdentityUnsafeError | PathSafetyError):
+            source = "unsafe"
+        elif isinstance(error, DatasetIdentityMalformedError):
+            source = "malformed"
         return DatasetIdentityView(
             dataset_id=None,
             parent_dataset_id=None,
@@ -195,7 +299,7 @@ def read_dataset_identity_safe(run_root: Path) -> DatasetIdentityView:
             target_hash=None,
             train_row_identity_hash=None,
             registry_schema_version=None,
-            source="conflict",
+            source=source,
             diagnostic=str(error),
         )
 
@@ -208,19 +312,38 @@ def read_config_dataset_version(
     if path is None:
         return None
     payload = _read_yaml_mapping(path)
-    return _resolved_dataset_version(payload)
+    if payload.status != MetadataReadStatus.OK:
+        return None
+    return _resolved_dataset_version(payload.payload)
 
 
-def read_paired_comparison_datasets(comparison_root: Path) -> tuple[str | None, str | None]:
+def read_paired_comparison_datasets(
+    comparison_root: Path,
+) -> tuple[str | None, str | None]:
     """Return (baseline_dataset_version, candidate_dataset_version)."""
-    baseline = _read_json_mapping(comparison_root / "baseline_run_reference.json")
-    candidate = _read_json_mapping(comparison_root / "candidate_run_reference.json")
+    root = _require_run_root(comparison_root)
+    baseline = _read_json_mapping(root / "baseline_run_reference.json")
+    candidate = _read_json_mapping(root / "candidate_run_reference.json")
+    for label, result in (
+        ("baseline_run_reference.json", baseline),
+        ("candidate_run_reference.json", candidate),
+    ):
+        if result.status in {
+            MetadataReadStatus.UNSAFE,
+            MetadataReadStatus.MALFORMED,
+            MetadataReadStatus.OVERSIZED,
+        }:
+            raise DatasetIdentityUnsafeError(
+                f"Unsafe or unreadable {label}: {result.diagnostic}"
+            )
     left = None
     right = None
-    if isinstance(baseline, dict) and baseline.get("dataset_version"):
-        left = str(baseline["dataset_version"])
-    if isinstance(candidate, dict) and candidate.get("dataset_version"):
-        right = str(candidate["dataset_version"])
+    if baseline.status == MetadataReadStatus.OK and baseline.payload:
+        if baseline.payload.get("dataset_version"):
+            left = str(baseline.payload["dataset_version"])
+    if candidate.status == MetadataReadStatus.OK and candidate.payload:
+        if candidate.payload.get("dataset_version"):
+            right = str(candidate.payload["dataset_version"])
     return left, right
 
 
@@ -235,7 +358,10 @@ def extract_experiment_core_launch_identity(
     path = _safe_repo_file(root, relative)
     if path is None:
         return None
-    payload = _read_yaml_mapping(path)
+    payload_result = _read_yaml_mapping(path)
+    if payload_result.status != MetadataReadStatus.OK:
+        return None
+    payload = payload_result.payload
     if not isinstance(payload, dict):
         return None
     dataset = payload.get("dataset")
@@ -292,17 +418,18 @@ def enrich_experiment_core_references(
     return enriched
 
 
-def _plan_id_from_config(repository_root: Path, payload: Mapping[str, Any]) -> str | None:
+def _plan_id_from_config(
+    repository_root: Path, payload: Mapping[str, Any]
+) -> str | None:
     plan_path = payload.get("evaluation_plan_path")
     if isinstance(plan_path, str) and plan_path:
         plan_file = _safe_repo_file(repository_root, plan_path)
         if plan_file is not None:
             plan = _read_yaml_mapping(plan_file)
-            if isinstance(plan, dict):
-                section = plan.get("plan")
+            if plan.status == MetadataReadStatus.OK and isinstance(plan.payload, dict):
+                section = plan.payload.get("plan")
                 if isinstance(section, Mapping) and section.get("id"):
                     return str(section["id"])
-    # Fallback: embedded evaluation_plan in resolved payloads.
     embedded = payload.get("evaluation_plan")
     if isinstance(embedded, Mapping):
         section = embedded.get("plan")
@@ -354,6 +481,32 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
+def _raise_if_preferred_unusable(
+    label: str, result: MetadataReadResult, *, preferred: bool
+) -> None:
+    if not preferred:
+        return
+    if result.status == MetadataReadStatus.UNSAFE:
+        raise DatasetIdentityUnsafeError(
+            f"Unsafe preferred metadata {label}: {result.diagnostic}"
+        )
+    if result.status in {
+        MetadataReadStatus.MALFORMED,
+        MetadataReadStatus.OVERSIZED,
+    }:
+        raise DatasetIdentityMalformedError(
+            f"Unreadable preferred metadata {label}: {result.diagnostic}"
+        )
+
+
+def _require_run_root(run_root: Path) -> Path:
+    root = Path(run_root)
+    try:
+        return require_safe_directory(root)
+    except PathSafetyError as error:
+        raise DatasetIdentityUnsafeError(str(error)) from error
+
+
 def _safe_repo_file(repository_root: Path, relative: str) -> Path | None:
     posix = PurePosixPath(str(relative).replace("\\", "/"))
     if (
@@ -364,31 +517,69 @@ def _safe_repo_file(repository_root: Path, relative: str) -> Path | None:
     ):
         return None
     root = Path(repository_root).resolve()
-    path = (root / Path(*posix.parts)).resolve()
+    path = root.joinpath(*posix.parts)
     try:
-        path.relative_to(root)
+        path.resolve().relative_to(root)
     except ValueError:
         return None
-    if not path.is_file():
+    if not path_exists_nonfollowing(path):
+        return None
+    try:
+        require_regular_file(path, reject_hardlinks=True)
+    except PathSafetyError:
         return None
     return path
 
 
-def _read_json_mapping(path: Path) -> dict[str, Any] | None:
-    try:
-        if not path.is_file() or path.stat().st_size > _MAX_BYTES:
-            return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
+def _read_json_mapping(path: Path) -> MetadataReadResult:
+    return _read_mapping(path, kind="json")
 
 
-def _read_yaml_mapping(path: Path) -> dict[str, Any] | None:
+def _read_yaml_mapping(path: Path) -> MetadataReadResult:
+    return _read_mapping(path, kind="yaml")
+
+
+def _read_mapping(path: Path, *, kind: str) -> MetadataReadResult:
     try:
-        if not path.is_file() or path.stat().st_size > _MAX_BYTES:
-            return None
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError):
-        return None
-    return payload if isinstance(payload, dict) else None
+        if not path_exists_nonfollowing(path):
+            return MetadataReadResult(status=MetadataReadStatus.ABSENT)
+        require_regular_file(path, reject_hardlinks=True)
+    except PathSafetyError as error:
+        return MetadataReadResult(
+            status=MetadataReadStatus.UNSAFE,
+            diagnostic=str(error),
+        )
+    except OSError as error:
+        return MetadataReadResult(
+            status=MetadataReadStatus.UNSAFE,
+            diagnostic=str(error),
+        )
+    try:
+        size = path.lstat().st_size
+    except OSError as error:
+        return MetadataReadResult(
+            status=MetadataReadStatus.UNSAFE,
+            diagnostic=str(error),
+        )
+    if size > _MAX_BYTES:
+        return MetadataReadResult(
+            status=MetadataReadStatus.OVERSIZED,
+            diagnostic=f"{path.name} exceeds {_MAX_BYTES} bytes",
+        )
+    try:
+        text = path.read_text(encoding="utf-8")
+        if kind == "json":
+            payload = json.loads(text)
+        else:
+            payload = yaml.safe_load(text)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, yaml.YAMLError) as error:
+        return MetadataReadResult(
+            status=MetadataReadStatus.MALFORMED,
+            diagnostic=str(error),
+        )
+    if not isinstance(payload, dict):
+        return MetadataReadResult(
+            status=MetadataReadStatus.MALFORMED,
+            diagnostic=f"{path.name} must contain a mapping",
+        )
+    return MetadataReadResult(status=MetadataReadStatus.OK, payload=payload)

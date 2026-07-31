@@ -529,12 +529,39 @@ def format_duration(seconds: float | int | None) -> str:
     return f"{hours}h {minutes}m {secs:02d}s"
 
 
+_PRESENTATION_REPOSITORY_ROOT: Path | None = None
+
+
+def set_presentation_repository_root(root: Path | None) -> None:
+    """Set the sole repository-root override used by presentation helpers."""
+    global _PRESENTATION_REPOSITORY_ROOT
+    _PRESENTATION_REPOSITORY_ROOT = Path(root).resolve() if root is not None else None
+
+
+def presentation_repository_root() -> Path:
+    """Return the active repository root for presentation config fallbacks."""
+    if _PRESENTATION_REPOSITORY_ROOT is not None:
+        return _PRESENTATION_REPOSITORY_ROOT
+    # presentation.py → control_panel → churn_ml → src → repository root
+    return Path(__file__).resolve().parents[3]
+
+
 def job_primary_label(
     record_job: Mapping[str, Any],
     record_commands: dict | None = None,
     *,
     repository_root: Path | None = None,
 ) -> str:
+    """Build a human-readable job label.
+
+    Streamlit call sites use the two-argument form::
+
+        job_primary_label(job, commands)
+
+    Repository root resolution uses ``presentation_repository_root`` only.
+    The optional ``repository_root`` keyword updates that same override so
+    HEAD-era callers do not raise ``TypeError``.
+    """
     try:
         command_id = record_job.get("command_id", "")
         action_id = record_job.get("action_id", "")
@@ -542,7 +569,9 @@ def job_primary_label(
         if not isinstance(references, dict):
             references = {}
         config_path = references.get("config", "")
-        repo = repository_root if repository_root is not None else Path(".")
+        if repository_root is not None:
+            set_presentation_repository_root(repository_root)
+        repo = presentation_repository_root()
 
         parts: list[str] = []
         dataset_id = references.get("dataset_id")

@@ -60,6 +60,9 @@ from src.churn_ml.control_panel.dataset_identity import (  # noqa: E402
     read_dataset_identity_safe,
     read_paired_comparison_datasets,
 )
+from src.churn_ml.control_panel.paired_comparison_readiness import (  # noqa: E402
+    evaluate_official_paired_readiness,
+)
 from src.churn_ml.control_panel.launch import (  # noqa: E402
     LaunchAuthorizationError,
     RenderedLaunch,
@@ -78,13 +81,14 @@ from src.churn_ml.control_panel.presentation import (  # noqa: E402
     format_date,
     format_time,
     is_raw_run_id,
-    job_primary_label,
+    job_primary_label as _imported_job_primary_label,
     mode_badge,
     mode_human_label,
     model_human_label,
     parse_config_metadata,
     readable_config_label,
     readable_path_label,
+    set_presentation_repository_root,
     source_human_label,
 )
 from src.churn_ml.control_panel.jobs import JobError, JobManager  # noqa: E402
@@ -118,6 +122,34 @@ from src.churn_ml.control_panel.selection_state import (  # noqa: E402
     ui_durable_key,
     widget_selection_key,
 )
+
+
+# Sole repository-root channel for presentation helpers (not a second store).
+set_presentation_repository_root(REPOSITORY_ROOT)
+
+# Live crash class (Dashboard Recent jobs + Jobs selectbox format_func):
+# commit 0707fd3 callers pass repository_root=, while a pre-0707fd3
+# presentation.job_primary_label rejects that keyword. Bind an app-local
+# adapter that accepts the keyword, updates the presentation root override,
+# and always calls the imported helper with two positional arguments only.
+_IMPORTED_JOB_PRIMARY_LABEL = _imported_job_primary_label
+_IMPORTED_JOB_PRIMARY_LABEL_FILE = getattr(
+    getattr(_IMPORTED_JOB_PRIMARY_LABEL, "__code__", None),
+    "co_filename",
+    getattr(_IMPORTED_JOB_PRIMARY_LABEL, "__module__", "?"),
+)
+
+
+def job_primary_label(
+    record_job: Mapping[str, Any],
+    record_commands: dict | None = None,
+    *,
+    repository_root: Path | None = None,
+) -> str:
+    """Label adapter used by Dashboard and Jobs ``_job_label``."""
+    if repository_root is not None:
+        set_presentation_repository_root(repository_root)
+    return _IMPORTED_JOB_PRIMARY_LABEL(record_job, record_commands)
 
 
 st.set_page_config(
@@ -162,8 +194,7 @@ def dashboard_page() -> None:
                 {
                     "label": job_primary_label(
                         item.job,
-                        record_commands=loaded.commands,
-                        repository_root=REPOSITORY_ROOT,
+                        loaded.commands,
                     ),
                     "status": item.status["state"],
                     "date": format_date(item.job.get("created_at_utc")),
@@ -1080,16 +1111,19 @@ def _results_inspect_tab(loaded: ControlPanelRegistry) -> None:
     if reader_id == "research_v2":
         _render_dataset_identity_summary(selected.root)
     elif reader_id == "research_v2_comparisons":
-        baseline_ds, candidate_ds = read_paired_comparison_datasets(selected.root)
-        st.subheader("Comparison datasets")
-        st.markdown(
-            "  \n".join(
-                [
-                    f"**Baseline dataset:** `{baseline_ds or 'Not available'}`",
-                    f"**Candidate dataset:** `{candidate_ds or 'Not available'}`",
-                ]
+        try:
+            baseline_ds, candidate_ds = read_paired_comparison_datasets(selected.root)
+            st.subheader("Comparison datasets")
+            st.markdown(
+                "  \n".join(
+                    [
+                        f"**Baseline dataset:** `{baseline_ds or 'Not available'}`",
+                        f"**Candidate dataset:** `{candidate_ds or 'Not available'}`",
+                    ]
+                )
             )
-        )
+        except Exception as error:
+            st.error(f"Comparison dataset identity unavailable: {error}")
     if selected.summaries:
         st.dataframe(
             [
@@ -1295,7 +1329,7 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
             "same evaluation plan": compatibility["same_evaluation_plan"],
             "same dataset fingerprint": compatibility["same_dataset_fingerprint"],
             "same fold assignments": compatibility["same_fold_assignments"],
-            "status": compatibility["status"],
+            "display status": compatibility["status"],
         }
     )
     if compatibility.get("descriptive_only"):
@@ -1305,7 +1339,10 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
             "and the runs are not formally compatible for official Paired Comparison."
         )
     elif compatibility["compatible"]:
-        st.success("Display check: compatible fingerprints.")
+        st.caption(
+            "Display check: matching plan/fingerprint/fold tokens. "
+            "Official Paired Comparison readiness is evaluated separately."
+        )
     else:
         st.warning(
             "Display check: incompatible or incomplete fingerprints. "
@@ -1382,16 +1419,34 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
                 st.rerun()
         with reset_cols[1]:
             st.caption(f"Suggested: `{st.session_state.get(suggested_key)}`")
-        comparison_ready = (
-            left_item.state == "completed"
-            and right_item.state == "completed"
-            and bool(compatibility.get("compatible"))
-        )
-        if not compatibility.get("compatible"):
-            st.info(
-                "Prepare Paired Comparison action stays disabled until the display "
-                "compatibility check passes. The CLI remains the authoritative final gate."
+        comparison_ready = False
+        official = None
+        if reader_id == "research_v2":
+            official = evaluate_official_paired_readiness(
+                left_root=left_item.root,
+                right_root=right_item.root,
+                repository_root=REPOSITORY_ROOT,
+                left_state=left_item.state,
+                right_state=right_item.state,
             )
+            comparison_ready = bool(official.ready)
+            st.subheader("Official Paired Comparison readiness")
+            st.write(
+                {
+                    "ready": official.ready,
+                    "compatible": official.compatible,
+                    "left dataset": official.left_dataset_version or "Not available",
+                    "right dataset": official.right_dataset_version or "Not available",
+                    "reason codes": list(official.reason_codes),
+                }
+            )
+            if official.diagnostic:
+                st.info(official.diagnostic)
+            if not official.ready:
+                st.caption(
+                    "Prepare Paired Comparison stays disabled until the official "
+                    "compatibility contract passes. The CLI remains the final gate."
+                )
         if (
             st.button(
                 "Prepare Paired Comparison action",
@@ -2475,8 +2530,7 @@ def _all_artifacts(loaded: ControlPanelRegistry) -> list[ArtifactRecord]:
 def _job_label(record: Any, commands: Mapping[str, Any] | None = None) -> str:
     return job_primary_label(
         record.job,
-        record_commands=dict(commands) if commands else None,
-        repository_root=REPOSITORY_ROOT,
+        dict(commands) if commands else None,
     )
 
 

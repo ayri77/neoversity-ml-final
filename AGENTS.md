@@ -10,6 +10,23 @@
 - Clearly distinguish legacy evaluation protocols from new evaluation protocols.
 - Kaggle Public Score is an external benchmark, not the primary model-selection criterion.
 
+## Persisted-state compatibility
+
+Any change to a persisted schema, job record, artifact reader, UI index, or
+MLflow mapping must:
+
+- inventory existing persisted records before changing readers or writers;
+- define whether compatibility uses direct reading, fallback, additive overlay,
+  or an explicit migration;
+- include a characterization fixture for the previous persisted form;
+- preserve authoritative historical artifacts;
+- never silently relabel or rewrite historical evidence;
+- document whether a migration is unnecessary, optional, or required.
+
+Dependency-module changes that affect Streamlit pages (for example
+`control_panel.presentation`) require a full Streamlit process restart; module
+hot-reload can mix a new caller with a cached older callee.
+
 ## Environments
 
 - Use `.venv` for the main project.
