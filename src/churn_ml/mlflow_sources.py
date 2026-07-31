@@ -111,6 +111,7 @@ _RESEARCH_ARTIFACT_ALLOWLIST = (
     "_FAILED",
     "_SUCCESS",
     "artifact_manifest.json",
+    "dataset_provenance.json",
     "execution_status.json",
     "metrics/aggregate.json",
     "resolved_config.yaml",

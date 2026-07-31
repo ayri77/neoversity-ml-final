@@ -105,6 +105,7 @@ class IndexedRun:
             source_type=self.source_type,
             source_run_id=self.source_run_id,
             adapter_id=self.params.get("adapter_id"),
+            dataset_version=self.params.get("dataset_version"),
         )
 
     @property
@@ -118,9 +119,12 @@ def deterministic_mlflow_run_name(
     source_type: str,
     source_run_id: str,
     adapter_id: Any = None,
+    dataset_version: Any = None,
 ) -> str:
     """Build the stable MLflow run name from portable source identity fields."""
     if source_type == "research_v2" and type(adapter_id) is str and adapter_id:
+        if type(dataset_version) is str and dataset_version:
+            return f"{dataset_version}__{adapter_id}__{source_run_id}"
         return f"{adapter_id}__{source_run_id}"
     return source_run_id
 
@@ -248,6 +252,19 @@ def build_research_mapping(
         "filesystem_authority": "authoritative",
         "mlflow_role": "searchable_metadata_index",
     }
+    if terminal_status == "completed":
+        provenance = _validated_completed_provenance(
+            run_dir=run_dir,
+            metadata=metadata,
+            dataset_version=str(dataset_version),
+        )
+        if provenance is not None:
+            _add_research_provenance_params(params, provenance)
+            tags["dataset.id"] = str(provenance["dataset_id"])
+            if provenance.get("target_dependency"):
+                tags["dataset.target_dependency"] = str(
+                    provenance["target_dependency"]
+                )
     failure = _mapping(status.get("failure"))
     if terminal_status == "failed" and failure:
         tags["failure_type"] = str(failure.get("type", "unknown"))
@@ -535,3 +552,76 @@ def _metric(target: dict[str, float], name: str, value: Any) -> None:
 
 def _without_none(values: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value is not None}
+
+
+def _add_research_provenance_params(
+    params: dict[str, Any], provenance: Mapping[str, Any]
+) -> None:
+    mapping = {
+        "dataset_parent_id": provenance.get("parent_dataset_id"),
+        "dataset_feature_count": provenance.get("n_features"),
+        "dataset_target_dependency": provenance.get("target_dependency"),
+        "dataset_schema_sha256": provenance.get("schema_hash"),
+        "dataset_train_content_sha256": provenance.get("train_content_hash"),
+        "dataset_target_sha256": provenance.get("target_hash"),
+        "dataset_train_row_identity_sha256": provenance.get(
+            "train_row_identity_hash"
+        ),
+        "dataset_registry_schema_version": provenance.get("registry_schema_version"),
+    }
+    for key, value in mapping.items():
+        if value is None or value == "":
+            continue
+        params[key] = value
+
+
+def _validated_completed_provenance(
+    *,
+    run_dir: Path,
+    metadata: Mapping[str, Any],
+    dataset_version: str,
+) -> dict[str, Any] | None:
+    """Return Registry provenance only when completed-run identities agree."""
+    embedded = metadata.get("dataset_provenance")
+    file_payload: dict[str, Any] | None = None
+    path = run_dir / "dataset_provenance.json"
+    try:
+        if path.is_file() and path.stat().st_size <= 32 * 1024:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                file_payload = loaded
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    candidates = [
+        item
+        for item in (file_payload, embedded if isinstance(embedded, Mapping) else None)
+        if isinstance(item, Mapping) and item.get("dataset_id")
+    ]
+    if not candidates:
+        return None
+    dataset_ids = {str(item.get("dataset_id")) for item in candidates}
+    if len(dataset_ids) != 1:
+        return None
+    dataset_id = next(iter(dataset_ids))
+    if dataset_version not in {"unknown", dataset_id}:
+        return None
+    primary = dict(candidates[0])
+    for item in candidates[1:]:
+        for key in (
+            "parent_dataset_id",
+            "n_features",
+            "target_dependency",
+            "schema_hash",
+            "train_content_hash",
+            "target_hash",
+            "train_row_identity_hash",
+            "registry_schema_version",
+        ):
+            left = primary.get(key)
+            right = item.get(key)
+            if left is not None and right is not None and left != right:
+                return None
+            if left is None and right is not None:
+                primary[key] = right
+    primary["dataset_id"] = dataset_id
+    return primary

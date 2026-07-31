@@ -251,6 +251,49 @@ def _merge_metadata(result: dict[str, str], content: dict[str, Any]) -> None:
             if folds is not None:
                 result["folds"] = str(folds)
 
+    dataset = content.get("dataset", {})
+    if isinstance(dataset, dict):
+        version = dataset.get("version")
+        if version:
+            result.setdefault("dataset_id", str(version))
+            result.setdefault("dataset_version", str(version))
+
+    if "dataset_id" in content and content.get("dataset_id"):
+        result.setdefault("dataset_id", str(content["dataset_id"]))
+        result.setdefault("dataset_version", str(content["dataset_id"]))
+    if "parent_dataset_id" in content and content.get("parent_dataset_id") is not None:
+        result.setdefault("parent_dataset_id", str(content["parent_dataset_id"]))
+    if "target_dependency" in content and content.get("target_dependency"):
+        result.setdefault("target_dependency", str(content["target_dependency"]))
+    if "n_features" in content and content.get("n_features") is not None:
+        result.setdefault("n_features", str(content["n_features"]))
+    if "schema_hash" in content and content.get("schema_hash"):
+        result.setdefault("schema_hash", str(content["schema_hash"]))
+    if "train_content_hash" in content and content.get("train_content_hash"):
+        result.setdefault("train_content_hash", str(content["train_content_hash"]))
+    if "target_hash" in content and content.get("target_hash"):
+        result.setdefault("target_hash", str(content["target_hash"]))
+    if "train_row_identity_hash" in content and content.get("train_row_identity_hash"):
+        result.setdefault(
+            "train_row_identity_hash", str(content["train_row_identity_hash"])
+        )
+
+    provenance = content.get("dataset_provenance")
+    if isinstance(provenance, dict):
+        if provenance.get("dataset_id"):
+            result.setdefault("dataset_id", str(provenance["dataset_id"]))
+            result.setdefault("dataset_version", str(provenance["dataset_id"]))
+        if provenance.get("parent_dataset_id") is not None:
+            result.setdefault(
+                "parent_dataset_id", str(provenance.get("parent_dataset_id"))
+            )
+        if provenance.get("target_dependency"):
+            result.setdefault(
+                "target_dependency", str(provenance["target_dependency"])
+            )
+        if provenance.get("n_features") is not None:
+            result.setdefault("n_features", str(provenance["n_features"]))
+
     plan = content.get("plan", {})
     if isinstance(plan, dict):
         plan_id = plan.get("id", "")
@@ -329,6 +372,7 @@ def parse_config_metadata(path_str: str, repo_root: Path) -> dict[str, str]:
 
         if full_path.is_dir():
             for relative in (
+                "dataset_provenance.json",
                 "run_metadata.json",
                 "resolved_config.yaml",
                 "metrics/aggregate.json",
@@ -486,25 +530,39 @@ def format_duration(seconds: float | int | None) -> str:
 
 
 def job_primary_label(
-    record_job: Mapping[str, Any], record_commands: dict | None = None
+    record_job: Mapping[str, Any],
+    record_commands: dict | None = None,
+    *,
+    repository_root: Path | None = None,
 ) -> str:
     try:
         command_id = record_job.get("command_id", "")
         action_id = record_job.get("action_id", "")
         references = record_job.get("references", {})
-        config_path = (
-            references.get("config", "") if isinstance(references, dict) else ""
-        )
+        if not isinstance(references, dict):
+            references = {}
+        config_path = references.get("config", "")
+        repo = repository_root if repository_root is not None else Path(".")
 
-        parts = []
-        if config_path:
-            meta = parse_config_metadata(str(config_path), Path("."))
-            model_family = meta.get("model_family", "")
-            mode = meta.get("mode", "")
-            if model_family:
-                parts.append(model_family)
-            if mode:
-                parts.append(mode)
+        parts: list[str] = []
+        dataset_id = references.get("dataset_id")
+        model_family = references.get("model_family")
+        mode = references.get("mode")
+        if not dataset_id or not model_family or not mode:
+            meta: dict[str, str] = {}
+            if config_path:
+                meta = parse_config_metadata(str(config_path), repo)
+            dataset_id = dataset_id or meta.get("dataset_id") or meta.get(
+                "dataset_version"
+            )
+            model_family = model_family or meta.get("model_family")
+            mode = mode or meta.get("mode")
+        if dataset_id:
+            parts.append(str(dataset_id))
+        if model_family:
+            parts.append(str(model_family))
+        if mode:
+            parts.append(str(mode))
 
         operation = ""
         if record_commands and command_id in record_commands:
@@ -531,6 +589,10 @@ def job_primary_label(
                 parts.append(date_label)
             if time_label:
                 parts.append(time_label)
+
+        job_id = record_job.get("job_id")
+        if isinstance(job_id, str) and len(job_id) >= 8:
+            parts.append(job_id[:8])
 
         if parts:
             return " · ".join(parts)
@@ -658,7 +720,10 @@ def _experiment_core_label(meta: dict[str, str], basename: str) -> str:
     if metric is None:
         metric = format_primary_metric(meta.get("best_objective"), prefix="obj")
 
-    parts = [experiment]
+    dataset = meta.get("dataset_id") or meta.get("dataset_version") or ""
+    parts = [part for part in (dataset, experiment) if part]
+    if not parts:
+        parts = [experiment or basename]
     if date_label and date_label not in {"—", "Invalid timestamp"}:
         parts.append(date_label)
     if time_label:

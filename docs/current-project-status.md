@@ -10,7 +10,9 @@
 manually executed and local `v0`-`v7` Registry packages are present; complete
 the post-notebook audit before starting any model campaign. The Experiment
 Control Panel now supports a Registry-backed dataset-driven Experiment Core
-entry mode (prepare local config/plan, then Validate/Run).
+entry mode (prepare local config/plan, then Validate/Run) and end-to-end
+dataset-identity visibility across jobs, Results/Compare, and the optional
+MLflow searchable mirror.
 
 ## 1. Purpose and maintenance policy
 
@@ -68,7 +70,10 @@ Immediate next actions:
 
 The Experiment Control Panel dataset selector is implemented and covered by
 automated tests, including a validate-only smoke path for
-`v7_compact_zero_indicators` + LightGBM smoke. That does not finish Stage A.
+`v7_compact_zero_indicators` + LightGBM smoke. Dataset identity is also
+persisted in Experiment Core UI job references, surfaced in Results/Compare,
+and mapped into searchable MLflow metadata for validated completed research
+runs. That does not finish Stage A or the Dataset Campaign.
 
 ### Working-directory dependency
 
@@ -210,6 +215,9 @@ require real-package verification or further development:
 The Control Panel dynamic Dataset Package selector for Experiment Core v2 is
 implemented: discovery uses `discover_registered_datasets`, exploratory
 packages are warned, and Validate/Run consume a prepared local config/plan.
+Dataset identity is first-class in job labels, Results tables/filters/charts,
+descriptive vs official Compare readiness, and validated MLflow params/tags/
+run names. Filesystem artifacts remain authoritative.
 
 ## 7. Prepared dataset suite
 
@@ -659,14 +667,21 @@ Completed for Experiment Core v2:
 3. Visual warning for `target_dependency: exploratory`.
 4. Explicit prepare of dataset-driven config/plan under `artifacts/ui_configs`,
    then Validate/Run through the existing allowlisted CLI path.
+5. Dataset-aware job labels and persisted job references (`dataset_id`,
+   experiment/plan/model/mode).
+6. Results Experiments columns/filter/search/charts for Dataset identity;
+   Inspect compact provenance; Compare left/right Dataset IDs with
+   descriptive-only cross-dataset labeling and stricter Paired Comparison
+   prepare readiness.
+7. Validated MLflow research provenance params/tags and dataset-prefixed
+   deterministic run names, with in-place backfill via `source_key`.
 
 Still planned after the Campaign Runner and comparison contract exist:
 
-1. Filters for dataset, parent, model, mode/protocol, and status on Results.
-2. Campaign Results matrix.
-3. Parent-child deltas.
-4. Descriptive labels instead of raw run IDs as the primary UI label.
-5. Keep filesystem artifacts authoritative and MLflow secondary.
+1. Campaign Results matrix.
+2. Parent-child deltas as a campaign view.
+3. Keep filesystem artifacts authoritative and MLflow secondary (already the
+   policy; campaign-scale UI still pending).
 
 ## 16. Stage G — screening and decision rules
 

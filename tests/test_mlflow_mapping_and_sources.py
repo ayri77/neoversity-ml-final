@@ -95,7 +95,8 @@ def test_completed_and_failed_research_mapping() -> None:
     assert completed.metrics["balanced_accuracy"] == 0.9
     assert completed.metrics["threshold_range"] == pytest.approx(0.3)
     assert completed.tags["metric_direction.brier_score"] == "lower_is_better"
-    assert completed.run_name == "adapter__run-1"
+    assert completed.run_name == "v3__adapter__run-1"
+    assert "dataset.id" not in completed.tags
 
     failed = build_research_mapping(
         run_dir=Path("run-2"),
@@ -109,7 +110,9 @@ def test_completed_and_failed_research_mapping() -> None:
     assert failed.mlflow_status == "FAILED"
     assert failed.metrics == {}
     assert failed.tags["failure_type"] == "RuntimeError"
-    assert failed.run_name == "adapter__run-2"
+    assert failed.run_name == "v3__adapter__run-2"
+    assert "dataset_parent_id" not in failed.params
+    assert "dataset.id" not in failed.tags
 
 
 def test_completed_and_failed_autogluon_mapping(tmp_path: Path) -> None:
@@ -237,7 +240,9 @@ def test_research_run_name_uses_adapter_and_source_id() -> None:
         threshold_summary={},
         threshold_standard_deviation=0.0,
     )
-    assert record.run_name == "xgboost_numeric_v1__20260729T070702417916Z_38bbefe2"
+    assert record.run_name == (
+        "v3__xgboost_numeric_v1__20260729T070702417916Z_38bbefe2"
+    )
 
 
 def test_persisted_research_config_accepts_valid_search_provenance(

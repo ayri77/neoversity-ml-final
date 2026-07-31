@@ -264,12 +264,36 @@ unchanged for completed sources.
 Sync always sets a stable UI name and reconciles it in place via `mlflow.runName`:
 
 - AutoGluon: `{source_run_id}`
-- research_v2: `{adapter_id}__{source_run_id}`
+- research_v2: `{dataset_version}__{adapter_id}__{source_run_id}` when
+  `dataset_version` is available; otherwise `{adapter_id}__{source_run_id}`
 
-Lookup identity remains `mlflow_index.source_key`. Renaming never allocates a second
-row for the same key. After create or rename reconciliation, a following sync is
-`unchanged`.
+Lookup identity remains `mlflow_index.source_key`. Renaming or backfilling an
+existing indexed source updates the same MLflow run in place and never allocates
+a second row for the same key. After create or rename reconciliation, a following
+sync is `unchanged`.
 
+### Research dataset provenance parameters and tags
+
+Filesystem artifacts remain authoritative. Completed, validated Registry-backed
+research runs may additionally map consistent provenance into searchable MLflow
+parameters (omit unavailable optional values):
+
+- retained: `dataset_version`, `dataset_identity_sha256`
+- added when validated: `dataset_parent_id`, `dataset_feature_count`,
+  `dataset_target_dependency`, `dataset_schema_sha256`,
+  `dataset_train_content_sha256`, `dataset_target_sha256`,
+  `dataset_train_row_identity_sha256`, `dataset_registry_schema_version`
+
+Searchable tags when provenance validates:
+
+- `dataset.id`
+- `dataset.target_dependency`
+
+`dataset_provenance.json` is included in the bounded completed-research metadata
+artifact allowlist and still subject to path, size, content, and post-copy
+verification. Failed-run mapping must not trust arbitrary optional provenance.
+Contradictory completed provenance is omitted rather than silently merged.
+AutoGluon mapping is unchanged.
 ### AutoGluon metrics and tags
 
 AutoGluon parameters include config/profile/dataset/seed/resource identities and

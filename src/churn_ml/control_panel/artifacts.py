@@ -275,12 +275,20 @@ def artifact_selector_options(
 
 
 def artifact_option_label(artifact: ArtifactRecord) -> str:
+    from src.churn_ml.control_panel.dataset_identity import read_dataset_identity_safe
+
     name = (
         artifact.summaries.get("Study name")
         or artifact.summaries.get("Search ID")
         or Path(artifact.relative_path).name
     )
     parts = [str(name)]
+    dataset = artifact.summaries.get("Dataset")
+    if not dataset:
+        identity = read_dataset_identity_safe(artifact.root)
+        dataset = identity.dataset_id
+    if dataset:
+        parts.insert(0, str(dataset))
     objective = artifact.summaries.get("Best objective")
     if objective is None:
         objective = artifact.summaries.get("Best trial objective")
@@ -301,10 +309,13 @@ def build_experiment_table_rows(
     repo_root: Path,
 ) -> list[dict[str, Any]]:
     """Build human-readable experiment catalog rows (newest first)."""
+    from src.churn_ml.control_panel.dataset_identity import read_dataset_identity_safe
+
     rows: list[dict[str, Any]] = []
     for artifact in artifacts:
         try:
             meta = parse_config_metadata(artifact.relative_path, repo_root)
+            identity = read_dataset_identity_safe(artifact.root)
             created = meta.get("created_at_utc")
             experiment = humanize_experiment_token(
                 meta.get("experiment_name") or meta.get("adapter_id") or "",
@@ -314,10 +325,32 @@ def build_experiment_table_rows(
                 experiment = Path(artifact.relative_path).name
             model = meta.get("model_family") or "Not available"
             mode = meta.get("mode") or "Not available"
+            dataset = identity.display("dataset_id")
+            if dataset == "Not available":
+                dataset = (
+                    meta.get("dataset_id")
+                    or meta.get("dataset_version")
+                    or "Not available"
+                )
+            parent = identity.display("parent_dataset_id")
+            if parent == "Not available" and meta.get("parent_dataset_id"):
+                parent = str(meta["parent_dataset_id"])
+            if parent in {"None", ""}:
+                parent = "—"
+            target_dependency = identity.display("target_dependency")
+            if target_dependency == "Not available" and meta.get("target_dependency"):
+                target_dependency = str(meta["target_dependency"])
+            features = identity.display("n_features")
+            if features == "Not available" and meta.get("n_features"):
+                features = str(meta["n_features"])
             created_date = format_date(created) if created else "Not available"
             created_time = format_time(created) if created else "Not available"
             rows.append(
                 {
+                    "Dataset": dataset,
+                    "Parent dataset": parent,
+                    "Target dependency": target_dependency,
+                    "Features": features,
                     "Model": model,
                     "Mode": mode,
                     "Experiment": experiment,
@@ -339,14 +372,15 @@ def build_experiment_table_rows(
                     "Status": artifact.state,
                     "Artifact path": artifact.relative_path,
                     "_created_sort": created or "",
-                    # Unique per artifact so Plotly never sums duplicate labels.
                     "_chart_key": artifact.relative_path,
                     "_chart_label": _chart_tick_label(
+                        dataset=dataset,
                         model=model,
                         experiment=experiment,
                         created_date=created_date,
                         created_time=created_time,
                     ),
+                    "_dataset_diagnostic": identity.diagnostic,
                     "_ba": artifact.summaries.get("Balanced Accuracy mean"),
                     "_sensitivity": artifact.summaries.get("Sensitivity"),
                     "_specificity": artifact.summaries.get("Specificity"),
@@ -358,6 +392,10 @@ def build_experiment_table_rows(
             fallback_name = Path(artifact.relative_path).name
             rows.append(
                 {
+                    "Dataset": "Not available",
+                    "Parent dataset": "Not available",
+                    "Target dependency": "Not available",
+                    "Features": "Not available",
                     "Model": "Not available",
                     "Mode": "Not available",
                     "Experiment": fallback_name,
@@ -375,6 +413,7 @@ def build_experiment_table_rows(
                     "_created_sort": "",
                     "_chart_key": artifact.relative_path,
                     "_chart_label": fallback_name,
+                    "_dataset_diagnostic": None,
                     "_ba": None,
                     "_sensitivity": None,
                     "_specificity": None,
@@ -388,13 +427,18 @@ def build_experiment_table_rows(
 
 def _chart_tick_label(
     *,
+    dataset: str,
     model: str,
     experiment: str,
     created_date: str,
     created_time: str,
 ) -> str:
-    """Readable bar tick/hover label: model, experiment, date, and time."""
-    parts = [part for part in (model, experiment) if part and part != "Not available"]
+    """Readable bar tick/hover label including dataset identity."""
+    parts = [
+        part
+        for part in (dataset, model, experiment)
+        if part and part != "Not available"
+    ]
     if created_date and created_date != "Not available":
         parts.append(created_date)
     if created_time and created_time != "Not available":
@@ -411,12 +455,16 @@ def display_compatibility_summary(
     This does not replace the official Paired Comparison gate; it only surfaces
     fingerprint equality checks already present on disk.
     """
+    from src.churn_ml.control_panel.dataset_identity import read_dataset_identity_safe
+
     left_plan = _identity_hash(left.root, "identities/evaluation_plan.json")
     right_plan = _identity_hash(right.root, "identities/evaluation_plan.json")
     left_dataset = _dataset_fingerprint_token(left.root)
     right_dataset = _dataset_fingerprint_token(right.root)
     left_folds = _fold_assignment_token(left.root)
     right_folds = _fold_assignment_token(right.root)
+    left_identity = read_dataset_identity_safe(left.root)
+    right_identity = read_dataset_identity_safe(right.root)
 
     same_plan = (
         left_plan is not None and right_plan is not None and left_plan == right_plan
@@ -436,6 +484,11 @@ def display_compatibility_summary(
         "same_fold_assignments": same_folds,
         "compatible": compatible,
         "status": "compatible" if compatible else "incompatible",
+        "left_dataset_id": left_identity.dataset_id or "Not available",
+        "right_dataset_id": right_identity.dataset_id or "Not available",
+        "left_dataset_diagnostic": left_identity.diagnostic,
+        "right_dataset_diagnostic": right_identity.diagnostic,
+        "descriptive_only": not same_dataset,
     }
 
 

@@ -163,3 +163,15 @@ Generated files stay under `artifacts/ui_configs/` (plans under
 5. Expand Pre-run summary and confirm: Model=LightGBM, Mode=Development, Source=Canonical config
 6. Check the confirmation box
 7. Click **Start background job**
+
+### Dataset-aware jobs and results
+
+- Job labels include Dataset ID so identical model/mode launches on different
+  packages stay distinguishable.
+- On the selected Job page, Dataset ID, experiment ID, plan ID, and config appear
+  outside the technical JSON expander.
+- Results → Experiments lists Dataset, Parent dataset, Target dependency, and
+  Features and supports a Dataset filter.
+- Results → Compare shows left/right Dataset IDs. Cross-dataset rows are
+  descriptive only; official Paired Comparison preparation stays disabled until
+  the display compatibility check passes.

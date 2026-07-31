@@ -35,12 +35,14 @@ application uses the main project environment, not `.venv-autogluon`.
   configuration, validates syntax, displays exact redacted argv, and starts one
   background job after the required confirmation.
 - **Jobs** refreshes persisted job state, shows PID, timestamps, elapsed time, exit
-  code, exact redacted argv, and bounded stdout/stderr tails. A running process can be
-  stopped only after explicit confirmation when stopping is enabled.
+  code, exact redacted argv, and bounded stdout/stderr tails. Experiment Core jobs
+  persist Dataset ID / experiment / plan / model / mode in `job.json` references and
+  surface them in human-readable labels. A running process can be stopped only after
+  explicit confirmation when stopping is enabled.
 - **Results** discovers artifacts only through reader definitions, renders configured
   summary fields and JSON trees, previews bounded CSV data, tails configured logs, and
-  shows a display-only side-by-side field table. Official comparison remains the
-  Paired Comparison CLI action.
+  shows a display-only side-by-side field table with explicit left/right Dataset IDs.
+  Official comparison remains the Paired Comparison CLI action.
 - **Configuration** reports strict registry validation, source paths, and loaded
   settings/command/reader summaries. The three UI registry files are read-only in v1.
 
@@ -272,12 +274,60 @@ status, logs, diagnostics, and UI output.
 - Launch authorization is fail-closed and tokenized; widget disabled state is not
   trusted.
 
+## Dataset identity visibility
+
+Dataset identity is a first-class presentation dimension end-to-end:
+
+```text
+Prepared config
+  → persisted UI job identity (job.json references)
+  → dataset-aware Jobs / Dashboard labels
+  → dataset-aware Results / Compare
+  → validated MLflow searchable metadata
+```
+
+### Job labels and metadata
+
+New Experiment Core Validate/Run jobs persist `dataset_id`, `experiment_id`,
+`plan_id`, `model_family`, `mode`, and `config` in the existing `job.json`
+`references` map (schema version 2). Values are derived only from the already
+authorized repository-contained config and never influence executable argv.
+Dashboard and Jobs labels include Dataset ID, model, mode, operation, timestamp,
+and a short job id fragment. Old jobs without these keys continue to load.
+
+### Results workspace
+
+The Experiments table adds Dataset, Parent dataset, Target dependency, and
+Features; Dataset filter and text search include Dataset ID; chart labels and
+hover data include Dataset ID. Inspect shows a compact provenance summary
+(hashes may sit in an expander) and warns when `target_dependency` is
+`exploratory`. Selectors expose Dataset ID in cascade labels.
+
+Historical Experiment Core identity is read from run-local artifacts
+(`dataset_provenance.json` preferred, cross-checked against
+`resolved_config.yaml`, `run_metadata.json`, and `dataset_fingerprints.json`).
+The live `data/processed` Registry is never consulted to label historical runs.
+Conflicts surface as an explicit diagnostic rather than a silent merge.
+
+### Descriptive compare vs official Paired Comparison
+
+The Results comparison table may show metrics from two different datasets, but
+it always displays left/right Dataset IDs and the fingerprint match flag. When
+datasets differ, the UI labels the view as descriptive only and keeps
+**Prepare Paired Comparison action** disabled. Official Paired Comparison still
+requires completed runs plus the existing authoritative compatibility gate
+(CLI remains the final authority). Saved comparison Inspect views show baseline
+and candidate dataset versions from their reference files without changing the
+paired-comparison artifact schema.
+
 ## MLflow integration
 
 The Dashboard opens `mlflow_url`. The registry can validate and synchronize the
 existing optional local metadata index through `scripts/sync_mlflow.py`. The UI does
 not start an MLflow server because the approved CLI has no start subcommand. Use the
 documented launch command in [MLflow Local Index](mlflow-local-index.md) when needed.
+Filesystem artifacts remain authoritative; MLflow remains an optional searchable
+mirror.
 
 ## Windows behavior and limitations
 

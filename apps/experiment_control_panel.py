@@ -55,6 +55,11 @@ from src.churn_ml.control_panel.dataset_experiment_materializer import (  # noqa
     prepare_dataset_driven_experiment,
     selection_fingerprint,
 )
+from src.churn_ml.control_panel.dataset_identity import (  # noqa: E402
+    enrich_experiment_core_references,
+    read_dataset_identity_safe,
+    read_paired_comparison_datasets,
+)
 from src.churn_ml.control_panel.launch import (  # noqa: E402
     LaunchAuthorizationError,
     RenderedLaunch,
@@ -156,7 +161,9 @@ def dashboard_page() -> None:
             [
                 {
                     "label": job_primary_label(
-                        item.job, record_commands=loaded.commands
+                        item.job,
+                        record_commands=loaded.commands,
+                        repository_root=REPOSITORY_ROOT,
                     ),
                     "status": item.status["state"],
                     "date": format_date(item.job.get("created_at_utc")),
@@ -523,12 +530,17 @@ def run_page() -> None:
                 rendered=rendered,
                 consumed_nonces=consumed,
             )
+            references = enrich_experiment_core_references(
+                authorized.references,
+                repository_root=REPOSITORY_ROOT,
+                command_id=command_id,
+            )
             record = job_manager(loaded).start(
                 argv=authorized.argv,
                 redacted_argv=authorized.redacted_argv,
                 command_id=command_id,
                 action_id=action_id,
-                references=authorized.references,
+                references=references,
             )
             st.success(f"Started job {record.job_id}.")
         except (LaunchAuthorizationError, JobError) as error:
@@ -579,6 +591,23 @@ def jobs_page() -> None:
     created = record.job.get("created_at_utc")
     columns[2].metric("Date", format_date(created))
     columns[3].metric("Time", format_time(created))
+    references = record.job.get("references")
+    if isinstance(references, Mapping) and (
+        references.get("dataset_id")
+        or references.get("experiment_id")
+        or references.get("plan_id")
+        or references.get("config")
+    ):
+        st.markdown(
+            "  \n".join(
+                [
+                    f"**Dataset ID:** `{references.get('dataset_id') or 'Not available'}`",
+                    f"**Experiment ID:** `{references.get('experiment_id') or 'Not available'}`",
+                    f"**Plan ID:** `{references.get('plan_id') or 'Not available'}`",
+                    f"**Config:** `{references.get('config') or 'Not available'}`",
+                ]
+            )
+        )
     if status.get("diagnostic"):
         st.warning(str(status["diagnostic"]))
     index_result = _maybe_post_index_job(loaded, record)
@@ -709,20 +738,36 @@ def _results_experiments_tab(loaded: ControlPanelRegistry) -> None:
         return
 
     rows = build_experiment_table_rows(artifacts, repo_root=REPOSITORY_ROOT)
+    datasets = sorted(
+        {
+            str(row["Dataset"])
+            for row in rows
+            if row.get("Dataset") not in {None, "", "Not available"}
+        }
+    )
     models = sorted(
         {str(row["Model"]) for row in rows if row["Model"] != "Not available"}
     )
     modes = sorted({str(row["Mode"]) for row in rows if row["Mode"] != "Not available"})
     statuses = sorted({str(row["Status"]) for row in rows})
 
-    filter_cols = st.columns(4)
+    filter_cols = st.columns(5)
+    dataset_key = f"results-exp-filter-dataset-{reader_id}"
     model_key = f"results-exp-filter-model-{reader_id}"
     mode_key = f"results-exp-filter-mode-{reader_id}"
     status_key = f"results-exp-filter-status-{reader_id}"
     search_key = f"results-exp-filter-search-{reader_id}"
+    dataset_options = ["All", *datasets]
     model_options = ["All", *models]
     mode_options = ["All", *modes]
     status_options = ["All", *statuses]
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=dataset_key,
+        durable_key=ui_durable_key("results", "filter", reader_id, "dataset"),
+        allowed=dataset_options,
+        default="All",
+    )
     sync_widget_with_durable(
         st.session_state,
         widget_key=model_key,
@@ -751,24 +796,35 @@ def _results_experiments_tab(loaded: ControlPanelRegistry) -> None:
         allowed=None,
         default="",
     )
-    selected_model = filter_cols[0].selectbox(
+    selected_dataset = filter_cols[0].selectbox(
+        "Dataset",
+        dataset_options,
+        key=dataset_key,
+    )
+    selected_model = filter_cols[1].selectbox(
         "Model",
         model_options,
         key=model_key,
     )
-    selected_mode = filter_cols[1].selectbox(
+    selected_mode = filter_cols[2].selectbox(
         "Mode",
         mode_options,
         key=mode_key,
     )
-    selected_status = filter_cols[2].selectbox(
+    selected_status = filter_cols[3].selectbox(
         "Status",
         status_options,
         key=status_key,
     )
-    search = filter_cols[3].text_input(
+    search = filter_cols[4].text_input(
         "Search experiment/config",
         key=search_key,
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=ui_durable_key("results", "filter", reader_id, "dataset"),
+        value=selected_dataset,
+        allowed=dataset_options,
     )
     remember_durable_value(
         st.session_state,
@@ -797,6 +853,8 @@ def _results_experiments_tab(loaded: ControlPanelRegistry) -> None:
 
     filtered = []
     for row in rows:
+        if selected_dataset != "All" and row.get("Dataset") != selected_dataset:
+            continue
         if selected_model != "All" and row["Model"] != selected_model:
             continue
         if selected_mode != "All" and row["Mode"] != selected_mode:
@@ -807,13 +865,24 @@ def _results_experiments_tab(loaded: ControlPanelRegistry) -> None:
             needle = search.lower()
             haystack = " ".join(
                 str(row.get(key, ""))
-                for key in ("Experiment", "Model", "Mode", "Artifact path")
+                for key in (
+                    "Dataset",
+                    "Parent dataset",
+                    "Experiment",
+                    "Model",
+                    "Mode",
+                    "Artifact path",
+                )
             ).lower()
             if needle not in haystack:
                 continue
         filtered.append(row)
 
     display_columns = [
+        "Dataset",
+        "Parent dataset",
+        "Target dependency",
+        "Features",
         "Model",
         "Mode",
         "Experiment",
@@ -866,6 +935,7 @@ def _render_experiment_charts(rows: list[dict[str, Any]]) -> None:
             {
                 "Experiment key": chart_key,
                 "Experiment": chart_label,
+                "Dataset": row.get("Dataset"),
                 "Model": row.get("Model"),
                 "Mode": row.get("Mode"),
                 "Created date": row.get("Created date"),
@@ -880,6 +950,7 @@ def _render_experiment_charts(rows: list[dict[str, Any]]) -> None:
     frame = pd.DataFrame(chart_frame)
     hover = [
         "Experiment",
+        "Dataset",
         "Model",
         "Mode",
         "Created date",
@@ -1006,10 +1077,23 @@ def _results_inspect_tab(loaded: ControlPanelRegistry) -> None:
     st.write(f"Status: `{selected.state}`")
     if selected.diagnostic:
         st.warning(selected.diagnostic)
+    if reader_id == "research_v2":
+        _render_dataset_identity_summary(selected.root)
+    elif reader_id == "research_v2_comparisons":
+        baseline_ds, candidate_ds = read_paired_comparison_datasets(selected.root)
+        st.subheader("Comparison datasets")
+        st.markdown(
+            "  \n".join(
+                [
+                    f"**Baseline dataset:** `{baseline_ds or 'Not available'}`",
+                    f"**Candidate dataset:** `{candidate_ds or 'Not available'}`",
+                ]
+            )
+        )
     if selected.summaries:
         st.dataframe(
             [
-                {"field": key, "value": value}
+                {"field": key, "value": "" if value is None else str(value)}
                 for key, value in selected.summaries.items()
             ],
             width="stretch",
@@ -1167,6 +1251,16 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
                 allowed=artifact_paths,
                 cascade_meta=parse_config_metadata(str(seeded_right), REPOSITORY_ROOT),
             )
+        # Prefer a distinct initial right artifact before the widget is created.
+        if (
+            left_path
+            and len(artifact_paths) >= 2
+            and st.session_state.get(right_key) in {None, "", left_path}
+        ):
+            for candidate in artifact_paths:
+                if candidate != left_path:
+                    st.session_state[right_key] = candidate
+                    break
         right_path = _cascade_item_selector(
             artifact_paths,
             widget_key=right_key,
@@ -1196,13 +1290,21 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
     st.subheader("Compatibility")
     st.write(
         {
+            "left dataset": compatibility.get("left_dataset_id"),
+            "right dataset": compatibility.get("right_dataset_id"),
             "same evaluation plan": compatibility["same_evaluation_plan"],
             "same dataset fingerprint": compatibility["same_dataset_fingerprint"],
             "same fold assignments": compatibility["same_fold_assignments"],
             "status": compatibility["status"],
         }
     )
-    if compatibility["compatible"]:
+    if compatibility.get("descriptive_only"):
+        st.warning(
+            "Descriptive comparison only: the selected runs use different dataset "
+            "fingerprints. The metric delta is not a paired statistical comparison "
+            "and the runs are not formally compatible for official Paired Comparison."
+        )
+    elif compatibility["compatible"]:
         st.success("Display check: compatible fingerprints.")
     else:
         st.warning(
@@ -1281,8 +1383,15 @@ def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
         with reset_cols[1]:
             st.caption(f"Suggested: `{st.session_state.get(suggested_key)}`")
         comparison_ready = (
-            left_item.state == "completed" and right_item.state == "completed"
+            left_item.state == "completed"
+            and right_item.state == "completed"
+            and bool(compatibility.get("compatible"))
         )
+        if not compatibility.get("compatible"):
+            st.info(
+                "Prepare Paired Comparison action stays disabled until the display "
+                "compatibility check passes. The CLI remains the authoritative final gate."
+            )
         if (
             st.button(
                 "Prepare Paired Comparison action",
@@ -2365,8 +2474,42 @@ def _all_artifacts(loaded: ControlPanelRegistry) -> list[ArtifactRecord]:
 
 def _job_label(record: Any, commands: Mapping[str, Any] | None = None) -> str:
     return job_primary_label(
-        record.job, record_commands=dict(commands) if commands else None
+        record.job,
+        record_commands=dict(commands) if commands else None,
+        repository_root=REPOSITORY_ROOT,
     )
+
+
+def _render_dataset_identity_summary(run_root: Path) -> None:
+    identity = read_dataset_identity_safe(run_root)
+    if identity.diagnostic:
+        st.error(identity.diagnostic)
+        return
+    st.subheader("Dataset identity")
+    columns = st.columns(4)
+    columns[0].metric("Dataset", identity.display("dataset_id"))
+    parent = identity.display("parent_dataset_id")
+    columns[1].metric("Parent", "—" if parent in {"None", "Not available"} else parent)
+    columns[2].metric("Target dependency", identity.display("target_dependency"))
+    columns[3].metric("Features", identity.display("n_features"))
+    if identity.is_exploratory:
+        st.warning(
+            "This run used an exploratory Dataset Package "
+            "(`target_dependency: exploratory`). Keep results labeled exploratory."
+        )
+    with st.expander("Dataset fingerprints", expanded=False):
+        st.code(
+            "\n".join(
+                [
+                    f"schema_hash: {identity.display('schema_hash')}",
+                    f"train_content_hash: {identity.display('train_content_hash')}",
+                    f"target_hash: {identity.display('target_hash')}",
+                    f"train_row_identity_hash: "
+                    f"{identity.display('train_row_identity_hash')}",
+                ]
+            ),
+            language="text",
+        )
 
 
 def main() -> None:

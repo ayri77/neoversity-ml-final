@@ -113,6 +113,23 @@ def _write_research_run(
         ),
         encoding="utf-8",
     )
+    (artifact / "dataset_provenance.json").write_text(
+        json.dumps(
+            {
+                "dataset_id": "v3",
+                "parent_dataset_id": "v2",
+                "hypothesis": "fixture",
+                "n_features": 42,
+                "schema_hash": "a" * 64,
+                "train_content_hash": "b" * 64,
+                "target_hash": "c" * 64,
+                "target_dependency": "none",
+                "train_row_identity_hash": "d" * 64,
+                "registry_schema_version": "dataset_package_v1",
+            }
+        ),
+        encoding="utf-8",
+    )
     splits = artifact / "splits"
     splits.mkdir(exist_ok=True)
     (splits / "outer_assignments.parquet").write_bytes(fold_payload)
@@ -177,6 +194,10 @@ def test_experiment_table_has_required_columns(
     rows = build_experiment_table_rows(artifacts, repo_root=tmp_path)
     assert rows
     required = {
+        "Dataset",
+        "Parent dataset",
+        "Target dependency",
+        "Features",
         "Model",
         "Mode",
         "Experiment",
@@ -193,9 +214,14 @@ def test_experiment_table_has_required_columns(
         "Artifact path",
     }
     assert required.issubset(rows[0].keys())
+    assert rows[0]["Dataset"] == "v3"
+    assert rows[0]["Parent dataset"] == "v2"
+    assert rows[0]["Target dependency"] == "none"
+    assert rows[0]["Features"] == "42"
     assert rows[0]["Model"] == "LightGBM"
     assert rows[0]["Mode"] == "Development"
     assert rows[0]["Balanced Accuracy"] == pytest.approx(0.897453)
+    assert "v3" in str(rows[0]["_chart_label"])
     assert "Artifact path" in rows[0]
     assert list(rows[0].keys()).index("Artifact path") >= list(rows[0].keys()).index(
         "Status"
@@ -393,6 +419,9 @@ def test_compatibility_shown_before_paired_comparison(
     assert summary["same_fold_assignments"] is True
     assert summary["compatible"] is True
     assert summary["status"] == "compatible"
+    assert summary["left_dataset_id"] == "v3"
+    assert summary["right_dataset_id"] == "v3"
+    assert summary["descriptive_only"] is False
 
     at = _load_results(monkeypatch, tmp_path)
     assert not at.exception
@@ -407,6 +436,66 @@ def test_compatibility_shown_before_paired_comparison(
     assert any(
         button.label == "Prepare Paired Comparison action" for button in at.button
     )
+    prepare = next(
+        button
+        for button in at.button
+        if button.label == "Prepare Paired Comparison action"
+    )
+    assert prepare.disabled is False
+
+
+def test_cross_dataset_compare_is_descriptive_only(tmp_path: Path) -> None:
+    left = _write_research_run(
+        tmp_path,
+        plan="telecom_v3_development_r2x5_t3_v1",
+        adapter="manual_lightgbm_te_v1_compat",
+        run_id="20260729T070702417916Z_38bbefe2",
+        ba=0.897453,
+        dataset_sha="dataset-a",
+    )
+    right = _write_research_run(
+        tmp_path,
+        plan="telecom_v3_development_r2x5_t3_v1",
+        adapter="xgboost_numeric_v1",
+        run_id="20260729T064407009547Z_55c26d5e",
+        ba=0.897987,
+        dataset_sha="dataset-b",
+    )
+    (right / "dataset_provenance.json").write_text(
+        json.dumps(
+            {
+                "dataset_id": "v7_compact_zero_indicators",
+                "parent_dataset_id": "v4",
+                "n_features": 10,
+                "target_dependency": "none",
+                "schema_hash": "a" * 64,
+                "train_content_hash": "b" * 64,
+                "target_hash": "c" * 64,
+                "train_row_identity_hash": "d" * 64,
+                "registry_schema_version": "dataset_package_v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (right / "dataset_fingerprints.json").write_text(
+        json.dumps(
+            {
+                "dataset_version": "v7_compact_zero_indicators",
+                "files": {"train_features": {"sha256": "dataset-b"}},
+                "row_position_identity": {"sha256": "rowsha"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_registry(PROJECT_ROOT)
+    artifacts = discover_artifacts(tmp_path, loaded.readers["research_v2"])
+    by_path = {item.root: item for item in artifacts}
+    summary = display_compatibility_summary(by_path[left], by_path[right])
+    assert summary["same_dataset_fingerprint"] is False
+    assert summary["compatible"] is False
+    assert summary["descriptive_only"] is True
+    assert summary["left_dataset_id"] == "v3"
+    assert summary["right_dataset_id"] == "v7_compact_zero_indicators"
 
 
 def test_run_jobs_run_restores_selection(monkeypatch: pytest.MonkeyPatch) -> None:
