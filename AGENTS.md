@@ -31,3 +31,16 @@
 - Run relevant tests and lightweight validation before reporting completion.
 - Report changed files, commands run, validation results, and unresolved risks.
 - Code, comments, configuration names, and documentation must be written in English.
+
+## Git branches and worktrees
+
+- Default to the currently checked-out task branch. Do not create a new branch or worktree unless the user explicitly requests it or approves a clearly explained need for isolation.
+- Use at most one feature branch per logical task. Revisions, review fixes, agent handoffs, and integration work must remain on that branch.
+- Do not create successive `codex/*`, `cursor/*`, `*-corrections`, `*-final`, or `integrate-*` branches for the same task.
+- Before creating a branch or worktree, state its base branch, purpose, integration target, and cleanup plan.
+- A branch-related task is not complete until the required changes are integrated or otherwise preserved, relevant validation passes, and no required unique commits or file changes remain.
+- Authorization to create a temporary branch or worktree includes authorization to remove that same temporary branch or worktree after verified integration, unless the user asks to preserve it. This does not apply to pre-existing or long-lived branches.
+- After verified integration, remove the temporary worktree, local branch, and pushed remote branch, then run `git fetch --prune`.
+- Never force-delete an unmerged branch based only on its name, age, or the existence of a newer branch. First prove ancestry or audit its patch and file contents.
+- Before reporting completion of branch-related work, verify `git branch --all`, `git worktree list`, and `git status --short --branch`.
+- If cleanup cannot be completed safely, report every remaining branch or worktree and ask the user how to proceed. Never leave temporary Git state behind silently.
