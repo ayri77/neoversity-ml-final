@@ -44,3 +44,13 @@
 - Never force-delete an unmerged branch based only on its name, age, or the existence of a newer branch. First prove ancestry or audit its patch and file contents.
 - Before reporting completion of branch-related work, verify `git branch --all`, `git worktree list`, and `git status --short --branch`.
 - If cleanup cannot be completed safely, report every remaining branch or worktree and ask the user how to proceed. Never leave temporary Git state behind silently.
+
+## Current project status and handoff
+
+- Treat `docs/current-project-status.md` as the canonical cross-session and cross-dialog operational handoff.
+- Read it before continuing a multi-stage task, then verify the active branch, HEAD, and Git status because volatile state may have changed.
+- Update it whenever a material milestone, dataset or evaluation contract, roadmap order, active branch, known risk, or next action changes.
+- Keep it aligned with implemented code, validated artifacts, and test results. Do not record planned work as completed.
+- Do not update it for trivial refactoring or temporary investigation notes.
+- This document supplements rather than replaces immutable dataset manifests, frozen experiment manifests, specialist documentation, artifacts, and Git history.
+- Before closing a material project stage, verify that its last-updated date, current checkpoint, completed work, remaining roadmap, and immediate next action are accurate.
