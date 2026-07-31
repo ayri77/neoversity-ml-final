@@ -36,7 +36,10 @@ def test_repository_registry_is_strict_and_cross_referenced() -> None:
         "deployment_v1",
         "optuna_search_v1",
     }
-    assert loaded.commands["final_deployment_v1"].actions["run"].enabled is False
+    assert loaded.commands["final_deployment_v1"].actions["run"].enabled is True
+    assert loaded.commands["final_deployment_v1"].actions["run"].title == (
+        "Generate submission"
+    )
     assert (
         loaded.commands["final_deployment_v1"].actions["run"].competition_test is True
     )

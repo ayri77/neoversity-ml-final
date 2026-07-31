@@ -142,15 +142,43 @@ def test_build_pre_run_summary_keys() -> None:
     summary = build_pre_run_summary(
         "experiment_core_v2",
         "run",
-        "Experiment Core v2",
+        "🧪 Train",
         "Run",
         {},
         PROJECT_ROOT,
     )
     assert "Operation" in summary
     assert "Action" in summary
-    assert summary["Operation"] == "Experiment Core v2"
+    assert summary["Operation"] == "🧪 Train"
     assert summary["Action"] == "Run"
+
+
+def test_normalize_source_kind_generated_deployment_draft() -> None:
+    assert (
+        normalize_source_kind(
+            "artifacts/deployment_drafts/run-abc/deployment_config.yaml"
+        )
+        == "Generated deployment draft"
+    )
+
+
+def test_build_pre_run_summary_generated_deployment_draft() -> None:
+    summary = build_pre_run_summary(
+        "final_deployment_v1",
+        "validate",
+        "📤 Generate submission",
+        "Validate",
+        {
+            "config": (
+                "artifacts/deployment_drafts/run-abc/deployment_config.yaml"
+            )
+        },
+        PROJECT_ROOT,
+    )
+    assert summary["Operation"] == "📤 Generate submission"
+    assert summary["Source"] == "Generated deployment draft"
+    assert summary["Config type"] == "Deployment"
+    assert "[DRAFT]" in summary["Config"]
 
 
 def test_job_primary_label_basic() -> None:

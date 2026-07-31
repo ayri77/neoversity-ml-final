@@ -1,0 +1,25 @@
+schema_version: 1
+sample_submission:
+  path: data/raw/final_proj_sample_submission.csv
+  sha256: cb6c18e88548ab6fb28b3735afa1e436412e9dc86dfe6fca275ce43016516d95
+  expected_rows: 2500
+  columns:
+  - index
+  - y
+  id_column: index
+  target_column: y
+  ordered_id_sha256: 6f8d86365e60041769db51cc9287d7efe027afa20250251973af5d77d2bb2eeb
+  target_placeholder_semantics: all_zeros_allowed
+test_row_identity:
+  path: data/competition/test_row_identity_v1.json
+  sha256: a11fde85b3ebb5bafaef5222a9f5e476726539979509a3c761e5196d3eb407c2
+  expected_rows: 2500
+  id_column: index
+  id_dtype: int64
+  id_semantics: zero_based_row_position
+  test_anchor_hash: 5149a289f16b71509a923ccede164e58540b035e8fc6d9bac3eb036949f0491f
+asset_fingerprint: 15b66971997cec12b1bf1597dccb2f81aff77a6f36f30e8132b81094a4a00c5e
+notes:
+- Submission IDs are separate from model features.
+- Dataset Packages link through the proven test_anchor_hash.
+- Original competition files under data/raw are never modified.

@@ -75,37 +75,42 @@ generates a draft through `control_panel/deployment_draft_builder.py`:
 ```text
 completed Research v2 run
 → deterministic readiness report
-→ artifacts/deployment_drafts/<run-id>-<manifest-sha256[:12]>/
+→ competition asset authentication (sample submission + row identity)
+→ artifacts/deployment_drafts/<run-id>-<manifest-sha256[:12]>[-r<asset-fp8>]/
   ├── deployment_config.yaml     (this deployment_v1 schema)
   ├── threshold_evidence.yaml    (typed evidence artifact)
   ├── candidate_approval.yaml    (approval schema v1)
   └── draft_provenance.json      (run, dataset, model, protocol, threshold links)
 ```
 
-The builder reads only authoritative run sidecars and the immutable Dataset
-Package manifest. It derives dataset version, pipeline ID, adapter ID, fixed
-resolved model parameters, plan/pipeline/adapter/candidate hashes, threshold value
-and policy, and competition-test identity (path, SHA-256, expected rows, ordered
-schema hash) from the Dataset Package manifest without reading the test file.
+The builder reads authoritative run sidecars and the immutable Dataset Package
+manifest for model/feature/threshold identity. Competition submission IDs come
+from a separate authenticated contract (`competition_assets_v1` /
+`data/competition/test_row_identity_v1.json` and
+`configs/competition/competition_assets_v1.yaml`), not from the feature matrix.
+Prepared Dataset Package `X_test.parquet` remains features-only.
+
+Optional additive config key `submission_row_identity` links the draft to that
+row-identity artifact (path, SHA-256, expected rows, ID column/dtype/semantics,
+ordered ID hash, row-position identity, Dataset Package `test_anchor_hash`).
+Legacy synthetic fixtures without this key keep the previous ID-on-test-frame
+path.
+
 Drafts are repository-relative, written atomically, idempotent on identical
 regeneration, and never silently replaced; a recorded approval is never rewritten.
+Unresolved historical drafts (placeholder sample path) remain inspectable.
+Resolved drafts use a deterministic `-r<asset-fingerprint[:8]>` revision so the
+unresolved draft is not overwritten.
 
 A generated draft is accepted by `load_deployment_config` and by
 `run_deployment_v1.py validate`, and can be rehearsed with
 `run_deployment_v1.py dry-run` against an approved synthetic fixture.
 
-Two inputs are intentionally **not** derived, so a real competition run stays
-blocked after draft generation:
-
-- `sample_submission` identity. The draft records
-  `data/competition/UNRESOLVED_sample_submission.csv` with a placeholder hash
-  because no registered competition sample submission exists to authenticate.
-- The submission ID column. A prepared Dataset Package `X_test.parquet` contains
-  features only, so the configured `id_column` is absent from the competition test
-  frame and `_validate_sample_and_alignment` would reject a real run.
-
-The registry action for the real run also remains `enabled: false` with
-`competition_test: true` and acknowledge confirmation.
+Local **Generate submission** (`run` + `--allow-competition-test`) is enabled in
+the registry only with acknowledge confirmation, a resolved draft, authenticated
+sample-submission identity, authenticated test-row identity, no-overwrite output
+under `artifacts/deployments/<deployment_id>`, and `runtime.network_enabled: false`.
+It does not upload to Kaggle.
 
 ## Full-data features and bagging
 

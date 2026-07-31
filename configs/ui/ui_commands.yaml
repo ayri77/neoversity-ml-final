@@ -481,8 +481,12 @@ commands:
         success_markers: ['"ok": true']
         failure_markers: ['"ok": false']
       - id: run
-        title: Real deployment run
-        description: Competition-test deployment; intentionally disabled by default in v1.
+        title: Generate submission
+        description: >
+          Local competition submission generation with explicit acknowledgement.
+          Network upload remains disabled. Launch still requires a resolved
+          deployment draft with authenticated sample-submission and test-row identity.
+          Output uses artifacts/deployments/<deployment_id> with no-overwrite.
         argv:
           - "run"
           - "--config"
@@ -496,7 +500,7 @@ commands:
             roots: ["configs/deployment", "artifacts/deployment_drafts", "artifacts/blend_deployment_packages"]
             must_exist: true
         confirmation: acknowledge
-        enabled: false
+        enabled: true
         competition_test: true
         success_markers: ['"ok": true']
         failure_markers: ['"ok": false']

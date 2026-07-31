@@ -136,9 +136,12 @@ untyped selector therefore cannot serve both Experiment Core and Final Deploymen
   identity (never the Research v2 YAML) through `apply_submission_handoff()`, so
   Results does not duplicate the builder.
 
-Real competition submission stays disabled. The generated draft leaves
-sample-submission identity unresolved, and the `run` action remains
-`enabled: false` with `competition_test: true` and acknowledge confirmation.
+Generated drafts are read-only. Competition sample-submission and test-row
+identity are authenticated separately (`competition_assets_v1`); submission IDs
+are not model features. Resolved drafts use a deterministic revision suffix so
+unresolved drafts remain inspectable. **Generate submission** requires
+acknowledge confirmation, a resolved draft, and readiness gates; output is
+local no-overwrite under `artifacts/deployments` with network upload disabled.
 
 ## Experiment Core v2 entry modes
 

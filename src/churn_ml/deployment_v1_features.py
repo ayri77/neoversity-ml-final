@@ -8,11 +8,16 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 
+from src.churn_ml.competition_assets_v1 import (
+    load_row_identity_artifact,
+    submission_ids_from_identity,
+)
 from src.churn_ml.deployment_v1_auth import SyntheticFixture
 from src.churn_ml.deployment_v1_contracts import (
     DeploymentConfig,
     ValidatedDeployment,
 )
+from src.churn_ml.control_panel.path_safety import PathSafetyError
 from src.churn_ml.deployment_v1_paths import (
     DeploymentPathError,
     validate_regular_file,
@@ -132,9 +137,7 @@ def load_deployment_data(
                 "values": y_train.tolist(),
             }
         ),
-        "test_id_sha256": canonical_sha256(
-            source_test[config.payload["sample_submission"]["id_column"]].tolist()
-        ),
+        "test_id_sha256": canonical_sha256(list(test_row_keys)),
         "sample_id_sha256": canonical_sha256(
             sample[config.payload["sample_submission"]["id_column"]].tolist()
         ),
@@ -326,13 +329,69 @@ def _validate_sample_and_alignment(
     expected_columns = [sample_config["id_column"], sample_config["target_column"]]
     if sample.columns.tolist() != expected_columns:
         raise DeploymentDataError("Sample submission columns or order differ.")
+    sample_ids = sample[sample_config["id_column"]].reset_index(drop=True)
+    _validate_id_series(sample_ids, "Sample submission")
+
+    row_identity_ref = config.payload.get("submission_row_identity")
+    if row_identity_ref is not None:
+        # Competition path: IDs come from a separate authenticated artifact.
+        # The feature matrix must not contain the submission ID column.
+        id_column = str(row_identity_ref["id_column"])
+        if id_column in test.columns:
+            raise DeploymentDataError(
+                "Submission ID column must not appear in the model feature matrix."
+            )
+        try:
+            identity_payload = load_row_identity_artifact(
+                config.project_root,
+                str(row_identity_ref["path"]),
+                expected_sha256=str(row_identity_ref["sha256"]),
+            )
+            materialised = submission_ids_from_identity(identity_payload)
+        except (OSError, ValueError, DeploymentPathError, PathSafetyError) as error:
+            raise DeploymentDataError(
+                f"Submission row identity failed authentication: {error}"
+            ) from error
+        if int(identity_payload["expected_rows"]) != len(test):
+            raise DeploymentDataError(
+                "Feature test row count differs from submission row identity."
+            )
+        if int(identity_payload["expected_rows"]) != len(sample):
+            raise DeploymentDataError(
+                "Sample submission row count differs from submission row identity."
+            )
+        if identity_payload["ordered_id_sha256"] != row_identity_ref["ordered_id_sha256"]:
+            raise DeploymentDataError("Ordered submission ID hash differs.")
+        if (
+            identity_payload["row_position_identity_sha256"]
+            != row_identity_ref["row_position_identity_sha256"]
+        ):
+            raise DeploymentDataError("Row-position identity hash differs.")
+        if canonical_sha256(sample_ids.tolist()) != row_identity_ref["ordered_id_sha256"]:
+            raise DeploymentDataError(
+                "Sample submission ordered IDs disagree with the row-identity artifact."
+            )
+        if sample_ids.tolist() != materialised:
+            raise DeploymentDataError(
+                "Sample submission ID order differs from the row-identity artifact."
+            )
+        # Row-count-only agreement is never enough: the ordered hash must match.
+        if canonical_sha256(list(range(len(test)))) != row_identity_ref[
+            "row_position_identity_sha256"
+        ]:
+            raise DeploymentDataError(
+                "Feature-matrix row-position identity differs from the authenticated "
+                "submission row identity."
+            )
+        keys = tuple(materialised)
+        return keys, canonical_sha256(list(keys))
+
+    # Legacy / synthetic-fixture path: ID column lives on the test frame.
     test_id = str(test_config.get("id_column", sample_config["id_column"]))
     if test_id not in test.columns:
         raise DeploymentDataError("Configured test ID column is absent.")
     test_ids = test[test_id].reset_index(drop=True)
-    sample_ids = sample[sample_config["id_column"]].reset_index(drop=True)
-    for values, label in ((test_ids, "Test"), (sample_ids, "Sample submission")):
-        _validate_id_series(values, label)
+    _validate_id_series(test_ids, "Test")
     if str(test_ids.dtype) != str(sample_ids.dtype):
         raise DeploymentDataError("Test and sample ID dtypes differ.")
     if not test_ids.equals(sample_ids):

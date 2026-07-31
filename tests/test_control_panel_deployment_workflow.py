@@ -30,17 +30,30 @@ from src.churn_ml.control_panel.deployment_candidates import (
     evaluate_deployment_readiness,
     list_deployment_candidates,
 )
+from src.churn_ml.control_panel.config_editor import ConfigEditError, read_config
 from src.churn_ml.control_panel.deployment_draft_builder import (
     APPROVAL_NAME,
+    DEFAULT_EXCEPTION_REASON,
+    DEFAULT_INTENDED_ROLE,
     DEPLOYMENT_CONFIG_NAME,
     DEPLOYMENT_DRAFT_ROOT,
     DeploymentDraftConflictError,
     DeploymentDraftError,
     prepare_deployment_draft,
 )
+from src.churn_ml.control_panel.presentation import (
+    build_pre_run_summary,
+    config_preview_allowed_roots,
+    is_read_only_config_path,
+    normalize_source_kind,
+)
 from src.churn_ml.control_panel.registry import load_registry
 from src.churn_ml.control_panel.research_inventory import build_research_inventory
-from src.churn_ml.control_panel.selection_state import get_durable_value
+from src.churn_ml.control_panel.selection_state import (
+    get_durable_value,
+    set_durable_value,
+    ui_durable_key,
+)
 from src.churn_ml.control_panel.workflow_navigation import (
     LEGACY_BADGE,
     RESEARCH_V2_RUN_CONTRACT,
@@ -405,11 +418,10 @@ def test_builder_produces_the_actual_deployment_schema(
     assert provenance["dataset"]["dataset_id"] == DATASET_ID
     assert provenance["model"]["adapter_id"] == ADAPTER_ID
     assert provenance["protocol"]["plan_sha256"] == _PLAN_HASH
-    assert provenance["safety"] == {
-        "competition_test_assets_accessed": False,
-        "sample_submission_identity_resolved": False,
-        "real_competition_run_ready": False,
-    }
+    assert provenance["safety"]["competition_test_assets_accessed"] is False
+    assert provenance["safety"]["sample_submission_identity_resolved"] is False
+    assert provenance["safety"]["real_competition_run_ready"] is False
+    assert "submission_row_identity" not in config
     approval = draft.payload.candidate_approval
     assert approval["research_run"]["path"] == canonical_run
     assert approval["manual_approval"]["approver"] == APPROVER
@@ -615,7 +627,8 @@ def test_competition_test_safety_and_typed_deployment_inputs_unchanged() -> None
     actions = deployment.actions
 
     real_run = actions["run"]
-    assert real_run.enabled is False
+    assert real_run.enabled is True
+    assert real_run.title == "Generate submission"
     assert real_run.competition_test is True
     assert real_run.confirmation == "acknowledge"
     for action_id in ("validate", "dry_run", "inspect"):
@@ -659,3 +672,99 @@ def test_draft_artifacts_contain_only_deployment_schema_content(
     assert config["components"][0]["approval_artifact_path"] == (
         draft.candidate_approval_path
     )
+
+
+def test_generated_draft_preview_uses_operation_specific_roots(
+    tmp_path: Path, canonical_run: str
+) -> None:
+    draft = prepare_deployment_draft(
+        tmp_path, canonical_run, approver=APPROVER, approved_at_utc=APPROVED_AT
+    )
+    registry = load_registry(REPOSITORY_ROOT)
+    deployment = registry.commands["final_deployment_v1"]
+    train = registry.commands["experiment_core_v2"]
+    deploy_roots = config_preview_allowed_roots(
+        allowed_input_roots=deployment.allowed_input_roots,
+        config_placeholder_roots=deployment.actions["validate"].placeholders[
+            "config"
+        ].roots,
+        allowed_config_globs=deployment.allowed_config_globs,
+    )
+    train_roots = config_preview_allowed_roots(
+        allowed_input_roots=train.allowed_input_roots,
+        config_placeholder_roots=train.actions["validate"].placeholders["config"].roots,
+        allowed_config_globs=train.allowed_config_globs,
+    )
+
+    assert DEPLOYMENT_DRAFT_ROOT in deploy_roots
+    assert "artifacts/ui_configs" not in deploy_roots
+    assert "artifacts/ui_configs" in train_roots
+    assert DEPLOYMENT_DRAFT_ROOT not in train_roots
+
+    text, canonical = read_config(
+        tmp_path, draft.deployment_config_path, allowed_roots=deploy_roots
+    )
+    assert "deployment_id" in text
+    assert canonical.name == DEPLOYMENT_CONFIG_NAME
+    assert is_read_only_config_path(draft.deployment_config_path) is True
+    assert (
+        normalize_source_kind(draft.deployment_config_path)
+        == "Generated deployment draft"
+    )
+
+    with pytest.raises(ConfigEditError, match="outside declared roots"):
+        read_config(
+            tmp_path, draft.deployment_config_path, allowed_roots=train_roots
+        )
+
+
+def test_user_facing_summary_for_generated_draft(
+    tmp_path: Path, canonical_run: str
+) -> None:
+    draft = prepare_deployment_draft(
+        tmp_path, canonical_run, approver=APPROVER, approved_at_utc=APPROVED_AT
+    )
+    operation = workflow_label("final_deployment_v1", fallback="final_deployment_v1")
+    summary = build_pre_run_summary(
+        "final_deployment_v1",
+        "validate",
+        operation,
+        "Validate",
+        {"config": draft.deployment_config_path},
+        tmp_path,
+    )
+    assert operation == "📤 Generate submission"
+    assert summary["Operation"] == "📤 Generate submission"
+    assert summary["Source"] == "Generated deployment draft"
+    assert summary["Config type"] == "Deployment"
+    assert "[OTHER]" not in summary["Config"]
+    assert "[DRAFT]" in summary["Config"]
+
+
+def test_approver_durable_state_key_and_advanced_defaults() -> None:
+    session: dict[str, object] = {}
+    durable = ui_durable_key("run", "deployment_approver")
+    set_durable_value(session, durable, "local-operator")
+    assert get_durable_value(session, durable) == "local-operator"
+    # Advanced approval fields keep their contract defaults when not customized.
+    assert DEFAULT_INTENDED_ROLE
+    assert DEFAULT_EXCEPTION_REASON
+
+
+def test_submission_blocked_message_is_context_specific() -> None:
+    # The Generate submission page must not reuse the dataset-driven Train message.
+    import apps.experiment_control_panel as panel
+
+    source = Path(panel.__file__).read_text(encoding="utf-8")
+    assert "Prepare a deployment draft before running validation." in source
+    assert "Validate and test" in source
+    assert "Approved by" in source
+    assert "Advanced approval details" in source
+    assert "Enter the approver name to prepare the draft." in source
+    # Dataset-driven Train message remains only for that entry mode.
+    assert (
+        "Prepare a valid dataset-driven configuration before Validate/Run."
+        in source
+    )
+    assert 'command_id == "final_deployment_v1"' in source
+    assert "use_dataset_driven" in source

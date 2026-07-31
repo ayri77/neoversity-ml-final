@@ -6,22 +6,23 @@
 **Last updated:** 2026-07-31  
 **Repository:** `ayri77/neoversity-ml-final`  
 **Active task branch:** `feature/prepared-dataset-pipeline-v1`  
-**Current checkpoint:** Research Workspace v1 and the canonical run to
-    deployment workflow v1 are implemented and committed on
-    `feature/prepared-dataset-pipeline-v1` (base HEAD `8e0c79f`). The Control
-    Panel now offers the ordered workflow Train → Compare → Tune → Blend →
-    Generate submission, generates `deployment_v1` drafts from completed
-    canonical runs under `artifacts/deployment_drafts/`, and rejects
-    cross-schema configurations. Verified locally on run
-    `20260731T102957829301Z_83e78e3f`: `validate` → `"ok": true`, synthetic
-    `dry-run` against a local non-competition fixture → `"ok": true`,
-    `uploaded: false`. Real Kaggle submission remains blocked (unresolved sample
-    submission identity and no submission ID column in prepared test features).
-    Stage D Dataset Campaign / Matrix Runner v1 remains committed (`6deafc3`)
-    and the 21-run unbiased development screening campaign has **not** been
-    executed via the Campaign Runner. Manual Research v2 coverage of
-    approximately 3 model families × 8 Dataset Packages exists on disk. Stage E
-    has not started.
+**Current checkpoint:** Canonical submission workflow v1 is implemented on
+    `feature/prepared-dataset-pipeline-v1`. The Control Panel workflow Train →
+    Compare → Tune → Blend → Generate submission produces read-only
+    `deployment_v1` drafts under `artifacts/deployment_drafts/`, uses
+    operation-specific config-preview roots, and authenticates competition
+    sample-submission plus separate test-row identity
+    (`competition_assets_v1`, `configs/competition/competition_assets_v1.yaml`,
+    `data/competition/test_row_identity_v1.json`). Submission IDs are not model
+    features. Unresolved and resolved drafts coexist via a deterministic
+    `-r<asset-fingerprint>` revision. Verified on LightGBM run
+    `20260731T102957829301Z_83e78e3f`: production `validate` → `"ok": true` for
+    both the historical unresolved draft and the resolved revision. Local
+    Generate submission is registry-enabled with acknowledge + readiness gates;
+    network/Kaggle upload remains disabled. Dataset Comparison v1 remains
+    unimplemented. Stage D Dataset Campaign / Matrix Runner v1 remains committed
+    (`6deafc3`) and the 21-run campaign has **not** been executed via the
+    Campaign Runner. Stage E has not started.
 
 ## 1. Purpose and maintenance policy
 
@@ -83,9 +84,10 @@ Immediate next actions:
 5. Do not start the full 21-run development screening campaign until every
    package passes the audit and validate-only succeeds. Manual Research v2
    coverage does not replace a frozen Campaign Runner execution.
-6. Treat generated deployment drafts as rehearsal evidence only. Do not enable
-   the real deployment run until competition sample-submission identity and a
-   submission ID column for the prepared test frame are authoritative.
+6. For local competition submission: select the completed LightGBM run, prepare
+   the resolved deployment draft (revision suffix), Validate, Synthetic dry run
+   if desired, then Generate submission with explicit acknowledgement. Do not
+   upload to Kaggle from this workflow.
 
 The Experiment Control Panel dataset selector is implemented and covered by
 automated tests, including a validate-only smoke path for
@@ -732,7 +734,10 @@ Completed for Experiment Core v2:
       (`control_panel/config_schema_guard.py`) and removal of the mixed-schema
       `artifacts/ui_configs` root from Final Deployment inputs;
     - Results → Research Workspace **Prepare for submission** run-identity
-      handoff.
+      handoff;
+    - authenticated competition assets and separate submission/test-row identity
+      (`competition_assets_v1`); optional `submission_row_identity` on
+      `deployment_v1`; Generate submission readiness gates; no Kaggle upload.
 
 Still planned after the Campaign Runner and comparison contract exist:
 
@@ -743,13 +748,8 @@ Still planned after the Campaign Runner and comparison contract exist:
 4. Physical authoritative-result deletion (explicitly out of scope for the
    current archive/cleanup v1).
 5. Dataset Comparison v1 and canonical completed-artifact handoffs for Tune and
-   Blend (both still start from a configuration).
-6. Real competition submission wiring. Two authoritative inputs are still
-   missing, so the real deployment run stays disabled:
-   - no registered competition sample submission to authenticate, so drafts
-     record an unresolved placeholder path and hash;
-   - prepared `X_test.parquet` contains features only, so the configured
-     submission `id_column` is absent from the competition test frame.
+   Blend (both still start from a configuration). Dataset Comparison v1 is
+   **not** implemented.
 
 ## 16. Stage G — screening and decision rules
 

@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AbstractSet, Any, Mapping, MutableSet
 
+from src.churn_ml.competition_assets_v1 import require_resolved_competition_draft
 from src.churn_ml.control_panel.command_builder import BuiltCommand, build_command
+from src.churn_ml.control_panel.path_safety import PathSafetyError
 from src.churn_ml.control_panel.process import argv_fingerprint
 from src.churn_ml.control_panel.schemas import CommandSpec
 
@@ -71,6 +73,16 @@ def authorize_launch(
         raise LaunchAuthorizationError("Required launch confirmation is missing.")
     if action.competition_test and not high_risk_acknowledged:
         raise LaunchAuthorizationError("Required high-risk acknowledgement is missing.")
+    if command_id == "final_deployment_v1" and action_id == "run":
+        config_value = values.get("config")
+        if not isinstance(config_value, str) or not config_value.strip():
+            raise LaunchAuthorizationError(
+                "Generate submission requires a resolved deployment draft."
+            )
+        try:
+            require_resolved_competition_draft(repository_root, config_value)
+        except (OSError, ValueError, PathSafetyError) as error:
+            raise LaunchAuthorizationError(str(error)) from error
     try:
         built = build_command(
             commands,

@@ -53,6 +53,13 @@ required keys fail validation.
 | `target` | Name, dtype, class counts, and value hash |
 | `row_identity` | Train/test content hashes plus alignment proof fields |
 
+Competition submission IDs are **not** Dataset Package features. When local
+competition files are present, `competition_assets_v1` registers
+`data/raw/final_proj_sample_submission.csv` and derives a separate authenticated
+row-identity artifact (`data/competition/test_row_identity_v1.json`) linked to
+the package `test_anchor_hash`. Existing packages and Research v2 runs are not
+mutated; see `configs/competition/competition_assets_v1.yaml`.
+
 ## Feature roles
 
 Exact allowed roles:

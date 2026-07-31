@@ -216,22 +216,28 @@ path. The deployment configuration is generated for you.
    evidence, the competition-test access flag (`false`), and the deployment
    schema that will be produced. When something authoritative is missing the
    step is **blocked** and every blocking reason is listed. Nothing is guessed.
-5. **3. Prepare deployment draft** — enter the approver required by the
-   deployment approval contract, then click **Prepare deployment draft**. The
-   builder writes, under `artifacts/deployment_drafts/<candidate-id>/`:
-   `deployment_config.yaml`, `threshold_evidence.yaml`, `candidate_approval.yaml`,
-   and `draft_provenance.json`. Regenerating the same run is idempotent; a draft
-   whose content differs produces a conflict instead of being overwritten, and a
-   recorded approval is never rewritten.
-6. **4. Validate and rehearse** — the generated draft is used as the `config`
+5. **3. Competition submission readiness** — authenticates the local sample
+   submission and the separate test-row identity artifact. When ready, the panel
+   shows `Competition submission readiness: ready`; otherwise it lists exact
+   blocking reasons. Submission IDs are never model features.
+6. **4. Prepare deployment draft** — enter **Approved by** (remembered locally as
+   an audit record), optionally open **Advanced approval details**, then click
+   **Prepare deployment draft**. Generated drafts are **read-only** preview
+   artifacts under `artifacts/deployment_drafts/<candidate-id>/`. Resolved drafts
+   use a revision suffix derived from the authenticated competition asset
+   fingerprint so an older unresolved draft is never overwritten. Regenerating
+   identical content is idempotent; differing content conflicts instead of
+   replacing, and a recorded approval is never rewritten.
+7. **5. Validate and test** — the generated draft is used as the `config`
    argument. Start the job and confirm `"ok": true` on Jobs.
-7. **Synthetic dry run** — select action **Synthetic dry run** and provide an
+8. **Synthetic dry run** — select action **Synthetic dry run** and provide an
    approved fixture directory under `artifacts/deployment_fixtures` plus a new
    output directory under `artifacts/deployments`.
-
-Real competition submission stays disabled: the generated draft intentionally
-leaves sample-submission identity unresolved, and the real deployment run remains
-disabled in the command registry.
+9. **Generate submission** — available only when competition readiness is ready
+   and a resolved draft carries authenticated sample-submission plus row-identity
+   references. Requires explicit competition-test acknowledgement. Output stays
+   local under `artifacts/deployments/<deployment_id>` with no-overwrite; network
+   upload to Kaggle remains disabled.
 
 You can also start from **Results → Research Workspace**: open a run and click
 **Prepare for submission**. That transfers only the run identity to Generate

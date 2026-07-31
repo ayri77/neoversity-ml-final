@@ -324,11 +324,12 @@ def evaluate_deployment_readiness(
     if facts.test_data_sha256 is not None:
         warnings.append(
             "Competition test identity is taken from the immutable Dataset Package "
-            "manifest; the test file itself is not read here."
+            "manifest; the feature matrix itself is not read here."
         )
     warnings.append(
-        "Sample-submission identity is a deployment-specific input and stays "
-        "unresolved in the draft, so a real competition run remains blocked."
+        "Competition submission readiness is evaluated separately from run "
+        "readiness: authenticated sample-submission and test-row identity must "
+        "resolve before Generate submission can run."
     )
     return DeploymentReadiness(
         supported=not blocking,

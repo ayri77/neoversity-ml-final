@@ -49,27 +49,32 @@ def normalize_mode(raw: str) -> str:
 
 def normalize_source_kind(path_str: str, content: dict | None = None) -> str:
     del content
-    if path_str.startswith("artifacts/optuna_exports"):
+    relative = str(path_str).replace("\\", "/")
+    if relative.startswith("artifacts/optuna_exports"):
         return "Optuna export"
-    if path_str.startswith("artifacts/optuna_searches"):
+    if relative.startswith("artifacts/optuna_searches"):
         return "Optuna study"
-    if path_str.startswith("artifacts/ui_configs"):
+    if relative.startswith("artifacts/ui_configs"):
         return "UI config copy"
-    if path_str.startswith("artifacts/research_v2_comparisons"):
+    if relative.startswith("artifacts/research_v2_comparisons"):
         return "Paired comparison"
-    if path_str.startswith("artifacts/blend_evaluations"):
+    if relative.startswith("artifacts/blend_evaluations"):
         return "Blend evaluation"
-    if path_str.startswith("artifacts/blend_deployment_packages"):
+    if relative.startswith("artifacts/blend_deployment_packages"):
         return "Blend deployment package"
-    if path_str.startswith("artifacts/research_v2"):
+    if relative.startswith("artifacts/deployment_drafts"):
+        return "Generated deployment draft"
+    if relative.startswith("artifacts/research_v2"):
         return "Experiment Core run"
-    if path_str.startswith("artifacts/research/"):
+    if relative.startswith("artifacts/research/"):
         return "Research v1 run"
-    if path_str.startswith("artifacts/deployments"):
+    if relative.startswith("artifacts/deployments"):
         return "Deployment artifact"
-    if path_str.startswith("artifacts/deployment_fixtures"):
+    if relative.startswith("artifacts/deployment_fixtures"):
         return "Deployment fixture"
-    if path_str.startswith("configs/"):
+    if relative.startswith("configs/deployment"):
+        return "Canonical deployment config"
+    if relative.startswith("configs/"):
         return "Canonical config"
     return "Other"
 
@@ -80,6 +85,8 @@ def config_badge(source_kind: str) -> str:
         "Optuna study": "STUDY",
         "UI config copy": "COPY",
         "Canonical config": "CANONICAL",
+        "Canonical deployment config": "CANONICAL",
+        "Generated deployment draft": "DRAFT",
         "Experiment Core run": "RUN",
         "Research v1 run": "RUN",
         "Paired comparison": "COMPARE",
@@ -89,6 +96,20 @@ def config_badge(source_kind: str) -> str:
         "Deployment fixture": "FIXTURE",
     }
     return mapping.get(source_kind, "OTHER")
+
+
+def is_generated_deployment_draft(path_str: str) -> bool:
+    """True when the path is a generated draft under the dedicated draft root."""
+    relative = str(path_str).replace("\\", "/")
+    return relative.startswith("artifacts/deployment_drafts/")
+
+
+def is_read_only_config_path(path_str: str) -> bool:
+    """Generated deployment drafts are immutable; preview is allowed, editing is not."""
+    relative = str(path_str).replace("\\", "/")
+    return is_generated_deployment_draft(relative) or relative.startswith(
+        "artifacts/blend_deployment_packages/"
+    )
 
 
 def mode_badge(mode: str) -> str:
@@ -661,7 +682,16 @@ def build_pre_run_summary(
             summary["Source"] = source_kind
 
         config_base = Path(str(config_path)).name
-        if badge:
+        if source_kind in {
+            "Generated deployment draft",
+            "Canonical deployment config",
+            "Blend deployment package",
+        }:
+            summary["Config type"] = "Deployment"
+            summary["Config"] = (
+                f"{config_base} [{badge}]" if badge else config_base
+            )
+        elif badge:
             summary["Config"] = f"{config_base} [{badge}]"
         else:
             summary["Config"] = config_base
@@ -678,12 +708,44 @@ def build_pre_run_summary(
     return summary
 
 
+def config_preview_allowed_roots(
+    *,
+    allowed_input_roots: tuple[str, ...] | list[str],
+    config_placeholder_roots: tuple[str, ...] | list[str] | None = None,
+    allowed_config_globs: tuple[str, ...] | list[str] | None = None,
+) -> tuple[str, ...]:
+    """Operation-specific roots for safe config preview (never a global union)."""
+    roots: list[str] = []
+    for value in allowed_input_roots:
+        text = str(value).replace("\\", "/").strip().rstrip("/")
+        if text and text not in roots:
+            roots.append(text)
+    if config_placeholder_roots:
+        for value in config_placeholder_roots:
+            text = str(value).replace("\\", "/").strip().rstrip("/")
+            if text and text not in roots:
+                roots.append(text)
+    if allowed_config_globs:
+        for glob in allowed_config_globs:
+            text = str(glob).replace("\\", "/").strip()
+            if not text or text.startswith("*"):
+                continue
+            parent = str(Path(text).parent).replace("\\", "/")
+            if parent in {".", ""}:
+                continue
+            if parent not in roots:
+                roots.append(parent)
+    return tuple(roots)
+
+
 # ---------------------------------------------------------------------------
 # Cascade config selector helpers
 # ---------------------------------------------------------------------------
 
 _SOURCE_LABEL_MAP: dict[str, str] = {
     "Canonical config": "Canonical config",
+    "Canonical deployment config": "Canonical deployment config",
+    "Generated deployment draft": "Generated deployment draft",
     "Optuna export": "Optuna export",
     "Optuna study": "Optuna study",
     "UI config copy": "UI copy",

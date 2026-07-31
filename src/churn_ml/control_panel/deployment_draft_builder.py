@@ -24,6 +24,13 @@ from typing import Any, Mapping
 
 import yaml
 
+from src.churn_ml.competition_assets_v1 import (
+    DEFAULT_ID_COLUMN,
+    DEFAULT_TARGET_COLUMN,
+    ID_SEMANTICS,
+    ensure_competition_row_identity,
+    write_competition_asset_registry,
+)
 from src.churn_ml.control_panel.deployment_candidates import (
     DEFAULT_SUBMISSION_ID_COLUMN,
     DEFAULT_SUBMISSION_TARGET_COLUMN,
@@ -137,8 +144,24 @@ def build_deployment_draft_payload(
     approved_at = _required_utc(approved_at_utc)
 
     facts = readiness.facts
-    candidate_id = facts.candidate_id
-    if candidate_id is None or _SLUG.fullmatch(candidate_id) is None:
+    base_candidate_id = facts.candidate_id
+    if base_candidate_id is None or _SLUG.fullmatch(base_candidate_id) is None:
+        raise DeploymentDraftError("A safe deterministic candidate ID is unavailable.")
+
+    assets = ensure_competition_row_identity(
+        repository_root, dataset_version=facts.dataset_version
+    )
+    if assets.ready and assets.asset_fingerprint:
+        candidate_id = f"{base_candidate_id}-r{assets.asset_fingerprint[:8]}"
+        try:
+            write_competition_asset_registry(repository_root, assets)
+        except OSError as error:
+            raise DeploymentDraftError(
+                f"Competition asset registry could not be written: {error}"
+            ) from error
+    else:
+        candidate_id = base_candidate_id
+    if _SLUG.fullmatch(candidate_id) is None:
         raise DeploymentDraftError("A safe deterministic candidate ID is unavailable.")
 
     threshold_evidence = {
@@ -243,19 +266,41 @@ def build_deployment_draft_payload(
             "expected_rows": facts.test_expected_rows,
             "ordered_schema_sha256": facts.test_ordered_schema_sha256,
         },
-        "sample_submission": {
-            "path": UNRESOLVED_SAMPLE_SUBMISSION_PATH,
-            "sha256": "0" * 64,
-            "expected_rows": facts.test_expected_rows,
-            "id_column": DEFAULT_SUBMISSION_ID_COLUMN,
-            "target_column": DEFAULT_SUBMISSION_TARGET_COLUMN,
-        },
+        "sample_submission": (
+            {
+                "path": assets.sample_submission_path,
+                "sha256": assets.sample_submission_sha256,
+                "expected_rows": assets.sample_expected_rows,
+                "id_column": assets.id_column or DEFAULT_ID_COLUMN,
+                "target_column": assets.target_column or DEFAULT_TARGET_COLUMN,
+            }
+            if assets.ready
+            else {
+                "path": UNRESOLVED_SAMPLE_SUBMISSION_PATH,
+                "sha256": "0" * 64,
+                "expected_rows": facts.test_expected_rows,
+                "id_column": DEFAULT_SUBMISSION_ID_COLUMN,
+                "target_column": DEFAULT_SUBMISSION_TARGET_COLUMN,
+            }
+        ),
         "output": {
             "root": "artifacts/deployments",
             "submission_filename": "submission.csv",
         },
         "runtime": {"tracking_enabled": False, "network_enabled": False},
     }
+    if assets.ready:
+        deployment_config["submission_row_identity"] = {
+            "path": assets.row_identity_path,
+            "sha256": assets.row_identity_sha256,
+            "expected_rows": assets.sample_expected_rows,
+            "id_column": assets.id_column or DEFAULT_ID_COLUMN,
+            "id_dtype": "int64",
+            "id_semantics": ID_SEMANTICS,
+            "ordered_id_sha256": assets.ordered_id_sha256,
+            "row_position_identity_sha256": assets.ordered_id_sha256,
+            "test_anchor_hash": assets.test_anchor_hash,
+        }
 
     provenance = {
         "schema_version": 1,
@@ -306,8 +351,18 @@ def build_deployment_draft_payload(
         },
         "safety": {
             "competition_test_assets_accessed": False,
-            "sample_submission_identity_resolved": False,
-            "real_competition_run_ready": False,
+            "sample_submission_identity_resolved": bool(assets.ready),
+            "real_competition_run_ready": bool(assets.ready),
+            "competition_asset_fingerprint": assets.asset_fingerprint,
+            "competition_blocking_reasons": list(assets.blocking_reasons),
+        },
+        "competition_assets": {
+            "ready": bool(assets.ready),
+            "sample_submission_path": assets.sample_submission_path,
+            "row_identity_path": assets.row_identity_path,
+            "ordered_id_sha256": assets.ordered_id_sha256,
+            "test_anchor_hash": assets.test_anchor_hash,
+            "asset_fingerprint": assets.asset_fingerprint,
         },
     }
     return DeploymentDraftPayload(

@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 import pandas as pd
 import streamlit as st
+import yaml
 
 try:
     import plotly.express as px  # type: ignore[import-untyped]
@@ -75,7 +76,11 @@ from src.churn_ml.control_panel.workflow_navigation import (  # noqa: E402
 )
 from src.churn_ml.control_panel.config_schema_guard import (  # noqa: E402
     ConfigGuardResult,
+    classify_config_document,
     guard_config_for_command,
+)
+from src.churn_ml.competition_assets_v1 import (  # noqa: E402
+    resolve_competition_assets,
 )
 from src.churn_ml.control_panel.deployment_candidates import (  # noqa: E402
     CANDIDATE_WIDGET_KEY,
@@ -137,14 +142,17 @@ from src.churn_ml.control_panel.presentation import (  # noqa: E402
     cascade_available_modes,
     cascade_available_sources,
     cascade_filter_configs,
+    config_preview_allowed_roots,
     enum_human_label,
     format_date,
     format_time,
     is_raw_run_id,
+    is_read_only_config_path,
     job_primary_label as _imported_job_primary_label,
     mode_badge,
     mode_human_label,
     model_human_label,
+    normalize_source_kind,
     parse_config_metadata,
     readable_config_label,
     readable_path_label,
@@ -170,6 +178,7 @@ from src.churn_ml.control_panel.registry import (  # noqa: E402
 )
 from src.churn_ml.control_panel.schemas import (  # noqa: E402
     ActionSpec,
+    CommandSpec,
     PlaceholderSpec,
     SchemaError,
 )
@@ -556,7 +565,7 @@ def run_page() -> None:
             )
 
     if selected_config is not None and selected_config.is_file():
-        _config_panel(loaded, selected_config)
+        _config_panel(loaded, selected_config, command=command, action=action)
 
     st.session_state["_last_command_id"] = command_id
     st.session_state["_last_action_id"] = action_id
@@ -566,6 +575,7 @@ def run_page() -> None:
     schema_blocks_launch = config_guard is not None and not config_guard.ok
     built = None
     pre_run: dict[str, str] = {}
+    operation_label = workflow_label(command_id, fallback=command.title)
     try:
         if action.enabled and not dataset_driven_blocks_launch and (
             not schema_blocks_launch
@@ -580,14 +590,16 @@ def run_page() -> None:
             pre_run = build_pre_run_summary(
                 command_id,
                 action_id,
-                command.title,
+                operation_label,
                 action.title,
                 values,
                 REPOSITORY_ROOT,
             )
             if dataset_driven_summary:
                 merged = {**dataset_driven_summary, **pre_run}
-                # Keep dataset-driven identity fields ahead of generic summary.
+                # Keep dataset-driven / submission identity fields ahead of
+                # the generic summary, and prefer the user-facing operation label.
+                merged["Operation"] = operation_label
                 ordered: dict[str, str] = {}
                 for key in (
                     "Operation",
@@ -597,12 +609,17 @@ def run_page() -> None:
                     "Target dependency",
                     "Pipeline",
                     "Model",
+                    "Model family",
                     "Evaluation mode",
                     "Mode",
                     "Base template",
                     "Prepared config",
                     "Prepared evaluation plan",
+                    "Selected run",
+                    "Deployment readiness",
+                    "Deployment draft",
                     "Source",
+                    "Config type",
                     "Config",
                     "Plan",
                 ):
@@ -617,10 +634,14 @@ def run_page() -> None:
                 st.code(display_argv(built.redacted_argv), language="python")
         elif schema_blocks_launch:
             st.info("Select a configuration that matches this operation's contract.")
-        elif dataset_driven_blocks_launch:
+        elif dataset_driven_blocks_launch and command_id == "final_deployment_v1":
+            st.info("Prepare a deployment draft before running validation.")
+        elif dataset_driven_blocks_launch and use_dataset_driven:
             st.info(
                 "Prepare a valid dataset-driven configuration before Validate/Run."
             )
+        elif dataset_driven_blocks_launch:
+            st.info("Complete the required inputs before Validate/Run.")
         else:
             with st.expander("Technical command (action disabled)", expanded=False):
                 st.code(
@@ -891,38 +912,91 @@ def _deployment_candidate_controls(
     for warning in readiness.warnings:
         st.caption(f"⚠ {warning}")
 
-    st.subheader("3. Prepare deployment draft")
-    candidate_id = readiness.facts.candidate_id
-    existing_config = (
-        f"{DEPLOYMENT_DRAFT_ROOT}/{candidate_id}/{DEPLOYMENT_CONFIG_NAME}"
-        if candidate_id
-        else None
+    st.subheader("3. Competition submission readiness")
+    competition = resolve_competition_assets(
+        REPOSITORY_ROOT, dataset_version=selected.dataset_id
     )
+    competition_summary = competition.summary()
+    st.dataframe(
+        [{"field": key, "value": value} for key, value in competition_summary.items()],
+        width="stretch",
+        hide_index=True,
+    )
+    if competition.ready:
+        st.success("Competition submission readiness: ready")
+    else:
+        st.error("Competition submission readiness: blocked")
+        for reason in competition.blocking_reasons:
+            st.write(f"- {reason}")
+
+    st.subheader("4. Prepare deployment draft")
+    base_candidate_id = readiness.facts.candidate_id
+    draft_candidates: list[str] = []
+    if (
+        competition.ready
+        and competition.asset_fingerprint
+        and base_candidate_id
+    ):
+        draft_candidates.append(
+            f"{base_candidate_id}-r{competition.asset_fingerprint[:8]}"
+        )
+    if base_candidate_id:
+        draft_candidates.append(base_candidate_id)
     draft_config: str | None = None
-    if existing_config and (REPOSITORY_ROOT / existing_config).is_file():
-        draft_config = existing_config
+    for candidate_id in draft_candidates:
+        existing_config = (
+            f"{DEPLOYMENT_DRAFT_ROOT}/{candidate_id}/{DEPLOYMENT_CONFIG_NAME}"
+        )
+        if (REPOSITORY_ROOT / existing_config).is_file():
+            draft_config = existing_config
+            break
+
+    approver_widget_key = "deploy-approver"
+    approver_durable_key = ui_durable_key("run", "deployment_approver")
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=approver_widget_key,
+        durable_key=approver_durable_key,
+        allowed=None,
+        default="",
+    )
     approver = st.text_input(
-        "Approver recorded in the candidate approval",
-        key="deploy-approver",
+        "Approved by",
+        key=approver_widget_key,
         help=(
-            "The deployment contract requires a named manual approval. It cannot "
-            "be inferred from a metric."
+            "Local audit record identifying who selected this completed run for "
+            "deployment. It is stored in the candidate approval and cannot be "
+            "inferred from a metric."
         ),
     )
-    role = st.text_input(
-        "Intended deployment role",
-        value=DEFAULT_INTENDED_ROLE,
-        key="deploy-intended-role",
+    remember_durable_value(
+        st.session_state,
+        durable_key=approver_durable_key,
+        value=str(approver).strip() or None,
+        allowed=None,
     )
-    reason = st.text_area(
-        "Paired-comparison exception reason",
-        value=DEFAULT_EXCEPTION_REASON,
-        key="deploy-exception-reason",
-        help=(
-            "A single-run candidate has no paired comparison, so the approval "
-            "must record an explicit granted exception and its reason."
-        ),
-    )
+    if not str(approver).strip():
+        st.caption("Enter the approver name to prepare the draft.")
+
+    role = DEFAULT_INTENDED_ROLE
+    reason = DEFAULT_EXCEPTION_REASON
+    with st.expander("Advanced approval details", expanded=False):
+        role = st.text_input(
+            "Intended deployment role",
+            value=DEFAULT_INTENDED_ROLE,
+            key="deploy-intended-role",
+        )
+        reason = st.text_area(
+            "Paired-comparison exception reason",
+            value=DEFAULT_EXCEPTION_REASON,
+            key="deploy-exception-reason",
+            help=(
+                "A single-run candidate has no paired comparison, so the "
+                "approval must record an explicit granted exception and its "
+                "reason."
+            ),
+        )
+
     if st.button(
         "Prepare deployment draft",
         type="primary",
@@ -958,37 +1032,83 @@ def _deployment_candidate_controls(
                 hide_index=True,
             )
 
-    st.subheader("4. Validate and rehearse")
-    if draft_config is None:
-        st.info(
-            "Prepare a deployment draft to enable Validate and Synthetic dry run."
+    st.subheader("5. Validate and test")
+    draft_resolved = False
+    if draft_config is not None:
+        try:
+            draft_payload = yaml.safe_load(
+                (REPOSITORY_ROOT / draft_config).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            draft_payload = None
+        draft_resolved = isinstance(draft_payload, dict) and isinstance(
+            draft_payload.get("submission_row_identity"), dict
+        ) and "UNRESOLVED" not in str(
+            (draft_payload.get("sample_submission") or {}).get("path", "")
         )
+
+    if draft_config is None:
+        st.info("Prepare a deployment draft before running validation.")
     else:
         st.markdown(f"**Deployment draft:** `{draft_config}`")
         st.caption(
             "Validate authenticates the draft, its generated approval, the "
-            "completed run, and the threshold evidence without reading "
-            "competition data."
+            "completed run, and threshold evidence. Generated drafts are "
+            "read-only. Synthetic dry run never uploads to Kaggle."
         )
         if action_id == "dry_run":
             st.caption(
                 "Synthetic dry run needs an approved synthetic fixture directory "
                 "under artifacts/deployment_fixtures and a new output directory."
             )
-    st.warning(
-        "Real competition submission remains blocked: the deployment draft "
-        "leaves sample-submission identity unresolved and the real deployment "
-        "run stays disabled in the command registry."
-    )
+        if action_id == "run":
+            if competition.ready and draft_resolved:
+                st.success(
+                    "Generate submission is available for this resolved draft. "
+                    "Output stays local under artifacts/deployments with "
+                    "no-overwrite; network upload remains disabled."
+                )
+            else:
+                st.warning(
+                    "Generate submission stays blocked until competition "
+                    "submission readiness is ready and a resolved deployment "
+                    "draft is prepared."
+                )
+                if not competition.ready:
+                    for reason in competition.blocking_reasons:
+                        st.write(f"- {reason}")
+                elif not draft_resolved:
+                    st.write(
+                        "- Prepare a resolved deployment draft (with "
+                        "authenticated sample submission and row identity)."
+                    )
+        elif not draft_resolved:
+            st.caption(
+                "This draft still uses unresolved sample-submission identity. "
+                "Validate and synthetic dry run remain available; Generate "
+                "submission stays blocked until a resolved draft is prepared."
+            )
 
     panel_summary = {
         "Selected run": selected_path,
         "Dataset Package": selected.dataset_id,
         "Model family": selected.model_family,
         "Deployment readiness": "supported" if readiness.supported else "blocked",
+        "Competition submission readiness": (
+            "ready" if competition.ready else "blocked"
+        ),
         "Deployment draft": draft_config or "not prepared",
+        "Source": (
+            normalize_source_kind(draft_config)
+            if draft_config
+            else "Completed Research v2 run"
+        ),
+        "Config type": "Deployment" if draft_config else "not prepared",
     }
-    return draft_config, panel_summary, draft_config is None
+    blocks_launch = draft_config is None or (
+        action_id == "run" and not (competition.ready and draft_resolved)
+    )
+    return draft_config, panel_summary, blocks_launch
 
 
 def jobs_page() -> None:
@@ -3573,31 +3693,63 @@ def _cascade_item_selector(
     return final_value
 
 
-def _config_panel(loaded: ControlPanelRegistry, selected: Path) -> None:
+def _config_panel(
+    loaded: ControlPanelRegistry,
+    selected: Path,
+    *,
+    command: CommandSpec,
+    action: ActionSpec,
+) -> None:
+    """Preview a selected configuration using the current operation's roots.
+
+    Generated deployment drafts are immutable: preview and schema classification
+    are allowed, but the mixed-schema UI copy editor is not offered.
+    """
+    relative = selected.relative_to(REPOSITORY_ROOT).as_posix()
+    config_placeholder = action.placeholders.get("config")
+    placeholder_roots = (
+        config_placeholder.roots if config_placeholder is not None else ()
+    )
+    allowed_roots = config_preview_allowed_roots(
+        allowed_input_roots=command.allowed_input_roots,
+        config_placeholder_roots=placeholder_roots,
+        allowed_config_globs=command.allowed_config_globs,
+    )
     try:
         text, canonical = read_config(
             REPOSITORY_ROOT,
-            selected.relative_to(REPOSITORY_ROOT),
-            allowed_roots=(
-                "configs",
-                loaded.settings.editable_config_root,
-                "artifacts/optuna_exports",
-            ),
+            relative,
+            allowed_roots=allowed_roots,
         )
     except ConfigEditError as error:
         st.error(str(error))
         return
+    source_kind = normalize_source_kind(relative)
+    read_only = is_read_only_config_path(relative)
     with st.expander("Config preview", expanded=False):
+        st.caption(f"Source: **{source_kind}**")
+        if read_only:
+            st.caption(
+                "This generated configuration is read-only. Edit the completed "
+                "run selection and regenerate a draft instead of copying it into "
+                "`artifacts/ui_configs`."
+            )
+        try:
+            parsed = yaml.safe_load(text)
+            kind = classify_config_document(parsed)
+            st.caption(f"Detected schema type: `{kind}`")
+        except Exception:  # noqa: BLE001 - preview must never crash the Run page
+            st.caption("Detected schema type: unavailable")
         st.code(text, language="yaml" if canonical.suffix != ".json" else "json")
         try:
             parse_config_text(text, canonical.suffix)
             st.success("YAML/JSON syntax is valid.")
         except ConfigEditError as error:
             st.error(str(error))
-    if not loaded.settings.allow_config_copy_editing:
+    if read_only or not loaded.settings.allow_config_copy_editing:
         return
     with st.expander("Advanced configuration editor"):
-        rel_path = selected.relative_to(REPOSITORY_ROOT).as_posix()
+        rel_path = relative
         draft_key = f"config-editor-draft-{rel_path}"
         copy_key = f"config-editor-copy-name-{rel_path}"
         draft_durable = ui_durable_key("config_editor", "draft", rel_path)

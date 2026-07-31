@@ -90,6 +90,20 @@ CONFIG_KEYS = {
     "output",
     "runtime",
 }
+# Optional additive extension: separate authenticated submission IDs so the
+# feature matrix never carries the competition row identity column.
+CONFIG_OPTIONAL_KEYS = {"submission_row_identity"}
+SUBMISSION_ROW_IDENTITY_KEYS = {
+    "path",
+    "sha256",
+    "expected_rows",
+    "id_column",
+    "id_dtype",
+    "id_semantics",
+    "ordered_id_sha256",
+    "row_position_identity_sha256",
+    "test_anchor_hash",
+}
 COMPONENT_KEYS = {
     "component_id",
     "approval_artifact_path",
@@ -382,7 +396,12 @@ def load_deployment_config(
     else:
         source = _contained_file(path, root, "deployment config")
     payload = _load_yaml(source, "deployment config")
-    _exact_keys(payload, CONFIG_KEYS, "deployment")
+    _exact_keys(
+        payload,
+        CONFIG_KEYS,
+        "deployment",
+        optional=CONFIG_OPTIONAL_KEYS,
+    )
     if _integer(payload["schema_version"], "schema_version") != 1:
         raise DeploymentContractError("schema_version must be 1.")
     _slug(payload["deployment_id"], "deployment_id")
@@ -500,6 +519,44 @@ def load_deployment_config(
         raise DeploymentContractError("Test and sample expected row counts differ.")
     if sample["id_column"] == sample["target_column"]:
         raise DeploymentContractError("Submission ID and target columns must differ.")
+
+    if "submission_row_identity" in payload:
+        row_identity = _mapping(
+            payload["submission_row_identity"], "submission_row_identity"
+        )
+        _exact_keys(
+            row_identity, SUBMISSION_ROW_IDENTITY_KEYS, "submission_row_identity"
+        )
+        portable_repository_path(
+            row_identity["path"], root, "submission_row_identity.path"
+        )
+        _sha(row_identity["sha256"], "submission_row_identity.sha256")
+        _positive_integer(
+            row_identity["expected_rows"], "submission_row_identity.expected_rows"
+        )
+        _string(row_identity["id_column"], "submission_row_identity.id_column")
+        _string(row_identity["id_dtype"], "submission_row_identity.id_dtype")
+        _string(row_identity["id_semantics"], "submission_row_identity.id_semantics")
+        _sha(
+            row_identity["ordered_id_sha256"],
+            "submission_row_identity.ordered_id_sha256",
+        )
+        _sha(
+            row_identity["row_position_identity_sha256"],
+            "submission_row_identity.row_position_identity_sha256",
+        )
+        _sha(
+            row_identity["test_anchor_hash"],
+            "submission_row_identity.test_anchor_hash",
+        )
+        if row_identity["expected_rows"] != sample["expected_rows"]:
+            raise DeploymentContractError(
+                "submission_row_identity.expected_rows differs from sample_submission."
+            )
+        if row_identity["id_column"] != sample["id_column"]:
+            raise DeploymentContractError(
+                "submission_row_identity.id_column differs from sample_submission."
+            )
 
     output = _mapping(payload["output"], "output")
     _exact_keys(output, OUTPUT_KEYS, "output")
@@ -772,12 +829,21 @@ def _mapping(value: Any, label: str) -> dict[str, Any]:
     return dict(value)
 
 
-def _exact_keys(value: Mapping[str, Any], expected: set[str], label: str) -> None:
+def _exact_keys(
+    value: Mapping[str, Any],
+    expected: set[str],
+    label: str,
+    *,
+    optional: set[str] | None = None,
+) -> None:
     actual = set(value)
-    if actual != expected:
+    allowed = expected | (optional or set())
+    missing = expected - actual
+    unknown = actual - allowed
+    if missing or unknown:
         raise DeploymentContractError(
-            f"{label} keys differ; missing={sorted(expected - actual)}, "
-            f"unknown={sorted(actual - expected)}."
+            f"{label} keys differ; missing={sorted(missing)}, "
+            f"unknown={sorted(unknown)}."
         )
 
 
