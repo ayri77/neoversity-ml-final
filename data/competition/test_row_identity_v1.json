@@ -1,0 +1,39 @@
+{
+  "asset_id": "b27333b004a88fd20749099ef915da66f9e68160617e2888c0659721a6cc9e1f",
+  "dataset_package_link": {
+    "alignment_method": "ordered_v0_raw_minimal_feature_projection",
+    "alignment_status": "proven",
+    "test_anchor_hash": "5149a289f16b71509a923ccede164e58540b035e8fc6d9bac3eb036949f0491f"
+  },
+  "expected_rows": 2500,
+  "id_column": "index",
+  "id_dtype": "int64",
+  "id_semantics": "zero_based_row_position",
+  "ordered_id_sha256": "6f8d86365e60041769db51cc9287d7efe027afa20250251973af5d77d2bb2eeb",
+  "path": "data/competition/test_row_identity_v1.json",
+  "row_position_identity_sha256": "6f8d86365e60041769db51cc9287d7efe027afa20250251973af5d77d2bb2eeb",
+  "schema_version": 1,
+  "sha256": "a11fde85b3ebb5bafaef5222a9f5e476726539979509a3c761e5196d3eb407c2",
+  "size_bytes": 1401,
+  "source_sample_submission": {
+    "columns": [
+      "index",
+      "y"
+    ],
+    "expected_rows": 2500,
+    "id_column": "index",
+    "path": "data/raw/final_proj_sample_submission.csv",
+    "sha256": "cb6c18e88548ab6fb28b3735afa1e436412e9dc86dfe6fca275ce43016516d95",
+    "size_bytes": 18899,
+    "target_column": "y",
+    "target_placeholder_values": [
+      0
+    ]
+  },
+  "source_test": {
+    "contains_submission_id_column": false,
+    "expected_rows": 2500,
+    "path": "data/raw/final_proj_test.csv",
+    "sha256": "0417e23314c0fb47c2906f79a18137a05d0e79da1a9afa50fca94881d83ef544"
+  }
+}
