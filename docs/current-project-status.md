@@ -6,12 +6,13 @@
 **Last updated:** 2026-07-31  
 **Repository:** `ayri77/neoversity-ml-final`  
 **Active task branch:** `feature/prepared-dataset-pipeline-v1`  
-**Current checkpoint:** Stage D Dataset Campaign / Matrix Runner v1 is committed
-    (`6deafc3`). Two real 1×1 smoke campaigns succeeded (including in-run MLflow
-    indexing verification). The 21-run unbiased development screening campaign has
-    **not** been executed. Stage E has not started. Control Panel workspace cleanup
-    and Dataset Registry discovery-cache hardening are in progress on the working
-    tree (Stage F maintenance; uncommitted).
+**Current checkpoint:** Research Workspace v1 implemented on the working tree
+    (uncommitted). Stage D Dataset Campaign / Matrix Runner v1 remains committed
+    (`6deafc3`) and the 21-run unbiased development screening campaign has
+    **not** been executed via the Campaign Runner. Manual Research v2 coverage
+    of approximately 3 model families × 8 Dataset Packages exists on disk and is
+    now inspectable in Results → Research Workspace. Stage E has not started.
+    Control Panel workspace cleanup remains at HEAD `ef6b7d4`.
 
 ## 1. Purpose and maintenance policy
 
@@ -61,15 +62,18 @@ contain user-local notebook changes; do not revert or commit them unless asked.
 
 Immediate next actions:
 
-1. Complete the post-notebook audit in section 9 (scan/validate Registry and
+1. Use Results → Research Workspace to review the manual Research v2 matrix,
+   shortlist candidates, and export a CSV before any further screening decisions.
+2. Complete the post-notebook audit in section 9 (scan/validate Registry and
    package checks). Do not treat UI or Campaign Runner implementation as a
    substitute for that audit.
-2. Keep `notebooks/03_feature_engineering.ipynb` untouched unless the user
+3. Keep `notebooks/03_feature_engineering.ipynb` untouched unless the user
    explicitly requests edits.
-3. After the audit passes, validate-only the Stage D campaign specification
+4. After the audit passes, validate-only the Stage D campaign specification
    (`docs/dataset-campaign-runner-v1.md`) before any real matrix execution.
-4. Do not start the full 21-run development screening campaign until every
-   package passes the audit and validate-only succeeds.
+5. Do not start the full 21-run development screening campaign until every
+   package passes the audit and validate-only succeeds. Manual Research v2
+   coverage does not replace a frozen Campaign Runner execution.
 
 The Experiment Control Panel dataset selector is implemented and covered by
 automated tests, including a validate-only smoke path for
@@ -454,7 +458,7 @@ git -C $repo status --short --branch
 | C. Verify Registry ↔ Experiment Core | Partly implemented | Real-package bridge validation and v3 compatibility parity |
 | D. Dataset Campaign / Matrix Runner | Implemented (not executed) | Versioned contract, validate-only, freeze, sequential execute/resume, CLI; 21-run screening not yet run |
 | E. Cross-dataset paired comparison | Planned | Parent-child deltas on aligned OOF |
-| F. Control Panel and Results integration | Partly implemented | Dynamic Dataset Package selector for Experiment Core; campaign-results UI still planned |
+| F. Control Panel and Results integration | Partly implemented | Dynamic Dataset Package selector; archive/cleanup; Research Workspace v1 for Research v2 inventory/matrix/annotations; campaign-results UI still planned |
 | G. Screening and decision | Planned | Evidence-based shortlist |
 | H. Confirmation, blending, and Kaggle | Planned | Untouched confirmation and justified submission |
 | I. AutoGluon r31 gap closure | Deferred | Controlled reproduction after dataset screening |
@@ -689,11 +693,21 @@ Completed for Experiment Core v2:
    - archive/restore for terminal UI jobs and Results artifacts;
    - permanent deletion limited to archived terminal UI job directories;
    - scoped Dataset Registry discovery cache with **Refresh datasets**.
+9. Research Workspace v1 (Results tab; not Stage E / not Campaign execution):
+   - Research v2 inventory with explicit unavailable identity fields;
+   - deterministic comparability badges and reasons;
+   - Dataset × model matrix with duplicate-cell policy and descriptive
+     baseline deltas vs a selectable package (default `v0_raw_minimal`);
+   - annotation overlay at
+     `artifacts/control_panel_state/research_annotations.json`
+     (tags / notes / shortlist; never mutates Research v2 artifacts);
+   - CSV export of the visible filtered inventory;
+   - scoped inventory cache with **Refresh research inventory**.
 
 Still planned after the Campaign Runner and comparison contract exist:
 
 1. Campaign Results matrix.
-2. Parent-child deltas as a campaign view.
+2. Parent-child deltas as a campaign view / Stage E paired inference.
 3. Keep filesystem artifacts authoritative and MLflow secondary (already the
    policy; campaign-scale UI still pending).
 4. Physical authoritative-result deletion (explicitly out of scope for the

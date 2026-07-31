@@ -163,7 +163,7 @@ def _load_results(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AppTest:
     return AppTest.from_function(_apptest_results_page, default_timeout=15).run()
 
 
-def test_results_page_has_three_tabs(
+def test_results_page_has_research_workspace_tabs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_research_run(
@@ -176,7 +176,12 @@ def test_results_page_has_three_tabs(
     at = _load_results(monkeypatch, tmp_path)
     assert not at.exception
     tab_labels = [tab.label for tab in at.tabs]
-    assert tab_labels == ["Experiments", "Inspect result", "Compare experiments"]
+    assert tab_labels == [
+        "Experiments",
+        "Inspect result",
+        "Compare experiments",
+        "Research Workspace",
+    ]
 
 
 def test_experiment_table_has_required_columns(

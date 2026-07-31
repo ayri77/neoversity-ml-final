@@ -178,6 +178,30 @@ Generated files stay under `artifacts/ui_configs/` (plans under
   and stays disabled until that contract passes. After changing Control Panel
   presentation modules, fully restart Streamlit.
 
+### Research Workspace
+
+Open **Results → Research Workspace** to review Research v2 screening runs.
+
+- Inventory lists every discoverable Research v2 run with Dataset, model,
+  protocol, metrics, and identity fields. Missing fields show as unavailable.
+- Comparability badges explain whether a run is comparable development,
+  smoke, exploratory (`v3`), tuned/Optuna, legacy, incomplete, or invalid.
+  These badges are descriptive and do **not** replace official Paired
+  Comparison readiness.
+- The matrix is Dataset Package × model family. Default filters hide smoke,
+  failed/invalid, archived, exploratory `v3`, and legacy runs when a
+  comparable development run already exists for that cell.
+- When a cell has multiple eligible runs, the UI shows the duplicate count and
+  lets you choose the exact run. It does not auto-crown the highest BA.
+- Baseline deltas vs `v0_raw_minimal` (or another selected package) are
+  descriptive aggregate deltas only — not Stage E paired inference.
+- Tags, notes, and shortlist are stored under
+  `artifacts/control_panel_state/research_annotations.json` and never rewrite
+  Research v2 artifacts.
+- **Export visible inventory CSV** downloads the filtered rows.
+- **Refresh research inventory** clears only the Research Workspace discovery
+  cache.
+
 ## Workspace cleanup (archive / job delete)
 
 Stage F maintenance capability. This is separate from Dataset Campaign execution,

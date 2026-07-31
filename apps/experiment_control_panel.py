@@ -21,6 +21,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 REGISTRY_DISCOVERY_CACHE_VERSION = "dataset_registry_discovery_v1"
 DEFAULT_PROCESSED_ROOT = "data/processed"
+RESEARCH_WORKSPACE_CACHE_VERSION = "research_workspace_inventory_v1"
 
 from src.churn_ml.control_panel.artifacts import (  # noqa: E402
     ArtifactRecord,
@@ -41,6 +42,29 @@ from src.churn_ml.control_panel.archive_registry import (  # noqa: E402
     ArchiveRegistry,
     preview_job_deletion,
     utc_now_text as archive_utc_now_text,
+)
+from src.churn_ml.control_panel.research_annotations import (  # noqa: E402
+    BUILTIN_TAGS,
+    ResearchAnnotationError,
+    ResearchAnnotationRegistry,
+)
+from src.churn_ml.control_panel.research_export import (  # noqa: E402
+    export_annotated_runs_csv,
+)
+from src.churn_ml.control_panel.research_inventory import (  # noqa: E402
+    UNAVAILABLE,
+    build_research_inventory,
+    inventory_rows_as_mappings,
+    inventory_rows_from_mappings,
+)
+from src.churn_ml.control_panel.research_matrix import (  # noqa: E402
+    DEFAULT_BASELINE_DATASET_ID,
+    MATRIX_METRICS,
+    MatrixFilters,
+    annotate_runs,
+    build_research_matrix,
+    descriptive_comparison_table,
+    matrix_display_rows,
 )
 from src.churn_ml.control_panel.command_builder import (  # noqa: E402
     CommandBuildError,
@@ -892,8 +916,13 @@ def results_page() -> None:
     show_archived = st.checkbox(
         "Show archived", value=False, key="results-show-archived"
     )
-    experiments_tab, inspect_tab, compare_tab = st.tabs(
-        ["Experiments", "Inspect result", "Compare experiments"]
+    experiments_tab, inspect_tab, compare_tab, research_tab = st.tabs(
+        [
+            "Experiments",
+            "Inspect result",
+            "Compare experiments",
+            "Research Workspace",
+        ]
     )
     with experiments_tab:
         _results_experiments_tab(
@@ -903,6 +932,10 @@ def results_page() -> None:
         _results_inspect_tab(loaded, archive=archive, show_archived=show_archived)
     with compare_tab:
         _results_compare_tab(loaded, archive=archive, show_archived=show_archived)
+    with research_tab:
+        _results_research_workspace_tab(
+            loaded, archive=archive, show_archived=show_archived
+        )
 
 
 def _visible_results_artifacts(
@@ -1803,6 +1836,388 @@ def _results_compare_tab(
             )
 
     _results_registry_actions(loaded, reader_id)
+
+
+def _results_research_workspace_tab(
+    loaded: ControlPanelRegistry,
+    *,
+    archive: ArchiveRegistry,
+    show_archived: bool,
+) -> None:
+    del loaded  # Research Workspace discovers Research v2 directly.
+    st.caption(
+        "Research Workspace v1 inventories filesystem Research v2 runs for "
+        "descriptive dataset × model comparison. Filesystem artifacts remain "
+        "authoritative. Annotations never mutate run artifacts. Baseline "
+        "deltas and multi-run tables are descriptive only — not Stage E "
+        "paired statistical inference, and not official Paired Comparison v1."
+    )
+    try:
+        annotations = ResearchAnnotationRegistry(REPOSITORY_ROOT)
+    except ResearchAnnotationError as error:
+        st.error(f"Research annotations unavailable: {error}")
+        return
+
+    refresh_cols = st.columns([1, 2, 2])
+    with refresh_cols[0]:
+        if st.button("Refresh research inventory", key="rw-refresh-inventory"):
+            _cached_research_inventory_rows.clear()
+            st.session_state["rw_inventory_last_refreshed_utc"] = archive_utc_now_text()
+            st.rerun()
+    with refresh_cols[1]:
+        last_refreshed = st.session_state.get("rw_inventory_last_refreshed_utc")
+        if last_refreshed:
+            st.caption(f"Inventory last refreshed: `{last_refreshed}`")
+        else:
+            st.caption("Inventory uses a scoped discovery cache.")
+    with refresh_cols[2]:
+        st.caption(
+            f"Cache version `{RESEARCH_WORKSPACE_CACHE_VERSION}` "
+            "(does not call global cache clear)."
+        )
+
+    try:
+        row_payloads = _cached_research_inventory_rows(
+            str(REPOSITORY_ROOT),
+            RESEARCH_WORKSPACE_CACHE_VERSION,
+        )
+        inventory_rows = inventory_rows_from_mappings(row_payloads)
+    except Exception as error:  # noqa: BLE001 - surface discovery failures
+        st.error(f"Research inventory discovery failed: {error}")
+        return
+
+    archived_paths = {
+        relative_path
+        for reader_id, relative_path in archive.archived_artifact_keys()
+        if reader_id == "research_v2"
+    }
+    annotations_by_path = {
+        item["relative_path"]: item for item in annotations.annotations
+    }
+    stale = annotations.list_stale({row.relative_path for row in inventory_rows})
+    if stale:
+        with st.expander(f"Stale annotations ({len(stale)})", expanded=False):
+            st.warning(
+                "These annotation keys no longer resolve to discovered Research "
+                "v2 runs. They are retained diagnostically and are not deleted."
+            )
+            st.code("\n".join(stale))
+
+    annotated = annotate_runs(
+        inventory_rows,
+        annotations_by_path=annotations_by_path,
+        archived_paths=archived_paths,
+    )
+    st.metric("Discovered Research v2 runs", len(inventory_rows))
+
+    filter_cols = st.columns(4)
+    with filter_cols[0]:
+        development_only = st.checkbox(
+            "Development only", value=True, key="rw-filter-development-only"
+        )
+        include_exploratory = st.checkbox(
+            "Include exploratory", value=False, key="rw-filter-exploratory"
+        )
+        shortlist_only = st.checkbox(
+            "Shortlist only", value=False, key="rw-filter-shortlist"
+        )
+    with filter_cols[1]:
+        model_options = sorted(
+            {
+                run.row.model_family
+                for run in annotated
+                if run.row.model_family
+            }
+        )
+        selected_models = st.multiselect(
+            "Model family",
+            options=model_options,
+            default=[],
+            key="rw-filter-models",
+        )
+        dataset_options = sorted(
+            {
+                run.row.dataset_id
+                for run in annotated
+                if run.row.dataset_id
+            }
+        )
+        selected_datasets = st.multiselect(
+            "Dataset ID",
+            options=dataset_options,
+            default=[],
+            key="rw-filter-datasets",
+        )
+    with filter_cols[2]:
+        adapter_or_config = st.text_input(
+            "Adapter / config contains",
+            value="",
+            key="rw-filter-adapter",
+        )
+        status_options = sorted({run.row.status for run in annotated})
+        selected_statuses = st.multiselect(
+            "Status",
+            options=status_options,
+            default=[],
+            key="rw-filter-status",
+        )
+    with filter_cols[3]:
+        tag_options = sorted(BUILTIN_TAGS | {tag for run in annotated for tag in run.tags})
+        selected_tags = st.multiselect(
+            "Tags",
+            options=tag_options,
+            default=[],
+            key="rw-filter-tags",
+        )
+        baseline_options = dataset_options or [DEFAULT_BASELINE_DATASET_ID]
+        baseline_default = (
+            DEFAULT_BASELINE_DATASET_ID
+            if DEFAULT_BASELINE_DATASET_ID in baseline_options
+            else baseline_options[0]
+        )
+        baseline_dataset_id = st.selectbox(
+            "Baseline Dataset Package",
+            options=baseline_options,
+            index=baseline_options.index(baseline_default),
+            key="rw-baseline-dataset",
+        )
+        metric_key = st.selectbox(
+            "Primary matrix metric",
+            options=[item[0] for item in MATRIX_METRICS],
+            format_func=lambda value: dict(MATRIX_METRICS)[value],
+            key="rw-primary-metric",
+        )
+
+    filters = MatrixFilters(
+        development_only=development_only,
+        include_exploratory=include_exploratory,
+        model_families=tuple(selected_models),
+        dataset_ids=tuple(selected_datasets),
+        adapter_or_config=adapter_or_config,
+        statuses=tuple(selected_statuses),
+        tags=tuple(selected_tags),
+        shortlist_only=shortlist_only,
+        show_archived=show_archived,
+    )
+    explicit_selections = st.session_state.setdefault("rw_explicit_cell_selections", {})
+    matrix = build_research_matrix(
+        annotated,
+        filters=filters,
+        baseline_dataset_id=baseline_dataset_id,
+        explicit_selections=explicit_selections,
+    )
+    st.caption(
+        "Descriptive baseline delta: "
+        f"`delta_BA = BA(candidate) - BA({baseline_dataset_id})`. "
+        "Not official paired inference."
+    )
+    display = matrix_display_rows(matrix, primary_metric=metric_key)
+    if display:
+        st.dataframe(pd.DataFrame(display), use_container_width=True, hide_index=True)
+    else:
+        st.info("No Research v2 runs match the current filters.")
+
+    csv_text = export_annotated_runs_csv(matrix.filtered_runs)
+    st.download_button(
+        "Export visible inventory CSV",
+        data=csv_text,
+        file_name="research_workspace_inventory.csv",
+        mime="text/csv",
+        key="rw-export-csv",
+    )
+
+    cell_options = [
+        f"{dataset_id} × {model_family}"
+        for dataset_id in matrix.dataset_ids
+        for model_family in matrix.model_families
+        if matrix.cells[(dataset_id, model_family)].selected is not None
+    ]
+    if not cell_options:
+        return
+
+    selected_cell_label = st.selectbox(
+        "Inspect matrix cell",
+        options=cell_options,
+        key="rw-selected-cell",
+    )
+    dataset_id, model_family = selected_cell_label.split(" × ", 1)
+    cell = matrix.cells[(dataset_id, model_family)]
+    if cell.has_duplicates:
+        st.warning(
+            f"{cell.duplicate_count} eligible runs for this cell. "
+            f"Selection policy: {cell.selection_policy}"
+        )
+        candidate_paths = [item.row.relative_path for item in cell.candidates]
+        current = (
+            cell.selected.row.relative_path
+            if cell.selected is not None
+            else candidate_paths[0]
+        )
+        chosen = st.selectbox(
+            "Choose exact run for this cell",
+            options=candidate_paths,
+            index=candidate_paths.index(current) if current in candidate_paths else 0,
+            key=f"rw-cell-choice-{dataset_id}-{model_family}",
+        )
+        if chosen != current:
+            explicit_selections[(dataset_id, model_family)] = chosen
+            st.session_state["rw_explicit_cell_selections"] = explicit_selections
+            st.rerun()
+
+    selected_run = cell.selected
+    if selected_run is None:
+        return
+
+    row = selected_run.row
+    st.subheader("Run details")
+    detail_cols = st.columns(2)
+    with detail_cols[0]:
+        st.markdown(
+            "\n".join(
+                [
+                    f"- **Path:** `{row.relative_path}`",
+                    f"- **Run ID:** `{row.display('run_id')}`",
+                    f"- **Created:** `{row.display('created_at_utc')}`",
+                    f"- **Status:** `{row.status}`",
+                    f"- **Dataset ID:** `{row.display('dataset_id')}`",
+                    f"- **Parent Dataset ID:** `{row.display('parent_dataset_id')}`",
+                    f"- **Target dependency:** `{row.display('target_dependency')}`",
+                    f"- **Feature count:** `{row.display('n_features')}`",
+                    f"- **Model family:** `{row.display('model_family')}`",
+                    f"- **Adapter ID:** `{row.display('adapter_id')}`",
+                    f"- **Model/config ID:** `{row.display('model_config_id')}`",
+                    f"- **Feature pipeline:** `{row.display('feature_pipeline_id')}`",
+                ]
+            )
+        )
+    with detail_cols[1]:
+        st.markdown(
+            "\n".join(
+                [
+                    f"- **Source config path:** `{row.display('source_config_path')}`",
+                    f"- **Source config hash:** `{row.display('source_config_hash')}`",
+                    f"- **Resolved config hash:** `{row.display('resolved_config_hash')}`",
+                    f"- **Evaluation-plan ID:** `{row.display('evaluation_plan_id')}`",
+                    f"- **Evaluation-plan hash:** `{row.display('evaluation_plan_hash')}`",
+                    f"- **Evaluation mode:** `{row.display('evaluation_mode')}`",
+                    f"- **Repeat seeds:** `{row.display('repeat_seeds')}`",
+                    f"- **Outer folds:** `{row.display('outer_fold_count')}`",
+                    f"- **Threshold protocol:** `{row.display('threshold_selection_protocol')}`",
+                    f"- **Competition assets accessed:** `{row.display('competition_assets_accessed')}`",
+                    f"- **Authoritative OOF:** `{row.display('authoritative_oof_path')}`",
+                    f"- **Comparability:** `{selected_run.comparability.primary}`",
+                ]
+            )
+        )
+    st.write("Comparability reasons:")
+    for reason in selected_run.comparability.reasons:
+        st.write(f"- {reason}")
+    if cell.delta_ba_vs_baseline is not None:
+        st.info(
+            f"Descriptive delta BA vs `{baseline_dataset_id}`: "
+            f"{cell.delta_ba_vs_baseline:.6f}"
+        )
+
+    metric_summary = {
+        "Balanced Accuracy": row.balanced_accuracy,
+        "Sensitivity": row.sensitivity,
+        "Specificity": row.specificity,
+        "ROC AUC": row.roc_auc,
+        "Average Precision": row.average_precision,
+        "Brier score": row.brier_score,
+        "Threshold median": row.threshold_median,
+    }
+    st.json({key: (UNAVAILABLE if value is None else value) for key, value in metric_summary.items()})
+
+    st.subheader("Annotations")
+    current_annotation = annotations.get(row.relative_path) or {
+        "tags": list(selected_run.tags),
+        "note": selected_run.note,
+        "shortlisted": selected_run.shortlisted,
+    }
+    tag_selection = st.multiselect(
+        "Tags",
+        options=sorted(BUILTIN_TAGS | set(current_annotation.get("tags", []))),
+        default=list(current_annotation.get("tags", [])),
+        key=f"rw-tags-{row.relative_path}",
+    )
+    note_value = st.text_area(
+        "Research note",
+        value=str(current_annotation.get("note") or ""),
+        key=f"rw-note-{row.relative_path}",
+        max_chars=2000,
+    )
+    ann_cols = st.columns(3)
+    with ann_cols[0]:
+        if st.button("Save annotation", key=f"rw-save-ann-{row.relative_path}"):
+            try:
+                annotations.upsert(
+                    row.relative_path,
+                    tags=tag_selection,
+                    note=note_value,
+                    shortlisted=bool(current_annotation.get("shortlisted")),
+                )
+                st.success("Annotation saved.")
+                st.rerun()
+            except ResearchAnnotationError as error:
+                st.error(str(error))
+    with ann_cols[1]:
+        if st.button("Promote to shortlist", key=f"rw-promote-{row.relative_path}"):
+            try:
+                annotations.promote_to_shortlist(row.relative_path)
+                st.success("Promoted to shortlist.")
+                st.rerun()
+            except ResearchAnnotationError as error:
+                st.error(str(error))
+    with ann_cols[2]:
+        if st.button("Remove from shortlist", key=f"rw-demote-{row.relative_path}"):
+            try:
+                annotations.remove_from_shortlist(row.relative_path)
+                st.success("Removed from shortlist.")
+                st.rerun()
+            except ResearchAnnotationError as error:
+                st.error(str(error))
+
+    st.subheader("Descriptive comparison preview")
+    compare_paths = st.multiselect(
+        "Select 2–4 runs",
+        options=[run.row.relative_path for run in matrix.filtered_runs],
+        default=[row.relative_path],
+        key="rw-compare-paths",
+        max_selections=4,
+    )
+    if len(compare_paths) >= 2:
+        compare_runs = [
+            run
+            for run in annotated
+            if run.row.relative_path in set(compare_paths)
+        ]
+        reference = st.selectbox(
+            "Reference run for descriptive deltas",
+            options=compare_paths,
+            key="rw-compare-reference",
+        )
+        table = descriptive_comparison_table(
+            compare_runs, reference_relative_path=reference
+        )
+        st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
+        st.caption(
+            "Descriptive aggregate comparison only. Stage E paired inference is "
+            "not implemented here."
+        )
+    elif compare_paths:
+        st.info("Select at least two runs for a descriptive comparison table.")
+
+
+@st.cache_data(show_spinner="Scanning Research v2 inventory…")
+def _cached_research_inventory_rows(
+    repository_root: str,
+    cache_version: str = RESEARCH_WORKSPACE_CACHE_VERSION,
+) -> list[dict[str, Any]]:
+    """Scoped Research Workspace discovery cache (serializable row mappings)."""
+    del cache_version
+    rows = build_research_inventory(Path(repository_root))
+    return inventory_rows_as_mappings(rows)
 
 
 def _results_registry_actions(loaded: ControlPanelRegistry, reader_id: str) -> None:

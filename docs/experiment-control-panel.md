@@ -335,6 +335,40 @@ readiness loads both completed runs through the validated completed-run loader
 and calls authoritative `build_compatibility_summary()`; the CLI remains the
 final gate. Cross-dataset paired inference is out of scope.
 
+### Research Workspace v1
+
+Results includes a **Research Workspace** tab for Research v2 screening
+inventory and a dataset × model matrix. It is descriptive research UX, not
+Stage E paired inference and not Dataset Campaign Results UI.
+
+Capabilities:
+
+- Normalized inventory of discoverable `artifacts/research_v2` runs with explicit
+  `unavailable` fields when identity or metrics are missing.
+- Deterministic comparability badges (`Comparable development`, `Smoke`,
+  `Exploratory dataset`, `Tuned / Optuna export`, `Different protocol`,
+  `Different model configuration`, `Legacy / descriptive only`,
+  `Incomplete identity`, `Invalid`) with explainable reasons. Badges never
+  claim official Paired Comparison v1 readiness.
+- Results Matrix v1: rows = Dataset Packages, columns = dynamically discovered
+  model families (default order LightGBM → XGBoost → CatBoost). Cells show BA,
+  sensitivity, specificity, threshold median, badge, and run identity.
+- Duplicate cells show a count and use an explicit selection policy (prefer
+  Comparable development, then newest `created_at_utc` / `run_id`, then path).
+  Maximum observed BA is never treated as canonical automatically.
+- Descriptive baseline deltas vs a selectable Dataset Package (default
+  `v0_raw_minimal`): `delta_BA = BA(candidate) - BA(baseline)`.
+- Annotation overlay at
+  `artifacts/control_panel_state/research_annotations.json` for tags, notes, and
+  shortlist. Annotations never mutate Research v2 artifacts; stale keys are
+  reported, not silently deleted.
+- CSV export of the currently visible filtered inventory.
+- Scoped discovery cache with **Refresh research inventory** only (no global
+  `st.cache_data.clear()`).
+
+`v3_targeted_missingness` remains visibly exploratory. The same-dataset Paired
+Comparison v1 contract is unchanged.
+
 ## MLflow integration
 
 The Dashboard opens `mlflow_url`. The registry can validate and synchronize the
