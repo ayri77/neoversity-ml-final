@@ -123,5 +123,7 @@ last; failures after allocation receive only `_FAILED`, and failures before
 allocation never mutate an input run.
 
 The typed loaders and builders in `src/churn_ml/paired_comparison.py` are
-side-effect-free foundations for a later optional MLflow mirror and
-experiment-campaign orchestration. Neither integration is implemented here.
+side-effect-free foundations for a later optional MLflow mirror. Dataset
+Campaign / Matrix Runner v1 (`docs/dataset-campaign-runner-v1.md`) orchestrates
+Research v2 cells but does not perform cross-dataset paired inference; that
+remains Stage E.

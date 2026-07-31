@@ -1,0 +1,37 @@
+# Dataset Campaign / Matrix Runner v1 — development screening template
+#
+# This is a template, not an automatic launcher. Explicit existing Research v2
+# configuration references are required. Do not guess or alter model parameters.
+#
+# Primary unbiased matrix: 7 datasets × 3 model families = 21 cells.
+# v3_targeted_missingness must never be mixed into an unbiased campaign.
+
+schema_version: dataset_campaign_v1
+
+campaign:
+  id: screening_development_v1
+  name: Unbiased development screening matrix
+  type: development
+  classification: unbiased
+
+datasets:
+  preset: unbiased_screening_v1
+
+models:
+  - family: LightGBM
+    config_path: configs/research_v2/manual_lightgbm_te_v1_compat_development.yaml
+  - family: XGBoost
+    config_path: configs/research_v2/xgboost_numeric_v1_development.yaml
+  - family: CatBoost
+    config_path: configs/research_v2/catboost_numeric_v1_development.yaml
+
+evaluation_plan:
+  # null => require all model configs to share one identical evaluation protocol
+  path: configs/research_v2/plans/telecom_v3_development_r2x5_t3_v1.yaml
+
+execution:
+  policy: sequential
+  processed_root: data/processed
+  artifacts_root: artifacts/dataset_campaigns
+  index_mlflow: true
+  mlflow_config_path: configs/mlflow/local.yaml

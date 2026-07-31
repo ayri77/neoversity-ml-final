@@ -185,25 +185,37 @@ Dry-run first, then write only after inspection:
 
 ```python
 from src.churn_ml.dataset_registry import (
+    discover_registered_datasets,
     list_dataset_packages,
     load_dataset_manifest,
     resolve_dataset_package,
     validate_dataset_package,
+    build_dataset_provenance,
 )
 ```
 
+`discover_registered_datasets(root)` returns sorted, strictly validated package
+summaries for Control Panel selectors and the Dataset Campaign Runner.
 `resolve_dataset_package(root, dataset_id)` returns a validated package object
-for later pipeline integration.
+for Research v2 Registry-backed loading and campaign materialization.
+
+## Campaign consumption
+
+The Dataset Campaign / Matrix Runner discovers packages dynamically through the
+Registry, freezes dataset hashes in an immutable campaign manifest, and executes
+each matrix cell through Experiment Core / Research v2. See
+`docs/dataset-campaign-runner-v1.md`. Exploratory packages such as
+`v3_targeted_missingness` (`target_dependency: exploratory`) must never be mixed
+into an unbiased screening campaign.
 
 ## Reserved future integration points
 
 Out of scope for Registry v1; reserved for later packages:
 
-- Generic Prepared-Dataset Pipeline (`prepared_dataset_v1`)
-- Dataset Campaign / Matrix Runner
-- Cross-Dataset Paired Comparison
+- Cross-Dataset Paired Comparison (Stage E)
 - Multi-Blend v2
-- MLflow / Control Panel wiring
+- Campaign Results UI (Stage F)
 
-Do not load datasets through this registry from Research v2 yet; keep existing
-research dataset loading unchanged until a dedicated integration task.
+Registry-backed Research v2 loading and the Dataset Campaign Runner are
+implemented separately; this document remains the package contract source of
+truth.

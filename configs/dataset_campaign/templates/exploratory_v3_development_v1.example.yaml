@@ -1,0 +1,34 @@
+# Dataset Campaign / Matrix Runner v1 — exploratory v3 template
+#
+# Run v3_targeted_missingness separately. Results are exploratory and must not
+# be ranked with the unbiased 21-run screening matrix.
+
+schema_version: dataset_campaign_v1
+
+campaign:
+  id: exploratory_v3_development_v1
+  name: Exploratory v3 targeted-missingness development runs
+  type: exploratory
+  classification: exploratory
+
+datasets:
+  ids:
+    - v3_targeted_missingness
+
+models:
+  - family: LightGBM
+    config_path: configs/research_v2/manual_lightgbm_te_v1_compat_development.yaml
+  - family: XGBoost
+    config_path: configs/research_v2/xgboost_numeric_v1_development.yaml
+  - family: CatBoost
+    config_path: configs/research_v2/catboost_numeric_v1_development.yaml
+
+evaluation_plan:
+  path: configs/research_v2/plans/telecom_v3_development_r2x5_t3_v1.yaml
+
+execution:
+  policy: sequential
+  processed_root: data/processed
+  artifacts_root: artifacts/dataset_campaigns
+  index_mlflow: true
+  mlflow_config_path: configs/mlflow/local.yaml

@@ -1,0 +1,25 @@
+schema_version: dataset_campaign_v1
+
+campaign:
+  id: screening_smoke_v0_lightgbm_mlflow_v2
+  name: Smoke MLflow indexing verification for v0 LightGBM
+  type: smoke
+  classification: unbiased
+
+datasets:
+  ids:
+    - v0_raw_minimal
+
+models:
+  - family: LightGBM
+    config_path: configs/research_v2/manual_lightgbm_te_v1_compat_smoke.yaml
+
+evaluation_plan:
+  path: configs/research_v2/plans/telecom_v3_smoke_r1x3_t2_v1.yaml
+
+execution:
+  policy: sequential
+  processed_root: data/processed
+  artifacts_root: artifacts/dataset_campaigns
+  index_mlflow: true
+  mlflow_config_path: configs/mlflow/local.yaml

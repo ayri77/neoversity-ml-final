@@ -1,0 +1,31 @@
+# Dataset Campaign / Matrix Runner v1 — smoke subset template
+#
+# Smaller matrix for path validation only. Not a substitute for the 21-run
+# unbiased development screening campaign.
+
+schema_version: dataset_campaign_v1
+
+campaign:
+  id: screening_smoke_subset_v1
+  name: Smoke subset for campaign-path validation
+  type: smoke
+  classification: unbiased
+
+datasets:
+  ids:
+    - v0_raw_minimal
+    - v7_compact_zero_indicators
+
+models:
+  - family: LightGBM
+    config_path: configs/research_v2/manual_lightgbm_te_v1_compat_smoke.yaml
+
+evaluation_plan:
+  path: configs/research_v2/plans/telecom_v3_smoke_r1x3_t2_v1.yaml
+
+execution:
+  policy: sequential
+  processed_root: data/processed
+  artifacts_root: artifacts/dataset_campaigns
+  index_mlflow: true
+  mlflow_config_path: configs/mlflow/local.yaml

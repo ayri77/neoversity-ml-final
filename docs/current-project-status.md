@@ -6,15 +6,13 @@
 **Last updated:** 2026-07-31  
 **Repository:** `ayri77/neoversity-ml-final`  
 **Active task branch:** `feature/prepared-dataset-pipeline-v1`  
-**Current checkpoint:** notebook `03_feature_engineering.ipynb` has been
-manually executed and local `v0`-`v7` Registry packages are present; complete
-the post-notebook audit before starting any model campaign. The Experiment
-Control Panel now supports a Registry-backed dataset-driven Experiment Core
-entry mode (prepare local config/plan, then Validate/Run) and end-to-end
-dataset-identity visibility across jobs, Results/Compare, and the optional
-MLflow searchable mirror. Dashboard/Jobs use a restart-safe two-argument job
-label contract; official Paired Comparison readiness uses the authoritative
-compatibility loader rather than lightweight display tokens.
+**Current checkpoint:** Stage C Registry ↔ Experiment Core integration and
+    hardening are on the branch tip. Stage D Dataset Campaign / Matrix Runner v1
+    is implemented (versioned campaign contract, validate-only, freeze, sequential
+    execute/resume, CLI, and synthetic tests). The 21-run unbiased screening
+    campaign has **not** been executed; do not treat Stage D screening as
+    complete until a real frozen campaign run is audited. Complete the
+    post-notebook Registry package audit before launching any real campaign.
 
 ## 1. Purpose and maintenance policy
 
@@ -65,10 +63,14 @@ contain user-local notebook changes; do not revert or commit them unless asked.
 Immediate next actions:
 
 1. Complete the post-notebook audit in section 9 (scan/validate Registry and
-   package checks). Do not treat UI work as a substitute for that audit.
+   package checks). Do not treat UI or Campaign Runner implementation as a
+   substitute for that audit.
 2. Keep `notebooks/03_feature_engineering.ipynb` untouched unless the user
    explicitly requests edits.
-3. Do not start the Dataset Campaign until every package passes the audit.
+3. After the audit passes, validate-only the Stage D campaign specification
+   (`docs/dataset-campaign-runner-v1.md`) before any real matrix execution.
+4. Do not start the full 21-run development screening campaign until every
+   package passes the audit and validate-only succeeds.
 
 The Experiment Control Panel dataset selector is implemented and covered by
 automated tests, including a validate-only smoke path for
@@ -209,7 +211,7 @@ require real-package verification or further development:
 - parity between the new generic route and
   `manual_v3_pipeline_v1_compat`;
 - first-class Registry documentation/catalog coverage for `v5`-`v7`;
-- Dataset Campaign / Matrix Runner;
+- real execution of the Stage D 21-run screening campaign (runner implemented);
 - cross-dataset paired comparison;
 - campaign-results UI;
 - Multi-Blend v2 for cross-model and cross-dataset blending.
@@ -451,7 +453,7 @@ git -C $repo status --short --branch
 | A. Generate and audit `v0`-`v7` | In progress | Eight validated immutable Dataset Packages |
 | B. Finish Registry/manifests/docs | Planned | `v5`-`v7` are first-class and documentation matches reality |
 | C. Verify Registry ↔ Experiment Core | Partly implemented | Real-package bridge validation and v3 compatibility parity |
-| D. Dataset Campaign / Matrix Runner | Planned | Frozen, reproducible screening matrix |
+| D. Dataset Campaign / Matrix Runner | Implemented (not executed) | Versioned contract, validate-only, freeze, sequential execute/resume, CLI; 21-run screening not yet run |
 | E. Cross-dataset paired comparison | Planned | Parent-child deltas on aligned OOF |
 | F. Control Panel and Results integration | Partly implemented | Dynamic Dataset Package selector for Experiment Core; campaign-results UI still planned |
 | G. Screening and decision | Planned | Evidence-based shortlist |
@@ -528,6 +530,12 @@ not as hidden behavior in the generic prepared-dataset pipeline.
 
 Stop adding new prepared datasets after `v7` until the current hypotheses have
 been screened.
+
+**Implementation status:** Dataset Campaign Runner v1 is implemented. See
+`docs/dataset-campaign-runner-v1.md` and
+`configs/dataset_campaign/templates/`. The runner orchestrates existing Research
+v2 single runs; it does not duplicate training. The 21-run screening campaign
+itself is **not** complete until a real frozen campaign is executed and audited.
 
 ### 13.1 Screening matrix
 
