@@ -35,12 +35,39 @@ Launch the panel:
 uv run --extra ui streamlit run apps/experiment_control_panel.py
 ```
 
+## The standard workflow
+
+Run offers one ordered workflow instead of technical operation names:
+
+```text
+🧪 Train → 🔎 Compare → 🎛️ Tune → 🧬 Blend → 📤 Generate submission
+```
+
+| Step | What it does | Selects | Produces |
+| --- | --- | --- | --- |
+| **🧪 Train** | Trains one candidate on a registered Dataset Package | Training configuration | Completed canonical run |
+| **🔎 Compare** | Compares two completed runs on identical folds and seeds | Completed runs | Paired-comparison artifact |
+| **🎛️ Tune** | Searches parameters on training data only | Search configuration | Search report, exported training config |
+| **🧬 Blend** | Combines completed runs with leakage-safe cross-fitting | Completed runs | Blend evaluation, deployment package |
+| **📤 Generate submission** | Turns one completed run into a validated deployment draft | Completed run | Deployment draft, then deployment artifact |
+
+Notes:
+
+- **Train** is the standard training backend. **Research evaluation v1** is
+  legacy: it stays hidden behind **Advanced / Legacy operations** on Run, is
+  labelled `Legacy`, and must not be used for new training.
+- Downstream steps select completed runs and artifacts, not raw YAML paths.
+- Technical operation IDs, action IDs, and schema versions are shown only inside
+  the **Technical details** expander.
+- Dataset Comparison and canonical handoffs for Tune and Blend remain subsequent
+  work; those steps still start from a configuration.
+
 ## Pages
 
 | Page | Purpose |
 | --- | --- |
 | **Dashboard** | Job counts, recent jobs/artifacts, command groups, MLflow link |
-| **Run** | Choose operation/action, fill placeholders, review argv, start a job |
+| **Run** | Choose a workflow step and action, fill placeholders, review argv, start a job |
 | **Jobs** | Refresh status, inspect redacted argv and log tails, stop when enabled, archive terminal jobs, permanently delete archived UI job metadata/logs |
 | **Results** | Discover reader artifacts, summaries, display-only side-by-side, archive/hide results without deleting files |
 | **Configuration** | Registry validation summary and reload |
@@ -97,17 +124,24 @@ runs. Re-sync is idempotent for already-indexed approved artifacts.
 | `artifacts/optuna_searches` | Optuna search reports |
 | `artifacts/optuna_exports` | Exported best-candidate YAML |
 | `artifacts/ui_jobs` | UI operational job records only |
-| `artifacts/ui_configs` | Editable config copies and dataset-driven prepared configs |
+| `artifacts/ui_configs` | Editable config copies and dataset-driven prepared configs (training schemas only) |
 | `artifacts/ui_configs/plans` | Dataset-driven prepared evaluation plans (not config selectors) |
+| `artifacts/deployment_drafts` | Generated deployment drafts (deployment schema only) |
+| `artifacts/deployment_fixtures` | Approved synthetic dry-run fixtures |
+| `artifacts/deployments` | Deployment outputs |
 | `artifacts/mlflow` | Local MLflow index store |
 
 ## Understanding the control panel UI
 
 ### Operations and Actions
 
-**Operation** corresponds to a command group (e.g. Experiment Core v2, Optuna Search v1).
-**Action** is the specific task within that operation (e.g. Run, Validate, New study).
+**Operation** is the workflow step (Train, Compare, Tune, Blend, Generate
+submission) plus any supporting operation such as MLflow local index.
+**Action** is the specific task within that step (e.g. Run, Validate, New study).
 These are separate because they have different safety levels, configs, and CLIs.
+The technical command and action IDs behind the selected step are listed under
+**Technical details**, together with the artifact contract the step accepts and
+the contract it produces.
 
 ### Source types
 
@@ -163,6 +197,46 @@ Generated files stay under `artifacts/ui_configs/` (plans under
 5. Expand Pre-run summary and confirm: Model=LightGBM, Mode=Development, Source=Canonical config
 6. Check the confirmation box
 7. Click **Start background job**
+
+### Example: Generate submission from a completed run
+
+Generate submission starts from a **completed run**, never from a deployment YAML
+path. The deployment configuration is generated for you.
+
+1. Operation → **📤 Generate submission**
+2. Action → **Validate**
+3. **1. Select a completed run** — pick the exact run. Labels show Dataset ID,
+   model family, config identity, mode, Balanced Accuracy, and short run
+   identity. Nothing is auto-selected by best metric; when several runs share a
+   dataset and model family the panel says so and keeps your choice.
+   Exploratory Dataset Packages are hidden until you enable them and always
+   carry a warning.
+4. **2. Deployment readiness** — a deterministic report of run identity, dataset
+   identity, model/adapter identity, resolved plan identity, selected threshold
+   evidence, the competition-test access flag (`false`), and the deployment
+   schema that will be produced. When something authoritative is missing the
+   step is **blocked** and every blocking reason is listed. Nothing is guessed.
+5. **3. Prepare deployment draft** — enter the approver required by the
+   deployment approval contract, then click **Prepare deployment draft**. The
+   builder writes, under `artifacts/deployment_drafts/<candidate-id>/`:
+   `deployment_config.yaml`, `threshold_evidence.yaml`, `candidate_approval.yaml`,
+   and `draft_provenance.json`. Regenerating the same run is idempotent; a draft
+   whose content differs produces a conflict instead of being overwritten, and a
+   recorded approval is never rewritten.
+6. **4. Validate and rehearse** — the generated draft is used as the `config`
+   argument. Start the job and confirm `"ok": true` on Jobs.
+7. **Synthetic dry run** — select action **Synthetic dry run** and provide an
+   approved fixture directory under `artifacts/deployment_fixtures` plus a new
+   output directory under `artifacts/deployments`.
+
+Real competition submission stays disabled: the generated draft intentionally
+leaves sample-submission identity unresolved, and the real deployment run remains
+disabled in the command registry.
+
+You can also start from **Results → Research Workspace**: open a run and click
+**Prepare for submission**. That transfers only the run identity to Generate
+submission (never the Research v2 configuration) and shows the same readiness and
+builder behavior.
 
 ### Dataset-aware jobs and results
 

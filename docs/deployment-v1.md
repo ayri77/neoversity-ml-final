@@ -66,6 +66,47 @@ disabled, model persistence is false, and existing output is never replaced.
 See [the config template](templates/deployment_v1.example.yaml). It contains
 placeholders and is intentionally not an approved production selection.
 
+## Generated deployment drafts
+
+Deployment configurations are no longer written by hand. The Control Panel
+**Generate submission** step selects a completed canonical Research v2 run and
+generates a draft through `control_panel/deployment_draft_builder.py`:
+
+```text
+completed Research v2 run
+→ deterministic readiness report
+→ artifacts/deployment_drafts/<run-id>-<manifest-sha256[:12]>/
+  ├── deployment_config.yaml     (this deployment_v1 schema)
+  ├── threshold_evidence.yaml    (typed evidence artifact)
+  ├── candidate_approval.yaml    (approval schema v1)
+  └── draft_provenance.json      (run, dataset, model, protocol, threshold links)
+```
+
+The builder reads only authoritative run sidecars and the immutable Dataset
+Package manifest. It derives dataset version, pipeline ID, adapter ID, fixed
+resolved model parameters, plan/pipeline/adapter/candidate hashes, threshold value
+and policy, and competition-test identity (path, SHA-256, expected rows, ordered
+schema hash) from the Dataset Package manifest without reading the test file.
+Drafts are repository-relative, written atomically, idempotent on identical
+regeneration, and never silently replaced; a recorded approval is never rewritten.
+
+A generated draft is accepted by `load_deployment_config` and by
+`run_deployment_v1.py validate`, and can be rehearsed with
+`run_deployment_v1.py dry-run` against an approved synthetic fixture.
+
+Two inputs are intentionally **not** derived, so a real competition run stays
+blocked after draft generation:
+
+- `sample_submission` identity. The draft records
+  `data/competition/UNRESOLVED_sample_submission.csv` with a placeholder hash
+  because no registered competition sample submission exists to authenticate.
+- The submission ID column. A prepared Dataset Package `X_test.parquet` contains
+  features only, so the configured `id_column` is absent from the competition test
+  frame and `_validate_sample_and_alignment` would reject a real run.
+
+The registry action for the real run also remains `enabled: false` with
+`competition_test: true` and acknowledge confirmation.
+
 ## Full-data features and bagging
 
 After all configuration, approval, completed-run, manifest, and identity checks

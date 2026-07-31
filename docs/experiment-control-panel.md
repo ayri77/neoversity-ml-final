@@ -31,9 +31,9 @@ application uses the main project environment, not `.venv-autogluon`.
 
 - **Dashboard** shows job-state counts, recent jobs, recent configured artifacts,
   command groups, and the configured MLflow link.
-- **Run** selects an allowlisted operation and action, reads an allowed YAML or JSON
-  configuration, validates syntax, displays exact redacted argv, and starts one
-  background job after the required confirmation.
+- **Run** selects one ordered workflow step and its action, reads an allowed YAML or
+  JSON configuration, validates syntax and configuration type, displays exact
+  redacted argv, and starts one background job after the required confirmation.
 - **Jobs** refreshes persisted job state, shows PID, timestamps, elapsed time, exit
   code, exact redacted argv, and bounded stdout/stderr tails. Experiment Core jobs
   persist Dataset ID / experiment / plan / model / mode in `job.json` references and
@@ -48,6 +48,97 @@ application uses the main project environment, not `.venv-autogluon`.
 
 The UI uses manual refresh. It does not use aggressive automatic reruns and never
 retries a command automatically.
+
+## Workflow navigation and artifact contracts
+
+`src/churn_ml/control_panel/workflow_navigation.py` declares the ordered
+user-facing workflow. Registry command IDs, action IDs, schema versions, and the
+allowlisted CLI backend are unchanged; only presentation and the declarative
+contract mapping live there.
+
+| Order | Label | Command ID | Accepted input contract | Produced output contract |
+| --- | --- | --- | --- | --- |
+| 1 | 🧪 Train | `experiment_core_v2` | `experiment_core_v2_config_v1` | `research_v2_completed_run_v1` |
+| 2 | 🔎 Compare | `paired_comparison` | `research_v2_completed_run_v1` | `paired_comparison_v1_artifact` |
+| 3 | 🎛️ Tune | `optuna_search_v1` | `optuna_search_config_v1` | `optuna_search_report_v1`, `experiment_core_v2_config_v1` |
+| 4 | 🧬 Blend | `blend_evaluation_v1` | `blend_evaluation_config_v1`, `research_v2_completed_run_v1` | `blend_evaluation_v1_completed_evaluation`, `blend_evaluation_v1_deployment_package` |
+| 5 | 📤 Generate submission | `final_deployment_v1` | `research_v2_completed_run_v1`, `blend_evaluation_v1_deployment_package` | `deployment_v1_submission_artifact` (intermediate `deployment_draft_v1`, `deployment_v1_config`) |
+
+Rules:
+
+- Workflow ordering is deterministic and comes first in the operation selector;
+  supporting operations such as MLflow local index follow.
+- `research_v1` (Research evaluation v1) is declared legacy. It is hidden from the
+  default selector, appears only after the **Advanced / Legacy operations**
+  checkbox is enabled, is labelled `Legacy`, and shows a warning when selected.
+  The legacy backend itself is unchanged. A durable session that already selected
+  it reveals the section instead of silently rewriting the selection.
+- Primary labels never contain `v1`, `v2`, `Experiment Core`, or
+  `Final Deployment`. The **Technical details** expander shows the command ID,
+  registry title, action ID, registry description, and the declared contracts.
+- The contract mapping is a small declarative table, not a plugin framework or a
+  global version-management layer.
+
+## Configuration schema-type guard
+
+`config_schema_guard.py` classifies a selected configuration by document content
+and, for deployment, by the authoritative production parser — never by filename or
+directory. Immediately before launch:
+
+- `final_deployment_v1` requires a `deployment_v1` document. An Experiment Core
+  training configuration is rejected with
+  `This file is an Experiment Core training configuration. Generate a deployment
+  draft from a completed run instead.`
+- `experiment_core_v2` rejects a deployment configuration with the symmetric
+  message.
+- A deployment document that the production loader rejects is reported with the
+  parser error instead of being launched.
+
+`final_deployment_v1` no longer accepts the generic mixed-schema
+`artifacts/ui_configs` root. Its allowed config globs and input roots are limited
+to `configs/deployment`, generated drafts under `artifacts/deployment_drafts`,
+existing blend deployment packages, plus the fixture and output roots. The same
+untyped selector therefore cannot serve both Experiment Core and Final Deployment.
+
+## Canonical run to deployment draft
+
+**Generate submission** starts from a completed canonical run, not a config path.
+
+- `deployment_candidates.py` reuses the Research Workspace inventory (no second
+  artifact scan), filters to completed non-smoke non-archived Research v2 runs
+  with complete identity and a deployment-supported adapter, and labels each
+  candidate with Dataset ID, model family, config identity, mode, primary metric,
+  short run identity, and an exploratory warning. Duplicates are reported; the
+  highest Balanced Accuracy is never auto-selected.
+- `evaluate_deployment_readiness()` returns a deterministic supported/blocked
+  report with ordered blocking reasons, run/dataset/model/plan identity, selected
+  threshold evidence, the competition-test access flag, and the deployment schema
+  that will be produced. Missing authoritative information blocks preparation;
+  nothing is inferred or requested from the operator by hand.
+- `deployment_draft_builder.py` derives the deployment payload from run sidecars
+  (`run_metadata.json`, `artifact_manifest.json`, `resolved_config.yaml`,
+  `identities/*.json`, `thresholds/threshold_summary.json`,
+  `dataset_fingerprints.json`) and the immutable Dataset Package manifest. It
+  produces the real `deployment_v1` schema — no parallel pseudo-schema.
+- Drafts are written to
+  `artifacts/deployment_drafts/<candidate-id>/` where `<candidate-id>` is
+  `<run-id>-<run-manifest-sha256[:12]>`: `deployment_config.yaml`,
+  `threshold_evidence.yaml`, `candidate_approval.yaml`, and
+  `draft_provenance.json`. Paths are repository-relative, writes are atomic, an
+  identical regeneration is idempotent, differing content raises a conflict
+  instead of being replaced, and a recorded approval is never rewritten.
+- Deployment-specific values receive safe deterministic defaults (deployment ID,
+  `artifacts/deployments` output root, `submission.csv`, single component,
+  `bag_seeds: [0]`, weight `1.0`). Only the approver, intended role, and
+  paired-comparison exception reason are operator inputs, because the approval
+  contract cannot infer them.
+- **Results → Research Workspace → Prepare for submission** transfers only the run
+  identity (never the Research v2 YAML) through `apply_submission_handoff()`, so
+  Results does not duplicate the builder.
+
+Real competition submission stays disabled. The generated draft leaves
+sample-submission identity unresolved, and the `run` action remains
+`enabled: false` with `competition_test: true` and acknowledge confirmation.
 
 ## Experiment Core v2 entry modes
 

@@ -395,15 +395,16 @@ commands:
     description: Validate, dry-run, inspect, or explicitly unlock the approved deployment CLI.
     category: Deployment
     argv_prefix: ["$PYTHON", "-u", "scripts/run_deployment_v1.py"]
+    # Deployment inputs are typed deployment configurations only. The generic
+    # mixed-schema artifacts/ui_configs root is intentionally not accepted here,
+    # so an Experiment Core training config can no longer reach this operation.
     allowed_config_globs:
       - "configs/deployment/*.yaml"
-      - "artifacts/ui_configs/*.yaml"
-      - "artifacts/ui_configs/*.yml"
-      - "artifacts/ui_configs/*.json"
+      - "artifacts/deployment_drafts/*/deployment_config.yaml"
       - "artifacts/blend_deployment_packages/*/deployment_config.draft.yaml"
     allowed_input_roots:
       - "configs/deployment"
-      - "artifacts/ui_configs"
+      - "artifacts/deployment_drafts"
       - "artifacts/deployment_fixtures"
       - "artifacts/deployments"
       - "artifacts/blend_deployment_packages"
@@ -421,7 +422,7 @@ commands:
             type: path
             role: config
             required: true
-            roots: ["configs/deployment", "artifacts/ui_configs"]
+            roots: ["configs/deployment", "artifacts/deployment_drafts", "artifacts/blend_deployment_packages"]
             must_exist: true
         confirmation: none
         enabled: true
@@ -444,7 +445,7 @@ commands:
             type: path
             role: config
             required: true
-            roots: ["configs/deployment", "artifacts/ui_configs"]
+            roots: ["configs/deployment", "artifacts/deployment_drafts", "artifacts/blend_deployment_packages"]
             must_exist: true
           fixture_dir:
             type: path
@@ -492,7 +493,7 @@ commands:
             type: path
             role: config
             required: true
-            roots: ["configs/deployment", "artifacts/ui_configs"]
+            roots: ["configs/deployment", "artifacts/deployment_drafts", "artifacts/blend_deployment_packages"]
             must_exist: true
         confirmation: acknowledge
         enabled: false

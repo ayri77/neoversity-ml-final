@@ -66,6 +66,33 @@ from src.churn_ml.control_panel.research_matrix import (  # noqa: E402
     descriptive_comparison_table,
     matrix_display_rows,
 )
+from src.churn_ml.control_panel.workflow_navigation import (  # noqa: E402
+    contract_declaration,
+    is_legacy_command,
+    visible_command_ids,
+    workflow_description,
+    workflow_label,
+)
+from src.churn_ml.control_panel.config_schema_guard import (  # noqa: E402
+    ConfigGuardResult,
+    guard_config_for_command,
+)
+from src.churn_ml.control_panel.deployment_candidates import (  # noqa: E402
+    CANDIDATE_WIDGET_KEY,
+    SUBMISSION_HANDOFF_KEY,
+    apply_submission_handoff,
+    candidate_durable_key,
+    evaluate_deployment_readiness,
+    list_deployment_candidates,
+)
+from src.churn_ml.control_panel.deployment_draft_builder import (  # noqa: E402
+    DEFAULT_EXCEPTION_REASON,
+    DEFAULT_INTENDED_ROLE,
+    DEPLOYMENT_CONFIG_NAME,
+    DEPLOYMENT_DRAFT_ROOT,
+    DeploymentDraftError,
+    prepare_deployment_draft,
+)
 from src.churn_ml.control_panel.command_builder import (  # noqa: E402
     CommandBuildError,
     build_command,
@@ -292,9 +319,31 @@ def run_page() -> None:
     prefill = st.session_state.pop("run_prefill", None) or {}
     if not isinstance(prefill, dict):
         prefill = {}
-    command_ids = list(loaded.commands)
+    registered_command_ids = list(loaded.commands)
     command_widget_key = "run-command"
     command_durable_key = ui_durable_key("run", "command")
+    advanced_widget_key = "run-show-advanced-operations"
+    advanced_durable_key = ui_durable_key("run", "show_advanced_operations")
+    if advanced_widget_key not in st.session_state:
+        st.session_state[advanced_widget_key] = bool(
+            get_durable_value(st.session_state, advanced_durable_key)
+        )
+    # A legacy operation may already be selected (durable state or a historical
+    # session). Reveal the legacy section instead of silently rewriting that
+    # selection.
+    already_selected = (
+        prefill.get("command_id")
+        or st.session_state.get(command_widget_key)
+        or get_durable_value(st.session_state, command_durable_key)
+    )
+    if already_selected in registered_command_ids and already_selected not in set(
+        visible_command_ids(registered_command_ids)
+    ):
+        st.session_state[advanced_widget_key] = True
+    command_ids = visible_command_ids(
+        registered_command_ids,
+        include_legacy=bool(st.session_state[advanced_widget_key]),
+    )
     preferred_command = prefill.get("command_id")
     if preferred_command in command_ids:
         st.session_state[command_widget_key] = preferred_command
@@ -308,10 +357,14 @@ def run_page() -> None:
             default=command_ids[0] if command_ids else None,
         )
     command_id = st.selectbox(
+        # The label stays "Operation" so existing UI state and UI tests keep
+        # working; the options themselves are now the ordered workflow steps.
         "Operation",
         command_ids,
         key=command_widget_key,
-        format_func=lambda value: loaded.commands[value].title,
+        format_func=lambda value: workflow_label(
+            value, fallback=loaded.commands[value].title
+        ),
     )
     remember_durable_value(
         st.session_state,
@@ -320,6 +373,14 @@ def run_page() -> None:
         allowed=command_ids,
     )
     command = loaded.commands[command_id]
+    st.caption(
+        workflow_description(command_id, fallback=command.description)
+    )
+    if is_legacy_command(command_id):
+        st.warning(
+            "Legacy operation. It stays available only so historical runs remain "
+            "reproducible. Use Train for new training."
+        )
     action_ids = list(command.actions)
     action_widget_key = f"run-action-{command_id}"
     action_durable_key = ui_durable_key("run", "action", command_id)
@@ -348,7 +409,6 @@ def run_page() -> None:
         allowed=action_ids,
     )
     action = command.actions[action_id]
-    st.write(action.description)
     risk = (
         "Competition-test / deployment"
         if action.competition_test
@@ -357,6 +417,11 @@ def run_page() -> None:
     st.caption(f"Safety level: {risk}")
     if not action.enabled:
         st.warning("This action is disabled by the declarative registry.")
+    _render_advanced_operations_toggle(
+        widget_key=advanced_widget_key,
+        durable_key=advanced_durable_key,
+    )
+    _render_workflow_technical_details(loaded, command_id, action_id)
 
     values: dict[str, Any] = {}
     selected_config: Path | None = None
@@ -408,60 +473,87 @@ def run_page() -> None:
                     st.session_state, command_id, "config", "config", prepared_config
                 )
 
+    deployment_summary: dict[str, str] = {}
+    use_candidate_driven = False
+    if command_id == "final_deployment_v1" and "config" in action.placeholders:
+        (
+            prepared_deployment_config,
+            deployment_summary,
+            deployment_blocks_launch,
+        ) = _deployment_candidate_controls(loaded, action_id=action_id)
+        use_candidate_driven = True
+        dataset_driven_blocks_launch = (
+            dataset_driven_blocks_launch or deployment_blocks_launch
+        )
+        if prepared_deployment_config:
+            values["config"] = prepared_deployment_config
+            selected_config = REPOSITORY_ROOT / prepared_deployment_config
+            config_widget = widget_selection_key(command_id, "config", "config")
+            st.session_state[config_widget] = prepared_deployment_config
+            set_logical_selection(
+                st.session_state,
+                command_id,
+                "config",
+                "config",
+                prepared_deployment_config,
+            )
+
+    skip_config_placeholder = use_dataset_driven or use_candidate_driven
     prefill_values = (
         prefill.get("values", {})
         if prefill.get("command_id") == command_id
         and prefill.get("action_id") == action_id
         else {}
     )
-    if not use_dataset_driven:
-        for name, value in prefill_values.items():
-            placeholder = action.placeholders.get(name)
-            role = placeholder.role if placeholder is not None else "value"
-            shared_key = widget_selection_key(command_id, role, name)
-            # Force override older durable/widget state from Results prepare actions.
-            st.session_state[shared_key] = value
-            set_logical_selection(st.session_state, command_id, role, name, value)
-            # Keep legacy per-action key in sync for older session handoffs.
-            st.session_state[f"value-{command_id}-{action_id}-{name}"] = value
+    for name, value in prefill_values.items():
+        if skip_config_placeholder and name == "config":
+            continue
+        placeholder = action.placeholders.get(name)
+        role = placeholder.role if placeholder is not None else "value"
+        shared_key = widget_selection_key(command_id, role, name)
+        # Force override older durable/widget state from Results prepare actions.
+        st.session_state[shared_key] = value
+        set_logical_selection(st.session_state, command_id, role, name, value)
+        # Keep legacy per-action key in sync for older session handoffs.
+        st.session_state[f"value-{command_id}-{action_id}-{name}"] = value
 
-        for name, placeholder in action.placeholders.items():
-            widget_key = widget_selection_key(command_id, placeholder.role, name)
-            # Migrate a previous per-action value once when shared key is empty.
-            legacy_key = f"value-{command_id}-{action_id}-{name}"
-            if st.session_state.get(widget_key) in (None, "") and st.session_state.get(
-                legacy_key
-            ) not in (None, ""):
-                st.session_state[widget_key] = st.session_state[legacy_key]
-            value = _placeholder_widget(
-                loaded,
-                command.allowed_config_globs,
-                name,
-                placeholder,
-                widget_key,
-                values,
-                operation=command_id,
+    for name, placeholder in action.placeholders.items():
+        if skip_config_placeholder and (
+            placeholder.role == "config" or name == "config"
+        ):
+            continue
+        widget_key = widget_selection_key(command_id, placeholder.role, name)
+        # Migrate a previous per-action value once when shared key is empty.
+        legacy_key = f"value-{command_id}-{action_id}-{name}"
+        if st.session_state.get(widget_key) in (None, "") and st.session_state.get(
+            legacy_key
+        ) not in (None, ""):
+            st.session_state[widget_key] = st.session_state[legacy_key]
+        value = _placeholder_widget(
+            loaded,
+            command.allowed_config_globs,
+            name,
+            placeholder,
+            widget_key,
+            values,
+            operation=command_id,
+        )
+        if value not in (None, ""):
+            values[name] = value
+            if placeholder.role == "config":
+                selected_config = REPOSITORY_ROOT / str(value)
+
+    config_guard: ConfigGuardResult | None = None
+    guarded_config = values.get("config")
+    if guarded_config:
+        config_guard = guard_config_for_command(
+            REPOSITORY_ROOT, command_id, str(guarded_config)
+        )
+        if not config_guard.ok:
+            st.error(
+                config_guard.message
+                or "The selected configuration does not match this operation."
             )
-            if value not in (None, ""):
-                values[name] = value
-                if placeholder.role == "config":
-                    selected_config = REPOSITORY_ROOT / str(value)
-    else:
-        for name, placeholder in action.placeholders.items():
-            if placeholder.role == "config" or name == "config":
-                continue
-            widget_key = widget_selection_key(command_id, placeholder.role, name)
-            value = _placeholder_widget(
-                loaded,
-                command.allowed_config_globs,
-                name,
-                placeholder,
-                widget_key,
-                values,
-                operation=command_id,
-            )
-            if value not in (None, ""):
-                values[name] = value
 
     if selected_config is not None and selected_config.is_file():
         _config_panel(loaded, selected_config)
@@ -469,10 +561,15 @@ def run_page() -> None:
     st.session_state["_last_command_id"] = command_id
     st.session_state["_last_action_id"] = action_id
 
+    if deployment_summary:
+        dataset_driven_summary = {**deployment_summary, **dataset_driven_summary}
+    schema_blocks_launch = config_guard is not None and not config_guard.ok
     built = None
     pre_run: dict[str, str] = {}
     try:
-        if action.enabled and not dataset_driven_blocks_launch:
+        if action.enabled and not dataset_driven_blocks_launch and (
+            not schema_blocks_launch
+        ):
             built = build_command(
                 loaded.commands,
                 command_id,
@@ -518,6 +615,8 @@ def run_page() -> None:
                 st.markdown("  \n".join(f"**{k}:** {v}" for k, v in pre_run.items()))
             with st.expander("Technical command", expanded=False):
                 st.code(display_argv(built.redacted_argv), language="python")
+        elif schema_blocks_launch:
+            st.info("Select a configuration that matches this operation's contract.")
         elif dataset_driven_blocks_launch:
             st.info(
                 "Prepare a valid dataset-driven configuration before Validate/Run."
@@ -613,6 +712,283 @@ def run_page() -> None:
             st.success(f"Started job {record.job_id}.")
         except (LaunchAuthorizationError, JobError) as error:
             st.error(str(error))
+
+
+def _render_advanced_operations_toggle(
+    *, widget_key: str, durable_key: str
+) -> None:
+    """Explicit Advanced / Legacy operations visibility toggle."""
+    with st.expander("Advanced / Legacy operations", expanded=False):
+        st.caption(
+            "The workflow above is the supported path. Superseded operations "
+            "stay hidden until you enable them here."
+        )
+        value = st.checkbox(
+            "Show legacy operations",
+            key=widget_key,
+            help=(
+                "Research evaluation v1 is a legacy training backend kept only "
+                "so historical runs remain reproducible. Do not use it for new "
+                "training."
+            ),
+        )
+        remember_durable_value(
+            st.session_state,
+            durable_key=durable_key,
+            value=bool(value),
+            allowed=None,
+        )
+
+
+def _render_workflow_technical_details(
+    loaded: ControlPanelRegistry, command_id: str, action_id: str
+) -> None:
+    """Technical operation identity and declared artifact contracts."""
+    command = loaded.commands[command_id]
+    action = command.actions[action_id]
+    contracts = contract_declaration(command_id)
+    accepted = ", ".join(contracts["input"]) or "—"
+    produced = ", ".join(contracts["output"]) or "—"
+    with st.expander("Technical details", expanded=False):
+        lines = [
+            f"- **Operation ID:** `{command_id}`",
+            f"- **Registry title:** {command.title}",
+            f"- **Action ID:** `{action_id}`",
+            f"- **Registry description:** {action.description}",
+            f"- **Accepted input contract:** `{accepted}`",
+        ]
+        if contracts["intermediate"]:
+            lines.append(
+                "- **Intermediate contract:** "
+                f"`{', '.join(contracts['intermediate'])}`"
+            )
+        lines.append(f"- **Produced output contract:** `{produced}`")
+        st.markdown("\n".join(lines))
+
+
+def _archived_research_run_paths() -> frozenset[str]:
+    try:
+        archive = ArchiveRegistry(REPOSITORY_ROOT)
+        return frozenset(
+            path
+            for reader_id, path in archive.archived_artifact_keys()
+            if reader_id == "research_v2"
+        )
+    except ArchiveError:
+        return frozenset()
+
+
+def _deployment_candidate_controls(
+    loaded: ControlPanelRegistry, *, action_id: str
+) -> tuple[str | None, dict[str, str], bool]:
+    """Canonical completed-run selection and deployment-draft preparation."""
+    del loaded
+    st.subheader("1. Select a completed run")
+    archived = _archived_research_run_paths()
+    try:
+        rows = inventory_rows_from_mappings(
+            _cached_research_inventory_rows(str(REPOSITORY_ROOT))
+        )
+    except Exception as error:  # noqa: BLE001 - never crash the Run page
+        st.error(f"Completed-run inventory is unavailable: {error}")
+        return None, {}, True
+    all_candidates = list_deployment_candidates(
+        rows, archived_paths=archived, include_exploratory=True
+    )
+    if not all_candidates:
+        st.info(
+            "No completed canonical run currently satisfies the deployment "
+            "candidate contract. Train a run first, then return here."
+        )
+        return None, {}, True
+
+    handoff = st.session_state.pop(SUBMISSION_HANDOFF_KEY, None)
+    exploratory_paths = {
+        item.relative_path for item in all_candidates if item.exploratory
+    }
+    exploratory_key = "deploy-include-exploratory"
+    if handoff in exploratory_paths:
+        st.session_state[exploratory_key] = True
+    include_exploratory = st.checkbox(
+        "Include exploratory Dataset Packages",
+        key=exploratory_key,
+        help=(
+            "Exploratory packages used target information during feature "
+            "discovery. Any submission built from them stays exploratory."
+        ),
+    )
+    candidates = [
+        item for item in all_candidates if include_exploratory or not item.exploratory
+    ]
+    if not candidates:
+        st.info("Enable exploratory packages to see the remaining candidates.")
+        return None, {}, True
+
+    paths = [item.relative_path for item in candidates]
+    labels = {item.relative_path: item.label for item in candidates}
+    durable_key = candidate_durable_key()
+    if handoff in paths:
+        st.session_state[CANDIDATE_WIDGET_KEY] = handoff
+        set_durable_value(st.session_state, durable_key, handoff)
+    else:
+        sync_widget_with_durable(
+            st.session_state,
+            widget_key=CANDIDATE_WIDGET_KEY,
+            durable_key=durable_key,
+            allowed=paths,
+            default=paths[0],
+        )
+    selected_path = st.selectbox(
+        "Completed run",
+        paths,
+        key=CANDIDATE_WIDGET_KEY,
+        format_func=lambda value: labels.get(value, value),
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=durable_key,
+        value=selected_path,
+        allowed=paths,
+    )
+    selected = next(
+        item for item in candidates if item.relative_path == selected_path
+    )
+    if selected.exploratory:
+        st.warning(
+            "This candidate uses an exploratory Dataset Package. It is not a "
+            "standard candidate; label every result exploratory."
+        )
+    duplicates = [
+        item
+        for item in candidates
+        if item.dataset_id == selected.dataset_id
+        and item.model_family == selected.model_family
+        and item.relative_path != selected.relative_path
+    ]
+    if duplicates:
+        st.info(
+            f"{len(duplicates) + 1} completed runs share this dataset and model "
+            "family. The exact run above is used; nothing is auto-selected by "
+            "maximum Balanced Accuracy."
+        )
+
+    st.subheader("2. Deployment readiness")
+    readiness = evaluate_deployment_readiness(
+        REPOSITORY_ROOT, selected_path, archived_paths=archived
+    )
+    summary = readiness.summary()
+    st.dataframe(
+        [{"field": key, "value": value} for key, value in summary.items()],
+        width="stretch",
+        hide_index=True,
+    )
+    if readiness.supported:
+        st.success("Supported: a deployment draft can be prepared from this run.")
+    else:
+        st.error("Blocked: required authoritative information is missing.")
+        for reason in readiness.blocking_reasons:
+            st.write(f"- {reason}")
+    for warning in readiness.warnings:
+        st.caption(f"⚠ {warning}")
+
+    st.subheader("3. Prepare deployment draft")
+    candidate_id = readiness.facts.candidate_id
+    existing_config = (
+        f"{DEPLOYMENT_DRAFT_ROOT}/{candidate_id}/{DEPLOYMENT_CONFIG_NAME}"
+        if candidate_id
+        else None
+    )
+    draft_config: str | None = None
+    if existing_config and (REPOSITORY_ROOT / existing_config).is_file():
+        draft_config = existing_config
+    approver = st.text_input(
+        "Approver recorded in the candidate approval",
+        key="deploy-approver",
+        help=(
+            "The deployment contract requires a named manual approval. It cannot "
+            "be inferred from a metric."
+        ),
+    )
+    role = st.text_input(
+        "Intended deployment role",
+        value=DEFAULT_INTENDED_ROLE,
+        key="deploy-intended-role",
+    )
+    reason = st.text_area(
+        "Paired-comparison exception reason",
+        value=DEFAULT_EXCEPTION_REASON,
+        key="deploy-exception-reason",
+        help=(
+            "A single-run candidate has no paired comparison, so the approval "
+            "must record an explicit granted exception and its reason."
+        ),
+    )
+    if st.button(
+        "Prepare deployment draft",
+        type="primary",
+        disabled=not readiness.supported or not str(approver).strip(),
+        key="deploy-prepare-draft",
+    ):
+        try:
+            draft = prepare_deployment_draft(
+                REPOSITORY_ROOT,
+                selected_path,
+                approver=str(approver),
+                intended_deployment_role=str(role),
+                paired_comparison_exception_reason=str(reason),
+                archived_paths=archived,
+            )
+        except DeploymentDraftError as error:
+            st.error(str(error))
+        else:
+            draft_config = draft.deployment_config_path
+            if draft.reused:
+                st.success(
+                    f"Reused the identical draft `{draft.deployment_config_path}`. "
+                    "The originally recorded approval evidence is preserved."
+                )
+            else:
+                st.success(f"Prepared `{draft.deployment_config_path}`.")
+            st.dataframe(
+                [
+                    {"field": key, "value": value}
+                    for key, value in draft.summary().items()
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+
+    st.subheader("4. Validate and rehearse")
+    if draft_config is None:
+        st.info(
+            "Prepare a deployment draft to enable Validate and Synthetic dry run."
+        )
+    else:
+        st.markdown(f"**Deployment draft:** `{draft_config}`")
+        st.caption(
+            "Validate authenticates the draft, its generated approval, the "
+            "completed run, and the threshold evidence without reading "
+            "competition data."
+        )
+        if action_id == "dry_run":
+            st.caption(
+                "Synthetic dry run needs an approved synthetic fixture directory "
+                "under artifacts/deployment_fixtures and a new output directory."
+            )
+    st.warning(
+        "Real competition submission remains blocked: the deployment draft "
+        "leaves sample-submission identity unresolved and the real deployment "
+        "run stays disabled in the command registry."
+    )
+
+    panel_summary = {
+        "Selected run": selected_path,
+        "Dataset Package": selected.dataset_id,
+        "Model family": selected.model_family,
+        "Deployment readiness": "supported" if readiness.supported else "blocked",
+        "Deployment draft": draft_config or "not prepared",
+    }
+    return draft_config, panel_summary, draft_config is None
 
 
 def jobs_page() -> None:
@@ -2177,6 +2553,32 @@ def _results_research_workspace_tab(
                 st.rerun()
             except ResearchAnnotationError as error:
                 st.error(str(error))
+
+    st.subheader("Submission handoff")
+    handoff_readiness = evaluate_deployment_readiness(
+        REPOSITORY_ROOT, row.relative_path
+    )
+    if handoff_readiness.supported:
+        st.success("This run satisfies the deployment candidate contract.")
+    else:
+        st.warning("This run cannot be prepared for submission yet.")
+        for reason in handoff_readiness.blocking_reasons:
+            st.write(f"- {reason}")
+    if st.button(
+        "Prepare for submission",
+        key=f"rw-prepare-submission-{row.relative_path}",
+        help=(
+            "Transfers only this run's identity to Generate submission. The "
+            "Research v2 configuration is never used as a deployment config."
+        ),
+    ):
+        # Run identity only; the draft itself is built by the shared builder
+        # inside Generate submission, never duplicated here.
+        apply_submission_handoff(st.session_state, row.relative_path)
+        st.success(
+            "Transferred the selected run to Generate submission. Open Run to "
+            "review readiness and prepare the deployment draft."
+        )
 
     st.subheader("Descriptive comparison preview")
     compare_paths = st.multiselect(
