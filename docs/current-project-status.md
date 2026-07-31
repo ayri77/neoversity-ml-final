@@ -6,9 +6,11 @@
 **Last updated:** 2026-07-31  
 **Repository:** `ayri77/neoversity-ml-final`  
 **Active task branch:** `feature/prepared-dataset-pipeline-v1`  
-**Current checkpoint:** manually execute
-`notebooks/03_feature_engineering.ipynb`, then audit the generated `v0`-`v7`
-Dataset Packages before starting any model campaign.
+**Current checkpoint:** notebook `03_feature_engineering.ipynb` has been
+manually executed and local `v0`-`v7` Registry packages are present; complete
+the post-notebook audit before starting any model campaign. The Experiment
+Control Panel now supports a Registry-backed dataset-driven Experiment Core
+entry mode (prepare local config/plan, then Validate/Run).
 
 ## 1. Purpose and maintenance policy
 
@@ -52,30 +54,21 @@ git -C $repo status --short --branch
 
 ## 2. Immediate resume checkpoint
 
-The user is manually running the complete notebook:
+Local `data/processed` currently exposes eight Registry packages discovered by
+`discover_registered_datasets` (`v0`-`v7`). The notebook working tree may still
+contain user-local notebook changes; do not revert or commit them unless asked.
 
-```text
-notebooks/03_feature_engineering.ipynb
-```
+Immediate next actions:
 
-The first actions in the next session are:
+1. Complete the post-notebook audit in section 9 (scan/validate Registry and
+   package checks). Do not treat UI work as a substitute for that audit.
+2. Keep `notebooks/03_feature_engineering.ipynb` untouched unless the user
+   explicitly requests edits.
+3. Do not start the Dataset Campaign until every package passes the audit.
 
-1. Obtain the final successful output or the complete traceback.
-2. Obtain:
-
-   ```powershell
-   git -C $repo status --short --branch
-   ```
-
-3. Inspect the generated Dataset Packages and manifests.
-4. Validate all `v0`-`v7` packages.
-5. Run the relevant automated tests.
-6. Do not start the Dataset Campaign until every package passes the audit.
-
-Do not propose another notebook run before inspecting the result of the current
-manual run. Do not automatically commit or revert notebook changes. Jupyter may
-change the `.ipynb` file by saving outputs, execution counts, or metadata; inspect
-the diff first.
+The Experiment Control Panel dataset selector is implemented and covered by
+automated tests, including a validate-only smoke path for
+`v7_compact_zero_indicators` + LightGBM smoke. That does not finish Stage A.
 
 ### Working-directory dependency
 
@@ -211,9 +204,12 @@ require real-package verification or further development:
 - first-class Registry documentation/catalog coverage for `v5`-`v7`;
 - Dataset Campaign / Matrix Runner;
 - cross-dataset paired comparison;
-- dynamic dataset selector in the Control Panel;
 - campaign-results UI;
 - Multi-Blend v2 for cross-model and cross-dataset blending.
+
+The Control Panel dynamic Dataset Package selector for Experiment Core v2 is
+implemented: discovery uses `discover_registered_datasets`, exploratory
+packages are warned, and Validate/Run consume a prepared local config/plan.
 
 ## 7. Prepared dataset suite
 
@@ -447,7 +443,7 @@ git -C $repo status --short --branch
 | C. Verify Registry ↔ Experiment Core | Partly implemented | Real-package bridge validation and v3 compatibility parity |
 | D. Dataset Campaign / Matrix Runner | Planned | Frozen, reproducible screening matrix |
 | E. Cross-dataset paired comparison | Planned | Parent-child deltas on aligned OOF |
-| F. Control Panel and Results integration | Planned | Dynamic dataset/campaign views |
+| F. Control Panel and Results integration | Partly implemented | Dynamic Dataset Package selector for Experiment Core; campaign-results UI still planned |
 | G. Screening and decision | Planned | Evidence-based shortlist |
 | H. Confirmation, blending, and Kaggle | Planned | Untouched confirmation and justified submission |
 | I. AutoGluon r31 gap closure | Deferred | Controlled reproduction after dataset screening |
@@ -656,22 +652,21 @@ Do not select a dataset from a single maximum Balanced Accuracy value.
 
 ## 15. Stage F — Control Panel and Results integration
 
-After the Campaign Runner and comparison contract exist:
+Completed for Experiment Core v2:
 
-1. Add a dynamic Registry-backed dataset selector.
-2. Do not hardcode dataset IDs.
-3. Show lineage and manifest/provenance fields.
-4. Visually mark `target_dependency: exploratory`.
-5. Add filters for:
-   - dataset;
-   - parent;
-   - model;
-   - mode/protocol;
-   - status.
-6. Add a Campaign Results matrix.
-7. Show parent-child deltas.
-8. Use descriptive labels instead of raw run IDs as the primary UI label.
-9. Keep filesystem artifacts authoritative and MLflow secondary.
+1. Dynamic Registry-backed dataset selector (no hardcoded dataset IDs).
+2. Lineage and manifest/provenance fields in the Run page.
+3. Visual warning for `target_dependency: exploratory`.
+4. Explicit prepare of dataset-driven config/plan under `artifacts/ui_configs`,
+   then Validate/Run through the existing allowlisted CLI path.
+
+Still planned after the Campaign Runner and comparison contract exist:
+
+1. Filters for dataset, parent, model, mode/protocol, and status on Results.
+2. Campaign Results matrix.
+3. Parent-child deltas.
+4. Descriptive labels instead of raw run IDs as the primary UI label.
+5. Keep filesystem artifacts authoritative and MLflow secondary.
 
 ## 16. Stage G — screening and decision rules
 

@@ -47,6 +47,39 @@ application uses the main project environment, not `.venv-autogluon`.
 The UI uses manual refresh. It does not use aggressive automatic reruns and never
 retries a command automatically.
 
+## Experiment Core v2 entry modes
+
+On **Run → Experiment Core v2**, choose one entry mode:
+
+- **Dataset-driven experiment** (recommended for registered Dataset Packages)
+  discovers packages dynamically through
+  `discover_registered_datasets(data/processed)`, shows lineage and
+  `target_dependency`, warns on exploratory packages, and materializes a local
+  Research v2 config/plan pair under `artifacts/ui_configs` after an explicit
+  **Prepare run configuration** action.
+- **Existing config** keeps the historical Source → Model → Mode → Config
+  cascade for canonical Research v2 YAML, UI copies, and Optuna exports.
+
+Dataset-driven preparation always forces:
+
+```yaml
+feature_pipeline:
+  id: registered_prepared_passthrough_v1
+  contract:
+    mode: registry_prepared_passthrough_v1
+    drop: []
+    keep_all_features: true
+```
+
+Candidate adapter contracts and evaluation-protocol sections are copied from the
+selected base template without change. Generated plans live under
+`artifacts/ui_configs/plans/` so they do not appear in config selectors. Canonical
+configs and plans remain read-only; publication is create-if-absent, with safe
+identical-content reuse and no overwrite on content conflicts. Changing dataset,
+model, mode, or template invalidates any previously prepared selection.
+
+Validate/Run then use the prepared config path in the exact allowlisted argv.
+
 ## Declarative contracts
 
 All UI integration lives under `configs/ui/`.

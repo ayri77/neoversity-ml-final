@@ -97,7 +97,8 @@ runs. Re-sync is idempotent for already-indexed approved artifacts.
 | `artifacts/optuna_searches` | Optuna search reports |
 | `artifacts/optuna_exports` | Exported best-candidate YAML |
 | `artifacts/ui_jobs` | UI operational job records only |
-| `artifacts/ui_configs` | Editable config copies |
+| `artifacts/ui_configs` | Editable config copies and dataset-driven prepared configs |
+| `artifacts/ui_configs/plans` | Dataset-driven prepared evaluation plans (not config selectors) |
 | `artifacts/mlflow` | Local MLflow index store |
 
 ## Understanding the control panel UI
@@ -139,11 +140,26 @@ Before clicking "Start background job", expand **Pre-run summary** and verify:
 
 The exact argv below the summary is always authoritative.
 
+### Example: dataset-driven Registry experiment
+
+1. Operation → **Experiment Core v2**
+2. Entry mode → **Dataset-driven experiment**
+3. Select a registered Dataset Package (exploratory packages show a warning)
+4. Choose Model, Evaluation mode, and base configuration template
+5. Click **Prepare run configuration** (explicit; not automatic on rerun)
+6. Review Pre-run summary: dataset, parent, target dependency, pipeline,
+   prepared config/plan, and exact argv
+7. Action → **Validate**, then **Run** when ready
+
+Generated files stay under `artifacts/ui_configs/` (plans under
+`artifacts/ui_configs/plans/`). They are local artifacts and are not committed.
+
 ### Example: running manual_lightgbm_te_v1_compat_development.yaml
 
 1. Operation → **Experiment Core v2**
-2. Action → **Run**
-3. Config → select **LightGBM — Development — manual TE compatibility [CANONICAL]**
-4. Expand Pre-run summary and confirm: Model=LightGBM, Mode=Development, Source=Canonical config
-5. Check the confirmation box
-6. Click **Start background job**
+2. Entry mode → **Existing config**
+3. Action → **Run**
+4. Config → select **LightGBM — Development — manual TE compatibility [CANONICAL]**
+5. Expand Pre-run summary and confirm: Model=LightGBM, Mode=Development, Source=Canonical config
+6. Check the confirmation box
+7. Click **Start background job**

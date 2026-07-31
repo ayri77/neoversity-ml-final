@@ -4,7 +4,8 @@ import json
 import os
 import re
 import tempfile
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -77,19 +78,43 @@ def save_config_copy(
     copy_name: str,
     text: str,
 ) -> Path:
+    return publish_editable_text_file(
+        repository_root,
+        editable_root=editable_root,
+        relative_path=copy_name,
+        text=text,
+        allow_identical_reuse=False,
+    )
+
+
+@dataclass(frozen=True)
+class PublishedEditableFile:
+    """Result of an exclusive editable-root publication."""
+
+    path: Path
+    reused: bool
+
+
+def publish_editable_text_file(
+    repository_root: Path,
+    *,
+    editable_root: str,
+    relative_path: str,
+    text: str,
+    allow_identical_reuse: bool = False,
+) -> Path | PublishedEditableFile:
+    """Publish YAML/JSON text under the editable root with create-if-absent safety.
+
+    ``relative_path`` may be a bare filename or one safe subdirectory such as
+    ``plans/example.yaml``. Existing targets are never overwritten. When
+    ``allow_identical_reuse`` is true, an existing file with identical parsed
+    content is returned instead of raising.
+    """
     root = repository_root.resolve(strict=True)
-    name = Path(copy_name)
-    if (
-        name.name != copy_name
-        or SAFE_COPY_NAME.fullmatch(copy_name) is None
-        or name.suffix.lower() not in CONFIG_SUFFIXES
-    ):
-        raise ConfigEditError(
-            "Copy name must be a safe filename ending in .json, .yaml, or .yml."
-        )
-    parse_config_text(text, name.suffix)
+    relative = _validate_editable_relative_path(relative_path)
+    parse_config_text(text, Path(relative).suffix)
     try:
-        _, directory = resolve_safe_path(
+        _, editable_directory = resolve_safe_path(
             root,
             editable_root,
             allowed_roots=(editable_root,),
@@ -97,21 +122,39 @@ def save_config_copy(
         )
     except CommandBuildError as error:
         raise ConfigEditError(str(error)) from error
+    target = editable_directory.joinpath(*PurePosixPath(relative).parts)
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        require_safe_directory(directory)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        require_safe_directory(editable_directory)
+        require_safe_directory(target.parent)
     except (OSError, PathSafetyError) as error:
         raise ConfigEditError("Editable configuration directory is unsafe.") from error
-    target = directory / name.name
+
+    desired = text if text.endswith("\n") else f"{text}\n"
+    if target.exists():
+        try:
+            existing = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            raise ConfigEditError(
+                f"Could not read existing editable file: {relative}."
+            ) from error
+        if allow_identical_reuse and _parsed_config_equal(
+            existing, desired, Path(relative).suffix
+        ):
+            return PublishedEditableFile(path=target, reused=True)
+        raise ConfigEditError(
+            f"Configuration copy already exists with different content: {relative}."
+            if allow_identical_reuse
+            else f"Configuration copy already exists: {Path(relative).name}."
+        )
+
     descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=directory
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
     )
     os.chmod(temporary, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            if text and not text.endswith("\n"):
-                handle.write("\n")
+            handle.write(desired)
             handle.flush()
             os.fsync(handle.fileno())
         _publish_new_file(Path(temporary), target)
@@ -121,6 +164,8 @@ def save_config_copy(
         except OSError:
             pass
         raise
+    if allow_identical_reuse:
+        return PublishedEditableFile(path=target, reused=False)
     return target
 
 
@@ -171,3 +216,36 @@ def _validate_primitive_tree(value: Any, path: str) -> None:
             _validate_primitive_tree(item, f"{path}.{key}")
         return
     raise ConfigEditError(f"{path} contains unsupported type {type(value).__name__}.")
+
+
+def _validate_editable_relative_path(relative_path: str) -> str:
+    posix = PurePosixPath(relative_path.replace("\\", "/"))
+    if (
+        not relative_path
+        or posix.is_absolute()
+        or ".." in posix.parts
+        or any(part in {"", ".", ".."} for part in posix.parts)
+        or len(posix.parts) > 2
+    ):
+        raise ConfigEditError(
+            "Editable relative path must be a safe filename or one safe subdirectory."
+        )
+    for part in posix.parts:
+        if SAFE_COPY_NAME.fullmatch(part) is None:
+            raise ConfigEditError(
+                "Editable relative path contains an unsafe path segment."
+            )
+    if posix.name != posix.parts[-1] or Path(posix.name).suffix.lower() not in CONFIG_SUFFIXES:
+        raise ConfigEditError(
+            "Editable file must end in .json, .yaml, or .yml."
+        )
+    return posix.as_posix()
+
+
+def _parsed_config_equal(left_text: str, right_text: str, suffix: str) -> bool:
+    try:
+        return parse_config_text(left_text, suffix) == parse_config_text(
+            right_text, suffix
+        )
+    except ConfigEditError:
+        return False

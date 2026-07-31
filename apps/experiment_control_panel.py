@@ -44,6 +44,17 @@ from src.churn_ml.control_panel.config_editor import (  # noqa: E402
     read_config,
     save_config_copy,
 )
+from src.churn_ml.control_panel.dataset_experiment_materializer import (  # noqa: E402
+    DatasetExperimentMaterializerError,
+    PreparedExperimentBundle,
+    RegisteredDatasetView,
+    build_dataset_driven_pre_run_summary,
+    discover_registry_summaries,
+    filter_templates,
+    list_base_templates,
+    prepare_dataset_driven_experiment,
+    selection_fingerprint,
+)
 from src.churn_ml.control_panel.launch import (  # noqa: E402
     LaunchAuthorizationError,
     RenderedLaunch,
@@ -274,43 +285,108 @@ def run_page() -> None:
 
     values: dict[str, Any] = {}
     selected_config: Path | None = None
+    dataset_driven_summary: dict[str, str] = {}
+    dataset_driven_blocks_launch = False
+    use_dataset_driven = False
+    if command_id == "experiment_core_v2":
+        entry_modes = ("Dataset-driven experiment", "Existing config")
+        entry_key = "ecv2-entry-mode"
+        entry_durable = ui_durable_key("run", "ecv2_entry_mode")
+        sync_widget_with_durable(
+            st.session_state,
+            widget_key=entry_key,
+            durable_key=entry_durable,
+            allowed=list(entry_modes),
+            # Existing config remains the fast default so Run loads without a
+            # full Registry scan; Dataset-driven is the recommended workflow.
+            default=entry_modes[1],
+        )
+        entry_mode = st.radio(
+            "Experiment Core entry mode",
+            entry_modes,
+            key=entry_key,
+            horizontal=True,
+            help=(
+                "Prefer Dataset-driven experiment for registered Dataset Packages. "
+                "Existing config keeps historical Research v2 launches unchanged."
+            ),
+        )
+        remember_durable_value(
+            st.session_state,
+            durable_key=entry_durable,
+            value=entry_mode,
+            allowed=list(entry_modes),
+        )
+        use_dataset_driven = entry_mode == "Dataset-driven experiment"
+        if use_dataset_driven:
+            (
+                prepared_config,
+                dataset_driven_summary,
+                dataset_driven_blocks_launch,
+            ) = _experiment_core_dataset_driven_controls(loaded, command_id=command_id)
+            if prepared_config:
+                values["config"] = prepared_config
+                selected_config = REPOSITORY_ROOT / prepared_config
+                config_widget = widget_selection_key(command_id, "config", "config")
+                st.session_state[config_widget] = prepared_config
+                set_logical_selection(
+                    st.session_state, command_id, "config", "config", prepared_config
+                )
+
     prefill_values = (
         prefill.get("values", {})
         if prefill.get("command_id") == command_id
         and prefill.get("action_id") == action_id
         else {}
     )
-    for name, value in prefill_values.items():
-        placeholder = action.placeholders.get(name)
-        role = placeholder.role if placeholder is not None else "value"
-        shared_key = widget_selection_key(command_id, role, name)
-        # Force override older durable/widget state from Results prepare actions.
-        st.session_state[shared_key] = value
-        set_logical_selection(st.session_state, command_id, role, name, value)
-        # Keep legacy per-action key in sync for older session handoffs.
-        st.session_state[f"value-{command_id}-{action_id}-{name}"] = value
+    if not use_dataset_driven:
+        for name, value in prefill_values.items():
+            placeholder = action.placeholders.get(name)
+            role = placeholder.role if placeholder is not None else "value"
+            shared_key = widget_selection_key(command_id, role, name)
+            # Force override older durable/widget state from Results prepare actions.
+            st.session_state[shared_key] = value
+            set_logical_selection(st.session_state, command_id, role, name, value)
+            # Keep legacy per-action key in sync for older session handoffs.
+            st.session_state[f"value-{command_id}-{action_id}-{name}"] = value
 
-    for name, placeholder in action.placeholders.items():
-        widget_key = widget_selection_key(command_id, placeholder.role, name)
-        # Migrate a previous per-action value once when shared key is empty.
-        legacy_key = f"value-{command_id}-{action_id}-{name}"
-        if st.session_state.get(widget_key) in (None, "") and st.session_state.get(
-            legacy_key
-        ) not in (None, ""):
-            st.session_state[widget_key] = st.session_state[legacy_key]
-        value = _placeholder_widget(
-            loaded,
-            command.allowed_config_globs,
-            name,
-            placeholder,
-            widget_key,
-            values,
-            operation=command_id,
-        )
-        if value not in (None, ""):
-            values[name] = value
-            if placeholder.role == "config":
-                selected_config = REPOSITORY_ROOT / str(value)
+        for name, placeholder in action.placeholders.items():
+            widget_key = widget_selection_key(command_id, placeholder.role, name)
+            # Migrate a previous per-action value once when shared key is empty.
+            legacy_key = f"value-{command_id}-{action_id}-{name}"
+            if st.session_state.get(widget_key) in (None, "") and st.session_state.get(
+                legacy_key
+            ) not in (None, ""):
+                st.session_state[widget_key] = st.session_state[legacy_key]
+            value = _placeholder_widget(
+                loaded,
+                command.allowed_config_globs,
+                name,
+                placeholder,
+                widget_key,
+                values,
+                operation=command_id,
+            )
+            if value not in (None, ""):
+                values[name] = value
+                if placeholder.role == "config":
+                    selected_config = REPOSITORY_ROOT / str(value)
+    else:
+        for name, placeholder in action.placeholders.items():
+            if placeholder.role == "config" or name == "config":
+                continue
+            widget_key = widget_selection_key(command_id, placeholder.role, name)
+            value = _placeholder_widget(
+                loaded,
+                command.allowed_config_globs,
+                name,
+                placeholder,
+                widget_key,
+                values,
+                operation=command_id,
+            )
+            if value not in (None, ""):
+                values[name] = value
 
     if selected_config is not None and selected_config.is_file():
         _config_panel(loaded, selected_config)
@@ -321,7 +397,7 @@ def run_page() -> None:
     built = None
     pre_run: dict[str, str] = {}
     try:
-        if action.enabled:
+        if action.enabled and not dataset_driven_blocks_launch:
             built = build_command(
                 loaded.commands,
                 command_id,
@@ -337,10 +413,40 @@ def run_page() -> None:
                 values,
                 REPOSITORY_ROOT,
             )
+            if dataset_driven_summary:
+                merged = {**dataset_driven_summary, **pre_run}
+                # Keep dataset-driven identity fields ahead of generic summary.
+                ordered: dict[str, str] = {}
+                for key in (
+                    "Operation",
+                    "Action",
+                    "Dataset Package",
+                    "Parent dataset",
+                    "Target dependency",
+                    "Pipeline",
+                    "Model",
+                    "Evaluation mode",
+                    "Mode",
+                    "Base template",
+                    "Prepared config",
+                    "Prepared evaluation plan",
+                    "Source",
+                    "Config",
+                    "Plan",
+                ):
+                    if key in merged:
+                        ordered[key] = merged[key]
+                for key, value in merged.items():
+                    ordered.setdefault(key, value)
+                pre_run = ordered
             if pre_run:
                 st.markdown("  \n".join(f"**{k}:** {v}" for k, v in pre_run.items()))
             with st.expander("Technical command", expanded=False):
                 st.code(display_argv(built.redacted_argv), language="python")
+        elif dataset_driven_blocks_launch:
+            st.info(
+                "Prepare a valid dataset-driven configuration before Validate/Run."
+            )
         else:
             with st.expander("Technical command (action disabled)", expanded=False):
                 st.code(
@@ -1342,6 +1448,243 @@ def configuration_page() -> None:
             }
         )
     st.caption("Registry and settings files are read-only in the v1 UI.")
+
+
+@st.cache_data(show_spinner="Scanning Dataset Registry…")
+def _cached_registry_dataset_views(repository_root: str) -> list[dict[str, Any]]:
+    """Cache strict Registry discovery for the Run page (serializable views)."""
+    summaries = discover_registry_summaries(Path(repository_root))
+    return [
+        RegisteredDatasetView.from_summary(item).__dict__ for item in summaries
+    ]
+
+
+def _experiment_core_dataset_driven_controls(
+    loaded: ControlPanelRegistry,
+    *,
+    command_id: str,
+) -> tuple[str | None, dict[str, str], bool]:
+    """Render Registry dataset selectors and prepare a local Experiment Core config.
+
+    Returns ``(prepared_config_relative, pre_run_fields, blocks_launch)``.
+    """
+    prepared_key = "ecv2_prepared_bundle"
+    st.subheader("Dataset Package")
+    try:
+        view_payloads = _cached_registry_dataset_views(str(REPOSITORY_ROOT))
+        views = [RegisteredDatasetView(**item) for item in view_payloads]
+    except DatasetExperimentMaterializerError as error:
+        st.error(str(error))
+        st.session_state.pop(prepared_key, None)
+        return None, {}, True
+    dataset_ids = [item.dataset_id for item in views]
+    dataset_key = "ecv2-dataset-id"
+    dataset_durable = ui_durable_key("run", "ecv2_dataset_id")
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=dataset_key,
+        durable_key=dataset_durable,
+        allowed=dataset_ids,
+        default=dataset_ids[0],
+    )
+    selected_dataset_id = st.selectbox(
+        "Registered Dataset Package",
+        dataset_ids,
+        key=dataset_key,
+        format_func=lambda value: _dataset_option_label(value, views),
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=dataset_durable,
+        value=selected_dataset_id,
+        allowed=dataset_ids,
+    )
+    selected_view = next(
+        item for item in views if item.dataset_id == selected_dataset_id
+    )
+    _render_dataset_package_details(selected_view)
+
+    templates = list_base_templates(REPOSITORY_ROOT)
+    if not templates:
+        st.error("No Research v2 base templates were found under configs/research_v2.")
+        st.session_state.pop(prepared_key, None)
+        return None, {}, True
+
+    model_families = sorted({item.model_family for item in templates})
+    model_key = "ecv2-model-family"
+    model_durable = ui_durable_key("run", "ecv2_model_family")
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=model_key,
+        durable_key=model_durable,
+        allowed=model_families,
+        default=model_families[0],
+    )
+    selected_model = st.selectbox("Model", model_families, key=model_key)
+    remember_durable_value(
+        st.session_state,
+        durable_key=model_durable,
+        value=selected_model,
+        allowed=model_families,
+    )
+
+    mode_options = sorted(
+        {
+            item.mode
+            for item in filter_templates(templates, model_family=selected_model)
+        }
+    )
+    if not mode_options:
+        st.error("No evaluation modes are available for the selected model.")
+        st.session_state.pop(prepared_key, None)
+        return None, {}, True
+    mode_key = "ecv2-mode"
+    mode_durable = ui_durable_key("run", "ecv2_mode")
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=mode_key,
+        durable_key=mode_durable,
+        allowed=mode_options,
+        default=mode_options[0],
+    )
+    selected_mode = st.selectbox("Evaluation mode", mode_options, key=mode_key)
+    remember_durable_value(
+        st.session_state,
+        durable_key=mode_durable,
+        value=selected_mode,
+        allowed=mode_options,
+    )
+
+    filtered = filter_templates(
+        templates, model_family=selected_model, mode=selected_mode
+    )
+    if not filtered:
+        st.error("No base templates match the selected model and mode.")
+        st.session_state.pop(prepared_key, None)
+        return None, {}, True
+    template_paths = [item.relative_path for item in filtered]
+    template_key = "ecv2-base-template"
+    template_durable = ui_durable_key("run", "ecv2_base_template")
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=template_key,
+        durable_key=template_durable,
+        allowed=template_paths,
+        default=template_paths[0],
+    )
+    selected_template = st.selectbox(
+        "Base configuration template",
+        template_paths,
+        key=template_key,
+        format_func=lambda path: readable_config_label(path, REPOSITORY_ROOT),
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=template_durable,
+        value=selected_template,
+        allowed=template_paths,
+    )
+    selected_template_info = next(
+        item for item in filtered if item.relative_path == selected_template
+    )
+
+    current_fingerprint = selection_fingerprint(
+        dataset_id=selected_dataset_id,
+        base_config_relative=selected_template,
+        model_family=selected_model,
+        mode=selected_mode,
+    )
+    prepared_raw = st.session_state.get(prepared_key)
+    prepared = _coerce_prepared_bundle(prepared_raw)
+    if prepared is not None and prepared.selection_fingerprint != current_fingerprint:
+        st.session_state.pop(prepared_key, None)
+        prepared = None
+        st.warning(
+            "Previously prepared configuration was invalidated because the dataset, "
+            "model, mode, or template changed."
+        )
+
+    if st.button("Prepare run configuration", key="ecv2-prepare-config"):
+        try:
+            prepared = prepare_dataset_driven_experiment(
+                REPOSITORY_ROOT,
+                editable_root=loaded.settings.editable_config_root,
+                dataset_id=selected_dataset_id,
+                base_config_relative=selected_template,
+            )
+            st.session_state[prepared_key] = prepared
+            if prepared.reused:
+                st.success(
+                    "Reused an existing identical prepared config/plan pair under "
+                    f"`{prepared.config_relative}`."
+                )
+            else:
+                st.success(
+                    "Prepared Experiment Core configuration at "
+                    f"`{prepared.config_relative}`."
+                )
+        except DatasetExperimentMaterializerError as error:
+            st.session_state.pop(prepared_key, None)
+            st.error(str(error))
+            return None, {}, True
+
+    prepared = _coerce_prepared_bundle(st.session_state.get(prepared_key))
+    if prepared is None:
+        return None, {}, True
+    if prepared.selection_fingerprint != current_fingerprint:
+        st.session_state.pop(prepared_key, None)
+        return None, {}, True
+
+    summary = build_dataset_driven_pre_run_summary(
+        prepared,
+        summary=selected_view,
+    )
+    st.caption(
+        f"Adapter `{selected_template_info.adapter_id}` and evaluation protocol "
+        "are copied from the selected base template. Feature pipeline is forced to "
+        "`registered_prepared_passthrough_v1`."
+    )
+    del command_id
+    return prepared.config_relative, summary, False
+
+
+def _dataset_option_label(dataset_id: str, views: list[RegisteredDatasetView]) -> str:
+    view = next(item for item in views if item.dataset_id == dataset_id)
+    marker = " [exploratory]" if view.target_dependency == "exploratory" else ""
+    return f"{dataset_id} ({view.n_features} features){marker}"
+
+
+def _render_dataset_package_details(view: RegisteredDatasetView) -> None:
+    columns = st.columns(4)
+    columns[0].metric("Dataset ID", view.dataset_id)
+    columns[1].metric("Parent", view.parent_dataset_id or "—")
+    columns[2].metric("Features", view.n_features)
+    columns[3].metric("Target dependency", view.target_dependency)
+    if view.target_dependency == "exploratory":
+        st.warning(
+            "This Dataset Package has `target_dependency: exploratory`. It is not an "
+            "unbiased screening dataset. Results must stay labeled exploratory "
+            "(for example `v3_targeted_missingness`)."
+        )
+    st.write(f"**Hypothesis:** {view.hypothesis}")
+    with st.expander("Dataset fingerprints", expanded=False):
+        st.code(
+            "\n".join(
+                [
+                    f"schema_hash: {view.schema_hash}",
+                    f"train_content_hash: {view.train_content_hash}",
+                    f"target_hash: {view.target_hash}",
+                    f"train_row_identity_hash: {view.train_row_identity_hash}",
+                ]
+            ),
+            language="text",
+        )
+
+
+def _coerce_prepared_bundle(value: Any) -> PreparedExperimentBundle | None:
+    if isinstance(value, PreparedExperimentBundle):
+        return value
+    return None
 
 
 def _placeholder_widget(
