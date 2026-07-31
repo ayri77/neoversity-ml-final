@@ -6,23 +6,22 @@
 **Last updated:** 2026-07-31  
 **Repository:** `ayri77/neoversity-ml-final`  
 **Active task branch:** `feature/prepared-dataset-pipeline-v1`  
-**Current checkpoint:** Canonical submission workflow v1 is implemented on
-    `feature/prepared-dataset-pipeline-v1`. The Control Panel workflow Train →
-    Compare → Tune → Blend → Generate submission produces read-only
-    `deployment_v1` drafts under `artifacts/deployment_drafts/`, uses
-    operation-specific config-preview roots, and authenticates competition
-    sample-submission plus separate test-row identity
-    (`competition_assets_v1`, `configs/competition/competition_assets_v1.yaml`,
-    `data/competition/test_row_identity_v1.json`). Submission IDs are not model
-    features. Unresolved and resolved drafts coexist via a deterministic
-    `-r<asset-fingerprint>` revision. Verified on LightGBM run
-    `20260731T102957829301Z_83e78e3f`: production `validate` → `"ok": true` for
-    both the historical unresolved draft and the resolved revision. Local
-    Generate submission is registry-enabled with acknowledge + readiness gates;
-    network/Kaggle upload remains disabled. Dataset Comparison v1 remains
-    unimplemented. Stage D Dataset Campaign / Matrix Runner v1 remains committed
-    (`6deafc3`) and the 21-run campaign has **not** been executed via the
-    Campaign Runner. Stage E has not started.
+**Current checkpoint:** Stage E Dataset Comparison v1 and the unified Compare
+    workflow are implemented on `feature/prepared-dataset-pipeline-v1`. Run →
+    Compare offers three scopes on completed Research v2 runs: same-dataset
+    Paired Comparison v1 (strict, unchanged), same-model Dataset Comparison v1
+    (`dataset_comparison_v1`, output under
+    `artifacts/research_v2_dataset_comparisons/`), and descriptive Research
+    Workspace comparison. Same-dataset Comparison ID / Output Root autofill is
+    fixed. Validate-only readiness confirmed for all 18 unbiased + 3 exploratory
+    planned pairs against local Development runs. One OOF-only end-to-end proof
+    comparison was written:
+    `lightgbm__v0_raw_minimal__vs__v1_missingness_summary` (mean repeat BA delta
+    ≈ `+0.001257`, repeat wins/ties/losses `1/0/1`). No model fitting occurred
+    for Dataset Comparison. Canonical submission workflow v1 remains available;
+    network/Kaggle upload remains disabled. Stage D Dataset Campaign / Matrix
+    Runner v1 remains committed (`6deafc3`) and the 21-run campaign has **not**
+    been executed via the Campaign Runner.
 
 ## 1. Purpose and maintenance policy
 
@@ -72,22 +71,20 @@ contain user-local notebook changes; do not revert or commit them unless asked.
 
 Immediate next actions:
 
-1. Use Results → Research Workspace to review the manual Research v2 matrix,
-   shortlist candidates, and export a CSV before any further screening decisions.
-2. Complete the post-notebook audit in section 9 (scan/validate Registry and
-   package checks). Do not treat UI or Campaign Runner implementation as a
-   substitute for that audit.
-3. Keep `notebooks/03_feature_engineering.ipynb` untouched unless the user
+1. Use Run → Compare → **Same model / different datasets** (or the Dataset
+   Comparison CLI) to review the remaining ready parent-child pairs after the
+   LightGBM `v0` → `v1` proof. Do not auto-execute all 21 comparisons.
+2. Use Results → Research Workspace for descriptive matrix review and
+   shortlist annotations; do not treat descriptive deltas as paired inference.
+3. Keep Dataset Campaign paused until an explicit authorize-to-execute decision;
+   validate-only the campaign specification before any frozen matrix run.
+4. Keep `notebooks/03_feature_engineering.ipynb` untouched unless the user
    explicitly requests edits.
-4. After the audit passes, validate-only the Stage D campaign specification
-   (`docs/dataset-campaign-runner-v1.md`) before any real matrix execution.
-5. Do not start the full 21-run development screening campaign until every
-   package passes the audit and validate-only succeeds. Manual Research v2
-   coverage does not replace a frozen Campaign Runner execution.
-6. For local competition submission: select the completed LightGBM run, prepare
-   the resolved deployment draft (revision suffix), Validate, Synthetic dry run
-   if desired, then Generate submission with explicit acknowledgement. Do not
-   upload to Kaggle from this workflow.
+5. Deferred Results cleanup (deployment metadata/selectors/charts) remains
+   backlog only; do not mix it into Dataset Comparison work.
+6. For local competition submission: select a completed run, prepare the
+   resolved deployment draft, Validate, then Generate submission with explicit
+   acknowledgement. Do not upload to Kaggle from this workflow.
 
 The Experiment Control Panel dataset selector is implemented and covered by
 automated tests, including a validate-only smoke path for
@@ -229,7 +226,7 @@ require real-package verification or further development:
   `manual_v3_pipeline_v1_compat`;
 - first-class Registry documentation/catalog coverage for `v5`-`v7`;
 - real execution of the Stage D 21-run screening campaign (runner implemented);
-- cross-dataset paired comparison;
+- remaining Dataset Comparison executions beyond the LightGBM `v0` → `v1` proof;
 - campaign-results UI;
 - Multi-Blend v2 for cross-model and cross-dataset blending.
 
@@ -471,7 +468,7 @@ git -C $repo status --short --branch
 | B. Finish Registry/manifests/docs | Planned | `v5`-`v7` are first-class and documentation matches reality |
 | C. Verify Registry ↔ Experiment Core | Partly implemented | Real-package bridge validation and v3 compatibility parity |
 | D. Dataset Campaign / Matrix Runner | Implemented (not executed) | Versioned contract, validate-only, freeze, sequential execute/resume, CLI; 21-run screening not yet run |
-| E. Cross-dataset paired comparison | Planned | Parent-child deltas on aligned OOF |
+| E. Cross-dataset paired comparison | Implemented | Dataset Comparison v1 + unified Compare scopes; 21-pair validate-only ready; one LightGBM proof executed |
 | F. Control Panel and Results integration | Partly implemented | Dynamic Dataset Package selector; archive/cleanup; Research Workspace v1 for Research v2 inventory/matrix/annotations; campaign-results UI still planned |
 | G. Screening and decision | Planned | Evidence-based shortlist |
 | H. Confirmation, blending, and Kaggle | Planned | Untouched confirmation and justified submission |
@@ -642,21 +639,24 @@ intermediate results.
 
 ## 14. Stage E — cross-dataset paired comparison
 
-Paired Comparison v1 requires the same dataset fingerprint and is intended for
-models or pipelines on one dataset. Do not weaken that contract.
+**Implementation status:** Dataset Comparison v1 is implemented. See
+`docs/dataset-comparison-v1.md`, `scripts/compare_research_v2_datasets.py`, and
+the Run → Compare scope selector. Paired Comparison v1 remains the strict
+same-dataset gate and must not be weakened.
 
-Create a separate versioned cross-dataset comparison contract. Different
-feature schemas and content are allowed, but it must require:
+Dataset Comparison v1 allows different feature schemas and content, but requires:
 
-- identical target hash;
-- identical training row identity;
-- identical outer assignments;
-- identical threshold-selection assignments;
-- identical seeds and evaluation protocol;
-- identical model family/configuration for a parent-child comparison;
-- exact alignment of all OOF keys.
+- identical target identity;
+- independent train-row identity from Dataset Package
+  `row_identity.train_anchor_hash` plus run row-position identity (not
+  feature-bound `train_hash` / `bound_train_row_identity_hash`);
+- identical outer and threshold-selection assignments;
+- normalized `evaluation_protocol_hash` (full plan IDs/hashes may differ);
+- normalized `model_configuration_hash` (dataset paths/hashes excluded);
+- exact OOF alignment by repeat / repeat_seed / outer_fold / row_position /
+  target.
 
-Primary parent-child comparisons for each model:
+Primary parent-child comparisons for each model (18 unbiased):
 
 - `v0_raw_minimal` → `v1_missingness_summary`;
 - `v0_raw_minimal` → `v2_missingness_indicators`;
@@ -666,22 +666,14 @@ Primary parent-child comparisons for each model:
 - `v4_zero_value_summary` → `v7_compact_zero_indicators`.
 
 The `v1_missingness_summary` → `v3_targeted_missingness` comparison remains
-exploratory.
+exploratory (3 additional pairs).
 
-Primary effect:
+Local validate-only audit: all 21 planned pairs are ready against completed
+Development runs. One proof artifact exists:
 
 ```text
-delta_BA = BA(child) - BA(parent)
+artifacts/research_v2_dataset_comparisons/lightgbm__v0_raw_minimal__vs__v1_missingness_summary
 ```
-
-Also report:
-
-- repeat wins, ties, and losses;
-- stability across repeats;
-- sensitivity/specificity trade-off;
-- threshold stability;
-- probability correlation;
-- disagreement patterns.
 
 Do not select a dataset from a single maximum Balanced Accuracy value.
 
@@ -747,9 +739,11 @@ Still planned after the Campaign Runner and comparison contract exist:
    policy; campaign-scale UI still pending).
 4. Physical authoritative-result deletion (explicitly out of scope for the
    current archive/cleanup v1).
-5. Dataset Comparison v1 and canonical completed-artifact handoffs for Tune and
-   Blend (both still start from a configuration). Dataset Comparison v1 is
-   **not** implemented.
+5. Canonical completed-artifact handoffs for Tune and Blend (both still start
+   from a configuration). Dataset Comparison v1 is implemented under Compare.
+6. Deferred Results cleanup for deployment artifacts (incomplete deployment
+   metadata, raw technical IDs in deployment selectors, irrelevant charts,
+   generic deployment comparison semantics) remains backlog only.
 
 ## 16. Stage G — screening and decision rules
 

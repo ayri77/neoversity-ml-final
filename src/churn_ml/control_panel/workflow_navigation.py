@@ -28,6 +28,7 @@ DEPLOYMENT_DRAFT_CONTRACT = "deployment_draft_v1"
 DEPLOYMENT_CONFIG_CONTRACT = "deployment_v1_config"
 DEPLOYMENT_ARTIFACT_CONTRACT = "deployment_v1_submission_artifact"
 PAIRED_COMPARISON_CONTRACT = "paired_comparison_v1_artifact"
+DATASET_COMPARISON_CONTRACT = "dataset_comparison_v1_artifact"
 MLFLOW_INDEX_CONTRACT = "mlflow_local_index_mirror"
 
 LEGACY_BADGE = "Legacy"
@@ -83,8 +84,9 @@ WORKFLOW_STEPS: tuple[WorkflowStep, ...] = (
         label="🔎 Compare",
         command_id="paired_comparison",
         description=(
-            "Compare two completed runs of the same dataset on identical folds "
-            "and seeds to see whether a difference is real."
+            "Compare completed runs across three scopes: same dataset with "
+            "different candidates (official paired inference), same model across "
+            "different datasets, or descriptive Research Workspace deltas."
         ),
         input_contracts=(RESEARCH_V2_RUN_CONTRACT,),
         output_contracts=(PAIRED_COMPARISON_CONTRACT,),
@@ -131,6 +133,17 @@ WORKFLOW_STEPS: tuple[WorkflowStep, ...] = (
 
 ADVANCED_OPERATIONS: tuple[AdvancedOperation, ...] = (
     AdvancedOperation(
+        command_id="dataset_comparison_v1",
+        label="Dataset Comparison v1",
+        description=(
+            "Supporting cross-dataset comparison CLI. Prefer the Compare workflow "
+            "scope selector; this registry entry exists for advanced launches."
+        ),
+        badge=None,
+        input_contracts=(RESEARCH_V2_RUN_CONTRACT,),
+        output_contracts=(DATASET_COMPARISON_CONTRACT,),
+    ),
+    AdvancedOperation(
         command_id="research_v1",
         label="Research evaluation v1",
         description=(
@@ -156,6 +169,7 @@ ADVANCED_OPERATIONS: tuple[AdvancedOperation, ...] = (
 
 _STEPS_BY_COMMAND = {step.command_id: step for step in WORKFLOW_STEPS}
 _ADVANCED_BY_COMMAND = {item.command_id: item for item in ADVANCED_OPERATIONS}
+ADVANCED_ONLY_COMMAND_IDS: frozenset[str] = frozenset({"dataset_comparison_v1"})
 
 
 def workflow_command_ids() -> tuple[str, ...]:
@@ -192,10 +206,15 @@ def visible_command_ids(
     """
     known = list(available)
     legacy = legacy_command_ids()
+    advanced_only = ADVANCED_ONLY_COMMAND_IDS
     ordered = [item for item in workflow_command_ids() if item in known]
     tail = [item for item in advanced_command_ids() if item in known]
     tail.extend(item for item in known if item not in ordered and item not in tail)
-    ordered.extend(item for item in tail if item not in ordered and item not in legacy)
+    ordered.extend(
+        item
+        for item in tail
+        if item not in ordered and item not in legacy and item not in advanced_only
+    )
     if include_legacy:
         ordered.extend(item for item in tail if item not in ordered)
     return ordered
@@ -246,12 +265,15 @@ def contract_declaration(command_id: str) -> dict[str, tuple[str, ...]]:
 
 __all__ = [
     "ADVANCED_OPERATIONS",
+    "ADVANCED_ONLY_COMMAND_IDS",
     "AdvancedOperation",
     "BLEND_DEPLOYMENT_PACKAGE_CONTRACT",
+    "DATASET_COMPARISON_CONTRACT",
     "DEPLOYMENT_ARTIFACT_CONTRACT",
     "DEPLOYMENT_CONFIG_CONTRACT",
     "DEPLOYMENT_DRAFT_CONTRACT",
     "LEGACY_BADGE",
+    "PAIRED_COMPARISON_CONTRACT",
     "RESEARCH_V2_RUN_CONTRACT",
     "TRAIN_CONFIG_CONTRACT",
     "WORKFLOW_STEPS",

@@ -89,6 +89,46 @@ readers:
       - "Decision status"
       - "Every repeat improved"
 
+  - id: dataset_comparison_v1
+    title: Dataset Comparison v1 results
+    artifact_roots: ["artifacts/research_v2_dataset_comparisons"]
+    discovery_glob: "*"
+    success_markers: ["_SUCCESS"]
+    failure_markers: ["_FAILED"]
+    summary_files:
+      - path: "summary.json"
+        fields:
+          Balanced Accuracy mean delta: "aggregate_summary.metrics.balanced_accuracy.candidate_minus_baseline.mean"
+          Balanced Accuracy median delta: "aggregate_summary.metrics.balanced_accuracy.candidate_minus_baseline.median"
+          Repeat wins: "aggregate_summary.metrics.balanced_accuracy.repeat_wins_ties_losses.wins"
+          Repeat ties: "aggregate_summary.metrics.balanced_accuracy.repeat_wins_ties_losses.ties"
+          Repeat losses: "aggregate_summary.metrics.balanced_accuracy.repeat_wins_ties_losses.losses"
+      - path: "compatibility_report.json"
+        fields:
+          Compatible: "compatible"
+          Parent-child relation: "parent_child_relation"
+          Exploratory: "exploratory"
+      - path: "baseline_run_reference.json"
+        fields:
+          Baseline dataset: "dataset_id"
+          Model family: "model_family"
+          Baseline run ID: "run_id"
+      - path: "candidate_run_reference.json"
+        fields:
+          Candidate dataset: "dataset_id"
+          Candidate run ID: "run_id"
+    csv_previews: ["repeat_metrics.csv", "fold_metrics.csv"]
+    log_files: []
+    compare_fields:
+      - "Balanced Accuracy mean delta"
+      - "Balanced Accuracy median delta"
+      - "Repeat wins"
+      - "Repeat ties"
+      - "Repeat losses"
+      - "Parent-child relation"
+      - "Exploratory"
+      - "Compatible"
+
   - id: blend_evaluation_v1
     title: Blend Evaluation v1 results
     artifact_roots: ["artifacts/blend_evaluations"]

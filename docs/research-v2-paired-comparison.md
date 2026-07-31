@@ -125,5 +125,7 @@ allocation never mutate an input run.
 The typed loaders and builders in `src/churn_ml/paired_comparison.py` are
 side-effect-free foundations for a later optional MLflow mirror. Dataset
 Campaign / Matrix Runner v1 (`docs/dataset-campaign-runner-v1.md`) orchestrates
-Research v2 cells but does not perform cross-dataset paired inference; that
-remains Stage E.
+Research v2 cells but does not perform cross-dataset paired inference. Official
+cross-dataset parent-child comparison is Dataset Comparison v1
+(`docs/dataset-comparison-v1.md`). Same-dataset Paired Comparison v1 remains
+strict and must not be weakened for cross-dataset pairs.

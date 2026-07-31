@@ -606,6 +606,7 @@ def test_workflow_order_labels_and_legacy_visibility() -> None:
     advanced = visible_command_ids(registered, include_legacy=True)
     assert advanced[: len(standard)] == standard
     assert "research_v1" in advanced
+    assert "dataset_comparison_v1" in advanced
     assert sorted(advanced) == sorted(registered)
     assert is_legacy_command("research_v1") is True
     assert is_legacy_command("experiment_core_v2") is False

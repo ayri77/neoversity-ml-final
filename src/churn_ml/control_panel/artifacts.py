@@ -275,8 +275,14 @@ def artifact_selector_options(
 
 
 def artifact_option_label(artifact: ArtifactRecord) -> str:
+    from src.churn_ml.control_panel.compare_workflow import dataset_comparison_artifact_label
     from src.churn_ml.control_panel.dataset_identity import read_dataset_identity_safe
 
+    if artifact.reader_id == "dataset_comparison_v1":
+        return dataset_comparison_artifact_label(
+            artifact.summaries,
+            comparison_name=Path(artifact.relative_path).name,
+        )
     name = (
         artifact.summaries.get("Study name")
         or artifact.summaries.get("Search ID")
@@ -501,6 +507,14 @@ def default_comparison_id(
     *,
     repo_root: Path,
 ) -> str:
+    from src.churn_ml.control_panel.compare_workflow import (
+        default_same_dataset_comparison_id,
+    )
+
+    try:
+        return default_same_dataset_comparison_id(left.root, right.root, repo_root)
+    except Exception:
+        pass
     left_meta = parse_config_metadata(left.relative_path, repo_root)
     right_meta = parse_config_metadata(right.relative_path, repo_root)
     left_model = _slug(left_meta.get("model_family") or "left")

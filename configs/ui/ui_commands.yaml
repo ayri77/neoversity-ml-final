@@ -3,6 +3,7 @@ approved_public_clis:
   - scripts/run_research_v2.py
   - scripts/run_research_evaluation.py
   - scripts/compare_research_v2.py
+  - scripts/compare_research_v2_datasets.py
   - scripts/run_blend_evaluation_v1.py
   - scripts/sync_mlflow.py
   - scripts/run_deployment_v1.py
@@ -180,6 +181,86 @@ commands:
             role: output
             required: true
             roots: ["artifacts/research_v2_comparisons"]
+            must_exist: false
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ["Status: completed"]
+        failure_markers: ["Status: failed", "Traceback"]
+
+  - id: dataset_comparison_v1
+    title: Dataset Comparison v1
+    description: Validate or create an official comparison of two compatible Experiment Core v2 runs across different Dataset Packages.
+    category: Analysis
+    argv_prefix: ["$PYTHON", "-u", "scripts/compare_research_v2_datasets.py"]
+    allowed_config_globs: []
+    allowed_input_roots: ["artifacts/research_v2"]
+    allowed_output_roots: ["artifacts/research_v2_dataset_comparisons"]
+    result_reader_id: dataset_comparison_v1
+    artifact_url: null
+    environment: []
+    actions:
+      - id: validate
+        title: Validate
+        description: Validate both runs and their cross-dataset compatibility without allocating output.
+        argv:
+          - "--baseline-run-dir"
+          - "{baseline_run_dir}"
+          - "--candidate-run-dir"
+          - "{candidate_run_dir}"
+          - "--validate-only"
+        placeholders:
+          baseline_run_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/research_v2"]
+            must_exist: true
+          candidate_run_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/research_v2"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ["Compatibility: compatible"]
+        failure_markers: ["Status: failed", "Traceback"]
+      - id: run
+        title: Compare
+        description: Create a non-authoritative cross-dataset comparison artifact.
+        argv:
+          - "--baseline-run-dir"
+          - "{baseline_run_dir}"
+          - "--candidate-run-dir"
+          - "{candidate_run_dir}"
+          - "--comparison-id"
+          - "{comparison_id}"
+          - "--output-root"
+          - "{output_root}"
+        placeholders:
+          baseline_run_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/research_v2"]
+            must_exist: true
+          candidate_run_dir:
+            type: path
+            role: input
+            required: true
+            roots: ["artifacts/research_v2"]
+            must_exist: true
+          comparison_id:
+            type: string
+            role: value
+            required: true
+          output_root:
+            type: path
+            role: output
+            required: true
+            roots: ["artifacts/research_v2_dataset_comparisons"]
             must_exist: false
         confirmation: confirm
         enabled: true

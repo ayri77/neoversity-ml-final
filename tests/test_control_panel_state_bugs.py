@@ -186,8 +186,8 @@ def test_comparison_id_generation_from_left_right(tmp_path: Path) -> None:
     right_b = artifacts[right_xgb.resolve()]
     first = default_comparison_id(left, right_a, repo_root=tmp_path)
     second = default_comparison_id(left, right_b, repo_root=tmp_path)
-    assert first.startswith("lightgbm-vs-lightgbm-")
-    assert second == "lightgbm-vs-xgboost-development-r2x5-t3-v1"
+    assert first.startswith("v3__lightgbm")
+    assert second == "v3__lightgbm__vs__xgboost"
     assert first != second
     assert sanitize_comparison_id("Bad ID!!") == "bad-id"
 

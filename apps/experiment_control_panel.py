@@ -87,6 +87,7 @@ from src.churn_ml.control_panel.deployment_candidates import (  # noqa: E402
     SUBMISSION_HANDOFF_KEY,
     apply_submission_handoff,
     candidate_durable_key,
+    candidate_label,
     evaluate_deployment_readiness,
     list_deployment_candidates,
 )
@@ -127,6 +128,21 @@ from src.churn_ml.control_panel.dataset_identity import (  # noqa: E402
 )
 from src.churn_ml.control_panel.paired_comparison_readiness import (  # noqa: E402
     evaluate_official_paired_readiness,
+)
+from src.churn_ml.control_panel.compare_workflow import (  # noqa: E402
+    COMPARE_SCOPE_DIFFERENT_DATASETS,
+    COMPARE_SCOPE_LABELS,
+    COMPARE_SCOPE_SAME_DATASET,
+    default_dataset_comparison_id_for_runs,
+    default_dataset_comparison_output_root,
+    default_same_dataset_comparison_id,
+    default_same_dataset_output_root,
+    evaluate_dataset_comparison_readiness,
+    exploratory_comparison_warning,
+    filter_dataset_comparison_candidates,
+    filter_same_dataset_candidates,
+    is_descriptive_comparison_scope,
+    list_completed_development_runs,
 )
 from src.churn_ml.control_panel.launch import (  # noqa: E402
     LaunchAuthorizationError,
@@ -484,6 +500,24 @@ def run_page() -> None:
 
     deployment_summary: dict[str, str] = {}
     use_candidate_driven = False
+    compare_skip_placeholders: set[str] = set()
+    effective_command_id = command_id
+    if command_id == "paired_comparison":
+        (
+            compare_values,
+            compare_summary,
+            compare_blocks_launch,
+            compare_skip_placeholders,
+            effective_command_id,
+        ) = _compare_workflow_controls(action_id=action_id)
+        values.update(compare_values)
+        dataset_driven_summary = {**compare_summary, **dataset_driven_summary}
+        dataset_driven_blocks_launch = (
+            dataset_driven_blocks_launch or compare_blocks_launch
+        )
+        use_compare_driven = True
+    else:
+        use_compare_driven = False
     if command_id == "final_deployment_v1" and "config" in action.placeholders:
         (
             prepared_deployment_config,
@@ -507,10 +541,10 @@ def run_page() -> None:
                 prepared_deployment_config,
             )
 
-    skip_config_placeholder = use_dataset_driven or use_candidate_driven
+    skip_config_placeholder = use_dataset_driven or use_candidate_driven or use_compare_driven
     prefill_values = (
         prefill.get("values", {})
-        if prefill.get("command_id") == command_id
+        if prefill.get("command_id") in {command_id, effective_command_id}
         and prefill.get("action_id") == action_id
         else {}
     )
@@ -527,11 +561,13 @@ def run_page() -> None:
         st.session_state[f"value-{command_id}-{action_id}-{name}"] = value
 
     for name, placeholder in action.placeholders.items():
+        if name in compare_skip_placeholders:
+            continue
         if skip_config_placeholder and (
             placeholder.role == "config" or name == "config"
         ):
             continue
-        widget_key = widget_selection_key(command_id, placeholder.role, name)
+        widget_key = widget_selection_key(effective_command_id, placeholder.role, name)
         # Migrate a previous per-action value once when shared key is empty.
         legacy_key = f"value-{command_id}-{action_id}-{name}"
         if st.session_state.get(widget_key) in (None, "") and st.session_state.get(
@@ -545,7 +581,7 @@ def run_page() -> None:
             placeholder,
             widget_key,
             values,
-            operation=command_id,
+            operation=effective_command_id,
         )
         if value not in (None, ""):
             values[name] = value
@@ -582,13 +618,13 @@ def run_page() -> None:
         ):
             built = build_command(
                 loaded.commands,
-                command_id,
+                effective_command_id,
                 action_id,
                 values,
                 repository_root=REPOSITORY_ROOT,
             )
             pre_run = build_pre_run_summary(
-                command_id,
+                effective_command_id,
                 action_id,
                 operation_label,
                 action.title,
@@ -797,6 +833,303 @@ def _archived_research_run_paths() -> frozenset[str]:
         )
     except ArchiveError:
         return frozenset()
+
+
+def _compare_workflow_controls(
+    *,
+    action_id: str,
+) -> tuple[dict[str, str], dict[str, str], bool, set[str], str]:
+    """Unified Compare workflow controls for the Run tab."""
+    scope_key = "compare-workflow-scope"
+    scope_durable = ui_durable_key("run", "compare_scope")
+    scope_values = [item[0] for item in COMPARE_SCOPE_LABELS]
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=scope_key,
+        durable_key=scope_durable,
+        allowed=scope_values,
+        default=COMPARE_SCOPE_SAME_DATASET,
+    )
+    scope = st.radio(
+        "Comparison scope",
+        scope_values,
+        key=scope_key,
+        format_func=lambda value: next(
+            label for key, label in COMPARE_SCOPE_LABELS if key == value
+        ),
+        horizontal=False,
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=scope_durable,
+        value=scope,
+        allowed=scope_values,
+    )
+
+    summary: dict[str, str] = {"Comparison scope": next(
+        label for key, label in COMPARE_SCOPE_LABELS if key == scope
+    )}
+    skip = {
+        "baseline_run_dir",
+        "candidate_run_dir",
+        "comparison_id",
+        "output_root",
+    }
+    effective_command_id = "paired_comparison"
+
+    if is_descriptive_comparison_scope(scope):
+        st.info(
+            "Descriptive comparison belongs in **Results → Research Workspace**. "
+            "Select runs there for aggregate descriptive deltas. That view is not "
+            "paired inference and cannot launch Validate/Compare from here."
+        )
+        st.caption(
+            "Open Results, choose the Research Workspace tab, and use the "
+            "descriptive comparison multiselect."
+        )
+        return {}, summary, True, skip, effective_command_id
+
+    archived = _archived_research_run_paths()
+    try:
+        inventory = inventory_rows_from_mappings(
+            _cached_research_inventory_rows(str(REPOSITORY_ROOT))
+        )
+    except Exception as error:  # noqa: BLE001
+        st.error(f"Completed-run inventory is unavailable: {error}")
+        return {}, summary, True, skip, effective_command_id
+
+    baselines = list_completed_development_runs(inventory, archived_paths=archived)
+    if not baselines:
+        st.info("No completed Development runs are available for comparison.")
+        return {}, summary, True, skip, effective_command_id
+
+    baseline_paths = [row.relative_path for row in baselines]
+    baseline_labels = {row.relative_path: candidate_label(row) for row in baselines}
+    baseline_key = "compare-baseline-run"
+    baseline_durable = ui_durable_key("run", "compare_baseline_run")
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=baseline_key,
+        durable_key=baseline_durable,
+        allowed=baseline_paths,
+        default=baseline_paths[0],
+    )
+    baseline_path = st.selectbox(
+        "Baseline completed run",
+        baseline_paths,
+        key=baseline_key,
+        format_func=lambda value: baseline_labels.get(value, value),
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=baseline_durable,
+        value=baseline_path,
+        allowed=baseline_paths,
+    )
+    baseline_row = next(row for row in baselines if row.relative_path == baseline_path)
+    summary["Baseline dataset"] = baseline_row.dataset_id or "Not available"
+    summary["Baseline model"] = baseline_row.model_family or "Not available"
+
+    if scope == COMPARE_SCOPE_DIFFERENT_DATASETS:
+        effective_command_id = "dataset_comparison_v1"
+        candidates = filter_dataset_comparison_candidates(baseline_row, inventory)
+    else:
+        candidates = filter_same_dataset_candidates(baseline_row, inventory)
+
+    if not candidates:
+        st.info("No compatible candidate runs match this scope and baseline.")
+        return {}, summary, True, skip, effective_command_id
+
+    candidate_paths = [row.relative_path for row in candidates]
+    candidate_labels = {row.relative_path: candidate_label(row) for row in candidates}
+    candidate_key = "compare-candidate-run"
+    candidate_durable = ui_durable_key("run", "compare_candidate_run")
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=candidate_key,
+        durable_key=candidate_durable,
+        allowed=candidate_paths,
+        default=candidate_paths[0],
+    )
+    candidate_path = st.selectbox(
+        "Candidate completed run",
+        candidate_paths,
+        key=candidate_key,
+        format_func=lambda value: candidate_labels.get(value, value),
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=candidate_durable,
+        value=candidate_path,
+        allowed=candidate_paths,
+    )
+    candidate_row = next(
+        row for row in candidates if row.relative_path == candidate_path
+    )
+    summary["Candidate dataset"] = candidate_row.dataset_id or "Not available"
+    summary["Candidate model"] = candidate_row.model_family or "Not available"
+
+    duplicate_count = sum(
+        1
+        for row in candidates
+        if row.dataset_id == candidate_row.dataset_id
+        and row.model_family == candidate_row.model_family
+    )
+    if duplicate_count > 1:
+        st.info(
+            f"{duplicate_count} completed runs share this dataset and model family. "
+            "The exact run selected above is used; nothing is auto-selected by "
+            "maximum Balanced Accuracy."
+        )
+
+    blocks_launch = False
+    if scope == COMPARE_SCOPE_SAME_DATASET:
+        st.subheader("Official Paired Comparison readiness")
+        official = evaluate_official_paired_readiness(
+            left_root=REPOSITORY_ROOT / baseline_path,
+            right_root=REPOSITORY_ROOT / candidate_path,
+            repository_root=REPOSITORY_ROOT,
+            left_state="completed",
+            right_state="completed",
+        )
+        st.write(official.to_dict())
+        if official.diagnostic:
+            st.info(official.diagnostic)
+        if not official.ready:
+            st.error("Blocked: official paired comparison is not ready.")
+            blocks_launch = True
+        else:
+            st.success("Ready for official paired comparison.")
+        suggested_id = default_same_dataset_comparison_id(
+            baseline_path,
+            candidate_path,
+            REPOSITORY_ROOT,
+        )
+        output_root = default_same_dataset_output_root()
+    else:
+        st.subheader("Dataset Comparison readiness")
+        readiness = evaluate_dataset_comparison_readiness(
+            baseline_run_dir=REPOSITORY_ROOT / baseline_path,
+            candidate_run_dir=REPOSITORY_ROOT / candidate_path,
+            repository_root=REPOSITORY_ROOT,
+        )
+        st.write(readiness.to_mapping())
+        if readiness.summary is not None:
+            st.write(
+                {
+                    "parent_child_relation": readiness.summary.parent_child_relation,
+                    "expected_differences": list(
+                        readiness.summary.expected_differences
+                    ),
+                    "exploratory": readiness.summary.exploratory,
+                }
+            )
+        warning = exploratory_comparison_warning(
+            baseline_dataset_id=baseline_row.dataset_id,
+            candidate_dataset_id=candidate_row.dataset_id,
+            baseline_target_dependency=baseline_row.target_dependency,
+            candidate_target_dependency=candidate_row.target_dependency,
+            summary=readiness.summary,
+        )
+        if warning:
+            st.warning(warning)
+        if readiness.diagnostic and not readiness.ready:
+            st.error(readiness.diagnostic)
+        if not readiness.ready:
+            blocks_launch = True
+        else:
+            st.success("Ready for dataset comparison.")
+        suggested_id = default_dataset_comparison_id_for_runs(
+            baseline_row,
+            candidate_row,
+        )
+        output_root = default_dataset_comparison_output_root()
+
+    summary["Comparison ID"] = suggested_id
+    summary["Output root"] = output_root
+
+    comparison_id = _compare_id_widget(
+        effective_command_id,
+        suggested_id=suggested_id,
+        baseline_path=baseline_path,
+        candidate_path=candidate_path,
+    )
+    values = {
+        "baseline_run_dir": baseline_path,
+        "candidate_run_dir": candidate_path,
+        "comparison_id": comparison_id,
+        "output_root": output_root,
+    }
+    for name, value in values.items():
+        role = "input" if name.endswith("_dir") else "value" if name == "comparison_id" else "output"
+        if name == "output_root":
+            role = "output"
+        widget_key = widget_selection_key(effective_command_id, role, name)
+        st.session_state[widget_key] = value
+        set_logical_selection(
+            st.session_state,
+            effective_command_id,
+            role,
+            name,
+            value,
+        )
+
+    with st.expander("Advanced: raw run paths", expanded=False):
+        st.text_input("Baseline run dir", value=baseline_path, disabled=True)
+        st.text_input("Candidate run dir", value=candidate_path, disabled=True)
+        st.text_input("Comparison ID", value=comparison_id, disabled=True)
+        st.text_input("Output root", value=output_root, disabled=True)
+
+    del action_id
+    return values, summary, blocks_launch, skip, effective_command_id
+
+
+def _compare_id_widget(
+    command_id: str,
+    *,
+    suggested_id: str,
+    baseline_path: str,
+    candidate_path: str,
+) -> str:
+    id_key = f"run-compare-id-{command_id}"
+    suggested_key = f"{id_key}__suggested"
+    manual_key = f"{id_key}__manual"
+    sides_key = f"{id_key}__sides"
+    reset_flag = f"{id_key}__do_reset"
+    id_durable_key = ui_durable_key("run", "comparison_id", command_id)
+    sides_fp = (baseline_path, candidate_path)
+    previous_sides = st.session_state.get(sides_key)
+    st.session_state[suggested_key] = suggested_id
+    if st.session_state.pop(reset_flag, False):
+        st.session_state[id_key] = suggested_id
+        st.session_state[manual_key] = False
+        st.session_state[sides_key] = sides_fp
+        set_durable_value(st.session_state, id_durable_key, suggested_id)
+    elif previous_sides != sides_fp:
+        if not st.session_state.get(manual_key):
+            st.session_state[id_key] = suggested_id
+            set_durable_value(st.session_state, id_durable_key, suggested_id)
+        st.session_state[sides_key] = sides_fp
+    elif st.session_state.get(id_key) in (None, ""):
+        durable_id = get_durable_value(st.session_state, id_durable_key)
+        st.session_state[id_key] = durable_id or suggested_id
+    comparison_id = st.text_input("Comparison ID", key=id_key)
+    remember_durable_value(
+        st.session_state,
+        durable_key=id_durable_key,
+        value=comparison_id,
+        allowed=None,
+    )
+    if comparison_id != st.session_state.get(suggested_key):
+        st.session_state[manual_key] = True
+    reset_cols = st.columns([1, 3])
+    with reset_cols[0]:
+        if st.button("Reset to suggested ID", key=f"{id_key}__reset"):
+            st.session_state[reset_flag] = True
+            st.rerun()
+    with reset_cols[1]:
+        st.caption(f"Suggested: `{st.session_state.get(suggested_key)}`")
+    return str(comparison_id).strip() or suggested_id
 
 
 def _deployment_candidate_controls(

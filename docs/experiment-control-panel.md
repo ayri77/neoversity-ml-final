@@ -59,7 +59,7 @@ contract mapping live there.
 | Order | Label | Command ID | Accepted input contract | Produced output contract |
 | --- | --- | --- | --- | --- |
 | 1 | 🧪 Train | `experiment_core_v2` | `experiment_core_v2_config_v1` | `research_v2_completed_run_v1` |
-| 2 | 🔎 Compare | `paired_comparison` | `research_v2_completed_run_v1` | `paired_comparison_v1_artifact` |
+| 2 | 🔎 Compare | `paired_comparison` (scope UI; Dataset Comparison via `dataset_comparison_v1`) | `research_v2_completed_run_v1` | `paired_comparison_v1_artifact`, `dataset_comparison_v1_artifact` |
 | 3 | 🎛️ Tune | `optuna_search_v1` | `optuna_search_config_v1` | `optuna_search_report_v1`, `experiment_core_v2_config_v1` |
 | 4 | 🧬 Blend | `blend_evaluation_v1` | `blend_evaluation_config_v1`, `research_v2_completed_run_v1` | `blend_evaluation_v1_completed_evaluation`, `blend_evaluation_v1_deployment_package` |
 | 5 | 📤 Generate submission | `final_deployment_v1` | `research_v2_completed_run_v1`, `blend_evaluation_v1_deployment_package` | `deployment_v1_submission_artifact` (intermediate `deployment_draft_v1`, `deployment_v1_config`) |
@@ -419,21 +419,43 @@ hover data include Dataset ID. Inspect shows a compact provenance summary
 without mutating jobs or artifacts and never invents a blanket
 `v0_raw_minimal` mapping.
 
-### Descriptive compare vs official Paired Comparison
+### Unified Compare scopes
+
+Run → Compare exposes three user-facing scopes on completed Research v2 runs:
+
+1. **Same dataset / different candidates** — official Paired Comparison v1.
+   Same-dataset fingerprint and evaluation-plan gates remain strict
+   (`EVALUATION_PLAN_*`, `DATASET_*`, `SAMPLE_ORDER_IDENTITY_MISMATCH`, and
+   related reason codes). Comparison ID and output root are autofilled from
+   authoritative run metadata.
+2. **Same model / different datasets** — Dataset Comparison v1
+   (`dataset_comparison_v1`). Same model/config/protocol across different
+   Dataset Packages; uses normalized protocol and model hashes plus independent
+   train-anchor row identity. Output root:
+   `artifacts/research_v2_dataset_comparisons`.
+3. **Descriptive comparison** — Research Workspace aggregate deltas only. Not
+   paired inference.
+
+`dataset_comparison_v1` is also registered as an Advanced operation. Technical
+IDs stay under **Technical details**.
+
+### Descriptive Results compare vs official gates
 
 The Results comparison table may show metrics from two different datasets, but
 it always displays left/right Dataset IDs and the fingerprint match flag. When
 datasets differ, the UI labels the view as descriptive only. The lightweight
-display tokens alone never enable **Prepare Paired Comparison action**. Official
-readiness loads both completed runs through the validated completed-run loader
-and calls authoritative `build_compatibility_summary()`; the CLI remains the
-final gate. Cross-dataset paired inference is out of scope.
+display tokens alone never enable official Paired Comparison. Official
+same-dataset readiness loads both completed runs through the validated
+completed-run loader and calls authoritative
+`paired_comparison.build_compatibility_summary()`; the CLI remains the final
+gate. Cross-dataset paired inference uses Dataset Comparison v1, not the
+same-dataset gate.
 
 ### Research Workspace v1
 
 Results includes a **Research Workspace** tab for Research v2 screening
 inventory and a dataset × model matrix. It is descriptive research UX, not
-Stage E paired inference and not Dataset Campaign Results UI.
+Dataset Comparison v1 paired inference and not Dataset Campaign Results UI.
 
 Capabilities:
 

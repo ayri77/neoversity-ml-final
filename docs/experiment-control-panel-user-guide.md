@@ -46,7 +46,7 @@ Run offers one ordered workflow instead of technical operation names:
 | Step | What it does | Selects | Produces |
 | --- | --- | --- | --- |
 | **🧪 Train** | Trains one candidate on a registered Dataset Package | Training configuration | Completed canonical run |
-| **🔎 Compare** | Compares two completed runs on identical folds and seeds | Completed runs | Paired-comparison artifact |
+| **🔎 Compare** | Compares completed runs under an explicit scope (same dataset, same model across datasets, or descriptive) | Completed runs | Paired-comparison or Dataset Comparison artifact |
 | **🎛️ Tune** | Searches parameters on training data only | Search configuration | Search report, exported training config |
 | **🧬 Blend** | Combines completed runs with leakage-safe cross-fitting | Completed runs | Blend evaluation, deployment package |
 | **📤 Generate submission** | Turns one completed run into a validated deployment draft | Completed run | Deployment draft, then deployment artifact |
@@ -59,7 +59,12 @@ Notes:
 - Downstream steps select completed runs and artifacts, not raw YAML paths.
 - Technical operation IDs, action IDs, and schema versions are shown only inside
   the **Technical details** expander.
-- Dataset Comparison and canonical handoffs for Tune and Blend remain subsequent
+- **Compare** offers three scopes on completed runs (not YAML):
+  - **Same dataset / different candidates** — strict Paired Comparison v1;
+  - **Same model / different datasets** — Dataset Comparison v1;
+  - **Descriptive comparison** — Research Workspace aggregate deltas only
+    (not paired inference).
+- Canonical completed-artifact handoffs for Tune and Blend remain subsequent
   work; those steps still start from a configuration.
 
 ## Pages
@@ -252,11 +257,11 @@ builder behavior.
   outside the technical JSON expander.
 - Results → Experiments lists Dataset, Parent dataset, Target dependency, and
   Features and supports a Dataset filter.
-- Results → Compare shows left/right Dataset IDs. Cross-dataset rows are
-  descriptive only. Official Paired Comparison preparation uses the
-  authoritative compatibility contract (not the lightweight display tokens)
-  and stays disabled until that contract passes. After changing Control Panel
-  presentation modules, fully restart Streamlit.
+- Results → Compare shows left/right Dataset IDs. Cross-dataset rows in the
+  Results side-by-side table remain descriptive only. Official same-dataset
+  Paired Comparison and Dataset Comparison are launched from Run → Compare
+  with the matching scope. After changing Control Panel presentation modules,
+  fully restart Streamlit.
 
 ### Research Workspace
 
@@ -274,7 +279,8 @@ Open **Results → Research Workspace** to review Research v2 screening runs.
 - When a cell has multiple eligible runs, the UI shows the duplicate count and
   lets you choose the exact run. It does not auto-crown the highest BA.
 - Baseline deltas vs `v0_raw_minimal` (or another selected package) are
-  descriptive aggregate deltas only — not Stage E paired inference.
+  descriptive aggregate deltas only — not Dataset Comparison v1 paired
+  inference.
 - Tags, notes, and shortlist are stored under
   `artifacts/control_panel_state/research_annotations.json` and never rewrite
   Research v2 artifacts.
@@ -284,8 +290,8 @@ Open **Results → Research Workspace** to review Research v2 screening runs.
 
 ## Workspace cleanup (archive / job delete)
 
-Stage F maintenance capability. This is separate from Dataset Campaign execution,
-Stage E cross-dataset comparison, and campaign-results UI.
+Stage F maintenance capability. This is separate from Dataset Campaign execution
+and campaign-results UI. Dataset Comparison v1 lives under Run → Compare.
 
 ### Archive
 
