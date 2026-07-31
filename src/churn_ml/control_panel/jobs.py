@@ -59,7 +59,7 @@ TRANSITIONS = {
 REQUIRED_JOB_FILES = frozenset(
     {"job.json", "command.json", "status.json", "stdout.log", "stderr.log"}
 )
-OPTIONAL_JOB_FILES = frozenset({TERMINAL_FILE_NAME})
+OPTIONAL_JOB_FILES = frozenset({TERMINAL_FILE_NAME, "mlflow_index.json"})
 ALLOWED_JOB_FILES = REQUIRED_JOB_FILES | OPTIONAL_JOB_FILES
 JOB_FILES = REQUIRED_JOB_FILES  # backward-compatible alias for required layout
 JOB_RUNNER_PATH = Path(__file__).resolve().parent / "job_runner.py"
@@ -282,6 +282,8 @@ class JobManager:
                 require_regular_file(root / name, reject_hardlinks=True)
             if TERMINAL_FILE_NAME in names:
                 require_regular_file(root / TERMINAL_FILE_NAME, reject_hardlinks=True)
+            if "mlflow_index.json" in names:
+                require_regular_file(root / "mlflow_index.json", reject_hardlinks=True)
         except (OSError, PathSafetyError) as error:
             raise JobError(f"Unsafe job directory: {job_id}.") from error
         job = _read_json(root / "job.json")

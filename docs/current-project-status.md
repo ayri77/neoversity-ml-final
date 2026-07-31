@@ -6,13 +6,12 @@
 **Last updated:** 2026-07-31  
 **Repository:** `ayri77/neoversity-ml-final`  
 **Active task branch:** `feature/prepared-dataset-pipeline-v1`  
-**Current checkpoint:** Stage C Registry ↔ Experiment Core integration and
-    hardening are on the branch tip. Stage D Dataset Campaign / Matrix Runner v1
-    is implemented (versioned campaign contract, validate-only, freeze, sequential
-    execute/resume, CLI, and synthetic tests). The 21-run unbiased screening
-    campaign has **not** been executed; do not treat Stage D screening as
-    complete until a real frozen campaign run is audited. Complete the
-    post-notebook Registry package audit before launching any real campaign.
+**Current checkpoint:** Stage D Dataset Campaign / Matrix Runner v1 is committed
+    (`6deafc3`). Two real 1×1 smoke campaigns succeeded (including in-run MLflow
+    indexing verification). The 21-run unbiased development screening campaign has
+    **not** been executed. Stage E has not started. Control Panel workspace cleanup
+    and Dataset Registry discovery-cache hardening are in progress on the working
+    tree (Stage F maintenance; uncommitted).
 
 ## 1. Purpose and maintenance policy
 
@@ -685,6 +684,11 @@ Completed for Experiment Core v2:
    prepare readiness.
 7. Validated MLflow research provenance params/tags and dataset-prefixed
    deterministic run names, with in-place backfill via `source_key`.
+8. Workspace cleanup maintenance (not Stage E / not Campaign Results UI):
+   - versioned archive overlay at `artifacts/control_panel_state/archived_items.json`;
+   - archive/restore for terminal UI jobs and Results artifacts;
+   - permanent deletion limited to archived terminal UI job directories;
+   - scoped Dataset Registry discovery cache with **Refresh datasets**.
 
 Still planned after the Campaign Runner and comparison contract exist:
 
@@ -692,6 +696,8 @@ Still planned after the Campaign Runner and comparison contract exist:
 2. Parent-child deltas as a campaign view.
 3. Keep filesystem artifacts authoritative and MLflow secondary (already the
    policy; campaign-scale UI still pending).
+4. Physical authoritative-result deletion (explicitly out of scope for the
+   current archive/cleanup v1).
 
 ## 16. Stage G — screening and decision rules
 

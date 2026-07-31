@@ -240,8 +240,10 @@ Refresh prefers a valid `terminal.json` over the in-memory process handle, so a 
 completed job still becomes `succeeded` or `failed` after a Streamlit rerun. Mismatched
 or unverifiable live jobs become `orphaned` only when there is no trustworthy terminal
 record and no verifiable live process. After an application restart, a still-matching
-process remains `running`. There is no database, recursive deletion, artifact cleanup,
-or automatic retry.
+process remains `running`. There is no database or automatic retry. Workspace cleanup
+may archive terminal jobs or permanently delete archived UI job directories under
+`artifacts/ui_jobs/<uuid>/` only; authoritative experiment artifacts are never deleted
+by the Control Panel.
 
 ### Minimal child environment
 

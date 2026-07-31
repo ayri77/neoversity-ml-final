@@ -41,8 +41,8 @@ uv run --extra ui streamlit run apps/experiment_control_panel.py
 | --- | --- |
 | **Dashboard** | Job counts, recent jobs/artifacts, command groups, MLflow link |
 | **Run** | Choose operation/action, fill placeholders, review argv, start a job |
-| **Jobs** | Refresh status, inspect redacted argv and log tails, stop when enabled |
-| **Results** | Discover reader artifacts, summaries, display-only side-by-side, action list |
+| **Jobs** | Refresh status, inspect redacted argv and log tails, stop when enabled, archive terminal jobs, permanently delete archived UI job metadata/logs |
+| **Results** | Discover reader artifacts, summaries, display-only side-by-side, archive/hide results without deleting files |
 | **Configuration** | Registry validation summary and reload |
 
 ## Optuna actions
@@ -177,3 +177,37 @@ Generated files stay under `artifacts/ui_configs/` (plans under
   authoritative compatibility contract (not the lightweight display tokens)
   and stays disabled until that contract passes. After changing Control Panel
   presentation modules, fully restart Streamlit.
+
+## Workspace cleanup (archive / job delete)
+
+Stage F maintenance capability. This is separate from Dataset Campaign execution,
+Stage E cross-dataset comparison, and campaign-results UI.
+
+### Archive
+
+- **Archive** hides an item from normal Control Panel lists and charts.
+- It does **not** move, rename, edit, or delete authoritative experiment files.
+- Supported for terminal UI jobs and configured Results artifacts.
+- Toggle **Show archived** to reveal archived items; **Restore** returns them to
+  the default lists.
+- Overlay state is stored under
+  `artifacts/control_panel_state/archived_items.json` (ignored with `artifacts/`).
+
+### Permanent UI job deletion
+
+- Only **archived terminal** UI jobs can be permanently deleted.
+- Deletion removes only `artifacts/ui_jobs/<canonical-job-uuid>/` (metadata + logs,
+  including an optional local `mlflow_index.json` sidecar).
+- Research v2 / comparison / blend / deployment artifacts and MLflow runs/receipts
+  are **not** deleted.
+- Requires checkbox confirmation plus typing the exact job ID, with a file preview.
+- Authoritative result directories cannot be physically deleted in this v1.
+
+### Dataset Registry cache
+
+- Dataset-driven Run discovery is cached (`st.cache_data`) keyed by repository root,
+  processed-data root, and discovery contract version.
+- **Refresh datasets** clears only that cache and rescans; it does not launch or
+  validate an experiment.
+- Jobs **Refresh job status** no longer calls global `st.cache_data.clear()`, so it
+  does not wipe the Registry cache.

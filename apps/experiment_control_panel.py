@@ -19,6 +19,9 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+REGISTRY_DISCOVERY_CACHE_VERSION = "dataset_registry_discovery_v1"
+DEFAULT_PROCESSED_ROOT = "data/processed"
+
 from src.churn_ml.control_panel.artifacts import (  # noqa: E402
     ArtifactRecord,
     ArtifactReadError,
@@ -32,6 +35,12 @@ from src.churn_ml.control_panel.artifacts import (  # noqa: E402
     display_compatibility_summary,
     sanitize_comparison_id,
     text_tail,
+)
+from src.churn_ml.control_panel.archive_registry import (  # noqa: E402
+    ArchiveError,
+    ArchiveRegistry,
+    preview_job_deletion,
+    utc_now_text as archive_utc_now_text,
 )
 from src.churn_ml.control_panel.command_builder import (  # noqa: E402
     CommandBuildError,
@@ -91,7 +100,11 @@ from src.churn_ml.control_panel.presentation import (  # noqa: E402
     set_presentation_repository_root,
     source_human_label,
 )
-from src.churn_ml.control_panel.jobs import JobError, JobManager  # noqa: E402
+from src.churn_ml.control_panel.jobs import (  # noqa: E402
+    TERMINAL_STATES,
+    JobError,
+    JobManager,
+)
 from src.churn_ml.control_panel.mlflow_post_index import (  # noqa: E402
     DEFAULT_MLFLOW_CONFIG,
     maybe_index_successful_job,
@@ -582,13 +595,34 @@ def jobs_page() -> None:
     loaded = registry()
     manager = job_manager(loaded)
     st.title("Jobs")
+    st.caption(
+        "Deleting a UI job removes only its Control Panel metadata and logs. "
+        "Experiment artifacts remain unchanged."
+    )
     if st.button("Refresh job status"):
-        st.cache_data.clear()
-    jobs = manager.list_jobs()
-    if not jobs:
-        st.info("No UI jobs have been started.")
+        # Intentionally do not call st.cache_data.clear() — that would wipe the
+        # Dataset Registry discovery cache used by the Run page.
+        st.rerun()
+    try:
+        archive = ArchiveRegistry(REPOSITORY_ROOT)
+    except ArchiveError as error:
+        st.error(f"Archive registry unavailable: {error}")
         return
-    job_ids = [item.job_id for item in jobs]
+    show_archived = st.checkbox("Show archived", value=False, key="jobs-show-archived")
+    jobs = manager.list_jobs()
+    archived_ids = archive.archived_ui_job_ids()
+    if show_archived:
+        visible = jobs
+    else:
+        visible = [item for item in jobs if item.job_id not in archived_ids]
+    if not visible:
+        st.info(
+            "No UI jobs match the current visibility filter."
+            if jobs
+            else "No UI jobs have been started."
+        )
+        return
+    job_ids = [item.job_id for item in visible]
     job_widget_key = "jobs-selected"
     job_durable_key = ui_durable_key("jobs", "selected")
     sync_widget_with_durable(
@@ -602,9 +636,10 @@ def jobs_page() -> None:
         "Job",
         job_ids,
         key=job_widget_key,
-        format_func=lambda value: _job_label(
-            next(item for item in jobs if item.job_id == value),
+        format_func=lambda value: _job_label_with_archive(
+            next(item for item in visible if item.job_id == value),
             commands=loaded.commands,
+            archived=value in archived_ids,
         ),
     )
     remember_durable_value(
@@ -616,6 +651,9 @@ def jobs_page() -> None:
     st.caption(f"Job ID: `{selected}`")
     record = manager.refresh(selected)
     status = record.status
+    is_archived = selected in archived_ids
+    if is_archived:
+        st.info("This job is archived (hidden from the default Jobs list).")
     columns = st.columns(4)
     columns[0].metric("Status", str(status["state"]))
     columns[1].metric("Elapsed", human_duration(status.get("elapsed_seconds")))
@@ -696,6 +734,124 @@ def jobs_page() -> None:
             except JobError as error:
                 st.error(str(error))
 
+    _render_job_archive_controls(
+        archive=archive,
+        manager=manager,
+        record=record,
+        is_archived=is_archived,
+        visible_job_ids=job_ids,
+        job_widget_key=job_widget_key,
+        job_durable_key=job_durable_key,
+    )
+
+
+def _job_label_with_archive(
+    record: Any,
+    *,
+    commands: Mapping[str, Any] | None,
+    archived: bool,
+) -> str:
+    label = _job_label(record, commands=commands)
+    return f"[archived] {label}" if archived else label
+
+
+def _render_job_archive_controls(
+    *,
+    archive: ArchiveRegistry,
+    manager: JobManager,
+    record: Any,
+    is_archived: bool,
+    visible_job_ids: list[str],
+    job_widget_key: str,
+    job_durable_key: str,
+) -> None:
+    state = str(record.status.get("state") or "")
+    terminal = state in TERMINAL_STATES
+    st.subheader("Workspace cleanup")
+    if not terminal and not is_archived:
+        st.caption("Active jobs remain visible and cannot be archived or deleted.")
+        return
+    if terminal and not is_archived:
+        if st.button("Archive job", key="jobs-archive"):
+            try:
+                archive.archive_ui_job(record.job_id, state=state)
+                remaining = [job_id for job_id in visible_job_ids if job_id != record.job_id]
+                sync_widget_with_durable(
+                    st.session_state,
+                    widget_key=job_widget_key,
+                    durable_key=job_durable_key,
+                    allowed=remaining,
+                    default=remaining[0] if remaining else None,
+                )
+                st.success("Job archived (hidden from the default Jobs list).")
+                st.rerun()
+            except ArchiveError as error:
+                st.error(str(error))
+        return
+    if is_archived:
+        cols = st.columns(2)
+        with cols[0]:
+            if st.button("Restore job", key="jobs-restore"):
+                try:
+                    archive.restore_ui_job(record.job_id)
+                    st.success("Job restored to the default Jobs list.")
+                    st.rerun()
+                except ArchiveError as error:
+                    st.error(str(error))
+        with cols[1]:
+            st.caption(
+                "Permanent deletion removes only this UI job directory under "
+                "`artifacts/ui_jobs/<job-id>/`."
+            )
+        if terminal:
+            try:
+                preview = preview_job_deletion(record.root)
+            except ArchiveError as error:
+                st.error(str(error))
+                return
+            with st.expander("Permanent deletion preview", expanded=False):
+                st.code(
+                    "\n".join(
+                        [
+                            f"Directory: artifacts/ui_jobs/{record.job_id}",
+                            "Files:",
+                            *[f"  - {name}" for name in preview],
+                        ]
+                    ),
+                    language="text",
+                )
+            confirm = st.checkbox(
+                "I understand this permanently deletes UI job metadata and logs only.",
+                key="jobs-delete-confirm",
+            )
+            typed = st.text_input(
+                "Type the exact job ID to confirm permanent deletion",
+                key="jobs-delete-typed-id",
+            )
+            if st.button(
+                "Permanently delete UI job",
+                disabled=not (confirm and typed == record.job_id),
+                key="jobs-delete",
+            ):
+                try:
+                    archive.permanently_delete_archived_ui_job(manager, record.job_id)
+                    remaining = [
+                        job_id for job_id in visible_job_ids if job_id != record.job_id
+                    ]
+                    sync_widget_with_durable(
+                        st.session_state,
+                        widget_key=job_widget_key,
+                        durable_key=job_durable_key,
+                        allowed=remaining,
+                        default=remaining[0] if remaining else None,
+                    )
+                    st.success(
+                        "UI job directory deleted. Experiment artifacts were not modified."
+                    )
+                    st.rerun()
+                except ArchiveError as error:
+                    st.error(str(error))
+
 
 def _maybe_post_index_job(loaded: ControlPanelRegistry, record: Any) -> Any:
     """Best-effort MLflow indexing after successful Experiment Core / AutoGluon jobs."""
@@ -722,18 +878,45 @@ def _maybe_post_index_job(loaded: ControlPanelRegistry, record: Any) -> Any:
 def results_page() -> None:
     loaded = registry()
     st.title("Results")
+    st.caption(
+        "Archive hides an item from the workspace lists and charts without "
+        "moving or deleting authoritative experiment artifacts."
+    )
     if loaded.settings.mlflow_url:
         st.link_button("Open MLflow", loaded.settings.mlflow_url)
+    try:
+        archive = ArchiveRegistry(REPOSITORY_ROOT)
+    except ArchiveError as error:
+        st.error(f"Archive registry unavailable: {error}")
+        return
+    show_archived = st.checkbox(
+        "Show archived", value=False, key="results-show-archived"
+    )
     experiments_tab, inspect_tab, compare_tab = st.tabs(
         ["Experiments", "Inspect result", "Compare experiments"]
     )
     with experiments_tab:
-        _results_experiments_tab(loaded)
+        _results_experiments_tab(
+            loaded, archive=archive, show_archived=show_archived
+        )
     with inspect_tab:
-        _results_inspect_tab(loaded)
+        _results_inspect_tab(loaded, archive=archive, show_archived=show_archived)
     with compare_tab:
-        _results_compare_tab(loaded)
+        _results_compare_tab(loaded, archive=archive, show_archived=show_archived)
 
+
+def _visible_results_artifacts(
+    loaded: ControlPanelRegistry,
+    reader_id: str,
+    *,
+    archive: ArchiveRegistry,
+    show_archived: bool,
+) -> list[ArtifactRecord]:
+    reader = loaded.readers[reader_id]
+    artifacts = discover_artifacts(REPOSITORY_ROOT, reader)
+    return archive.filter_artifacts(
+        artifacts, reader_id=reader_id, show_archived=show_archived
+    )
 
 def _results_reader_select(loaded: ControlPanelRegistry, key: str) -> Any:
     reader_ids = list(loaded.readers)
@@ -760,15 +943,27 @@ def _results_reader_select(loaded: ControlPanelRegistry, key: str) -> Any:
     return selected
 
 
-def _results_experiments_tab(loaded: ControlPanelRegistry) -> None:
+def _results_experiments_tab(
+    loaded: ControlPanelRegistry,
+    *,
+    archive: ArchiveRegistry,
+    show_archived: bool,
+) -> None:
     reader_id = _results_reader_select(loaded, "results-experiments-reader")
-    reader = loaded.readers[reader_id]
-    artifacts = discover_artifacts(REPOSITORY_ROOT, reader)
+    artifacts = _visible_results_artifacts(
+        loaded, reader_id, archive=archive, show_archived=show_archived
+    )
     if not artifacts:
-        st.info("No artifacts match this configured reader.")
+        st.info("No artifacts match this configured reader and visibility filter.")
         return
 
     rows = build_experiment_table_rows(artifacts, repo_root=REPOSITORY_ROOT)
+    archived_keys = archive.archived_artifact_keys()
+    for row in rows:
+        path = str(row.get("Artifact path") or "")
+        if (reader_id, path) in archived_keys:
+            status = str(row.get("Status") or "")
+            row["Status"] = f"archived · {status}" if status else "archived"
     datasets = sorted(
         {
             str(row["Dataset"])
@@ -944,6 +1139,81 @@ def _results_experiments_tab(loaded: ControlPanelRegistry) -> None:
         )
 
     _render_experiment_charts(filtered)
+    _render_results_archive_controls(
+        artifacts=artifacts,
+        reader_id=reader_id,
+        archive=archive,
+        show_archived=show_archived,
+        key_prefix="results-exp",
+    )
+
+
+def _render_results_archive_controls(
+    *,
+    artifacts: list[ArtifactRecord],
+    reader_id: str,
+    archive: ArchiveRegistry,
+    show_archived: bool,
+    key_prefix: str,
+) -> None:
+    if not artifacts:
+        return
+    st.subheader("Archive result")
+    paths = [item.relative_path for item in artifacts]
+    archived_keys = archive.archived_artifact_keys()
+    selected_path = st.selectbox(
+        "Result to archive or restore",
+        paths,
+        key=f"{key_prefix}-archive-path-{reader_id}",
+        format_func=lambda value: (
+            f"[archived] {value}"
+            if (reader_id, value) in archived_keys
+            else value
+        ),
+    )
+    selected = next(item for item in artifacts if item.relative_path == selected_path)
+    meta = parse_config_metadata(selected.relative_path, REPOSITORY_ROOT)
+    st.markdown(
+        "  \n".join(
+            [
+                f"**Reader:** `{reader_id}`",
+                f"**Dataset:** `{meta.get('dataset_id') or meta.get('dataset_version') or 'Not available'}`",
+                f"**Model:** `{meta.get('model_family') or 'Not available'}`",
+                f"**Mode:** `{meta.get('mode') or 'Not available'}`",
+                f"**Status:** `{selected.state}`",
+                f"**Artifact path:** `{selected.relative_path}`",
+            ]
+        )
+    )
+    is_archived = (reader_id, selected.relative_path) in archived_keys
+    if is_archived:
+        if st.button("Restore result", key=f"{key_prefix}-restore-{reader_id}"):
+            try:
+                archive.restore_artifact(
+                    reader_id=reader_id, relative_path=selected.relative_path
+                )
+                st.success("Result restored to default Results visibility.")
+                st.rerun()
+            except ArchiveError as error:
+                st.error(str(error))
+        return
+    confirm = st.checkbox(
+        "Archive this result (hide from lists/charts; do not delete files).",
+        key=f"{key_prefix}-archive-confirm-{reader_id}",
+    )
+    if st.button(
+        "Archive result",
+        disabled=not confirm,
+        key=f"{key_prefix}-archive-{reader_id}",
+    ):
+        try:
+            archive.archive_artifact(
+                reader_id=reader_id, relative_path=selected.relative_path
+            )
+            st.success("Result archived (files unchanged).")
+            st.rerun()
+        except ArchiveError as error:
+            st.error(str(error))
 
 
 def _render_experiment_charts(rows: list[dict[str, Any]]) -> None:
@@ -1051,12 +1321,19 @@ def _render_experiment_charts(rows: list[dict[str, Any]]) -> None:
         st.plotly_chart(fig_roc, width="stretch")
 
 
-def _results_inspect_tab(loaded: ControlPanelRegistry) -> None:
+def _results_inspect_tab(
+    loaded: ControlPanelRegistry,
+    *,
+    archive: ArchiveRegistry,
+    show_archived: bool,
+) -> None:
     reader_id = _results_reader_select(loaded, "results-inspect-reader")
     reader = loaded.readers[reader_id]
-    artifacts = discover_artifacts(REPOSITORY_ROOT, reader)
+    artifacts = _visible_results_artifacts(
+        loaded, reader_id, archive=archive, show_archived=show_archived
+    )
     if not artifacts:
-        st.info("No artifacts match this configured reader.")
+        st.info("No artifacts match this configured reader and visibility filter.")
         return
     artifact_paths = [item.relative_path for item in artifacts]
     source_kinds = {
@@ -1201,12 +1478,19 @@ def _results_inspect_tab(loaded: ControlPanelRegistry) -> None:
     _results_registry_actions(loaded, reader_id)
 
 
-def _results_compare_tab(loaded: ControlPanelRegistry) -> None:
+def _results_compare_tab(
+    loaded: ControlPanelRegistry,
+    *,
+    archive: ArchiveRegistry,
+    show_archived: bool,
+) -> None:
     reader_id = _results_reader_select(loaded, "results-compare-reader")
     reader = loaded.readers[reader_id]
-    artifacts = discover_artifacts(REPOSITORY_ROOT, reader)
+    artifacts = _visible_results_artifacts(
+        loaded, reader_id, archive=archive, show_archived=show_archived
+    )
     if not artifacts:
-        st.info("No artifacts match this configured reader.")
+        st.info("No artifacts match this configured reader and visibility filter.")
         return
     if len(artifacts) < 2:
         st.info("At least two artifacts are required for comparison.")
@@ -1615,9 +1899,17 @@ def configuration_page() -> None:
 
 
 @st.cache_data(show_spinner="Scanning Dataset Registry…")
-def _cached_registry_dataset_views(repository_root: str) -> list[dict[str, Any]]:
+def _cached_registry_dataset_views(
+    repository_root: str,
+    processed_root: str = DEFAULT_PROCESSED_ROOT,
+    cache_version: str = REGISTRY_DISCOVERY_CACHE_VERSION,
+) -> list[dict[str, Any]]:
     """Cache strict Registry discovery for the Run page (serializable views)."""
-    summaries = discover_registry_summaries(Path(repository_root))
+    del cache_version  # present only to scope the Streamlit cache key
+    summaries = discover_registry_summaries(
+        Path(repository_root),
+        processed_root_relative=processed_root,
+    )
     return [
         RegisteredDatasetView.from_summary(item).__dict__ for item in summaries
     ]
@@ -1634,8 +1926,24 @@ def _experiment_core_dataset_driven_controls(
     """
     prepared_key = "ecv2_prepared_bundle"
     st.subheader("Dataset Package")
+    refresh_cols = st.columns([1, 2])
+    with refresh_cols[0]:
+        if st.button("Refresh datasets", key="ecv2-refresh-datasets"):
+            _cached_registry_dataset_views.clear()
+            st.session_state["ecv2_registry_last_refreshed_utc"] = archive_utc_now_text()
+            st.rerun()
+    with refresh_cols[1]:
+        last_refreshed = st.session_state.get("ecv2_registry_last_refreshed_utc")
+        if last_refreshed:
+            st.caption(f"Registry last refreshed: `{last_refreshed}`")
+        else:
+            st.caption("Registry discovery is cached until Refresh datasets.")
     try:
-        view_payloads = _cached_registry_dataset_views(str(REPOSITORY_ROOT))
+        view_payloads = _cached_registry_dataset_views(
+            str(REPOSITORY_ROOT),
+            DEFAULT_PROCESSED_ROOT,
+            REGISTRY_DISCOVERY_CACHE_VERSION,
+        )
         views = [RegisteredDatasetView(**item) for item in view_payloads]
     except DatasetExperimentMaterializerError as error:
         st.error(str(error))
@@ -2521,9 +2829,17 @@ def _config_panel(loaded: ControlPanelRegistry, selected: Path) -> None:
 
 
 def _all_artifacts(loaded: ControlPanelRegistry) -> list[ArtifactRecord]:
+    try:
+        archive = ArchiveRegistry(REPOSITORY_ROOT)
+        archived = archive.archived_artifact_keys()
+    except ArchiveError:
+        archived = frozenset()
     records: list[ArtifactRecord] = []
     for reader in loaded.readers.values():
-        records.extend(discover_artifacts(REPOSITORY_ROOT, reader))
+        for item in discover_artifacts(REPOSITORY_ROOT, reader):
+            if (reader.id, item.relative_path) in archived:
+                continue
+            records.append(item)
     return records
 
 
