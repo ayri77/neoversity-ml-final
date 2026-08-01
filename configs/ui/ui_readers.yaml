@@ -204,3 +204,74 @@ readers:
       - "Best trial"
       - "Requested trials"
       - "Actual trials"
+
+  - id: prediction_candidate_v1
+    title: Canonical prediction candidates
+    artifact_roots: ["artifacts/prediction_candidates"]
+    discovery_glob: "*"
+    success_markers: ["_SUCCESS"]
+    failure_markers: ["_FAILED"]
+    summary_files:
+      - path: "candidate_manifest.json"
+        fields:
+          Source model: "source_model_name"
+          Source kind: "source_kind"
+          Dataset: "dataset_id"
+          Source metric: "source_metric_value"
+          Exploratory: "exploratory"
+          OOF protocol: "oof_protocol"
+    csv_previews: []
+    log_files: []
+    compare_fields:
+      - "Source metric"
+      - "Dataset"
+      - "Source kind"
+
+  - id: prediction_blend_v1
+    title: Canonical prediction blends
+    artifact_roots: ["artifacts/prediction_blends"]
+    discovery_glob: "*"
+    success_markers: ["_SUCCESS"]
+    failure_markers: ["_FAILED"]
+    summary_files:
+      - path: "blend_manifest.json"
+        fields:
+          Optimizer: "settings.optimizer_backend"
+          Honest mean BA: "honest_meta_cv_metrics.mean_repeat_balanced_accuracy"
+          Honest BA std: "honest_meta_cv_metrics.std_repeat_balanced_accuracy"
+          Final threshold: "final_deployment_threshold"
+          Exploratory: "exploratory"
+          Submission readiness: "submission_readiness.state"
+      - path: "evaluation.json"
+        fields:
+          Parent count: "search_budget.max_active_models"
+    csv_previews: []
+    log_files: []
+    compare_fields:
+      - "Honest mean BA"
+      - "Final threshold"
+      - "Optimizer"
+
+  - id: candidate_submission_v1
+    title: Candidate submissions
+    artifact_roots: ["artifacts/candidate_submissions"]
+    discovery_glob: "*"
+    success_markers: ["_SUCCESS"]
+    failure_markers: ["_FAILED"]
+    summary_files:
+      - path: "submission_manifest.json"
+        fields:
+          Rows: "row_count"
+          Threshold: "threshold"
+          Candidate ID: "candidate_id"
+          Blend ID: "blend_id"
+      - path: "source_metadata.json"
+        fields:
+          Exploratory: "exploratory"
+          Threshold metadata: "threshold"
+    csv_previews: ["submission.csv"]
+    log_files: []
+    compare_fields:
+      - "Rows"
+      - "Threshold"
+      - "Candidate ID"

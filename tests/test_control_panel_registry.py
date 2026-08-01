@@ -28,6 +28,8 @@ def test_repository_registry_is_strict_and_cross_referenced() -> None:
         "mlflow_local_index",
         "final_deployment_v1",
         "optuna_search_v1",
+        "prediction_blend_v1",
+        "candidate_submission_v1",
     }
     assert set(loaded.readers) == {
         "research_v2",
@@ -37,6 +39,9 @@ def test_repository_registry_is_strict_and_cross_referenced() -> None:
         "blend_evaluation_v1",
         "deployment_v1",
         "optuna_search_v1",
+        "prediction_candidate_v1",
+        "prediction_blend_v1",
+        "candidate_submission_v1",
     }
     assert loaded.commands["final_deployment_v1"].actions["run"].enabled is True
     assert loaded.commands["final_deployment_v1"].actions["run"].title == (

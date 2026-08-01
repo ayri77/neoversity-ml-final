@@ -24,6 +24,10 @@ OPTUNA_SEARCH_CONTRACT = "optuna_search_report_v1"
 BLEND_CONFIG_CONTRACT = "blend_evaluation_config_v1"
 BLEND_EVALUATION_CONTRACT = "blend_evaluation_v1_completed_evaluation"
 BLEND_DEPLOYMENT_PACKAGE_CONTRACT = "blend_evaluation_v1_deployment_package"
+PREDICTION_CANDIDATE_CONTRACT = "prediction_candidate_v1"
+PREDICTION_BLEND_CONTRACT = "prediction_blend_v1"
+CANDIDATE_SUBMISSION_CONTRACT = "candidate_submission_v1"
+BLEND_UI_REQUEST_CONTRACT = "blend_ui_request_v1"
 DEPLOYMENT_DRAFT_CONTRACT = "deployment_draft_v1"
 DEPLOYMENT_CONFIG_CONTRACT = "deployment_v1_config"
 DEPLOYMENT_ARTIFACT_CONTRACT = "deployment_v1_submission_artifact"
@@ -103,35 +107,65 @@ WORKFLOW_STEPS: tuple[WorkflowStep, ...] = (
         output_contracts=(OPTUNA_SEARCH_CONTRACT, TRAIN_CONFIG_CONTRACT),
     ),
     WorkflowStep(
-        key="blend",
-        label="🧬 Blend",
-        command_id="blend_evaluation_v1",
-        description=(
-            "Combine the probabilities of completed runs with leakage-safe "
-            "second-level cross-fitting and a shared threshold."
-        ),
-        input_contracts=(BLEND_CONFIG_CONTRACT, RESEARCH_V2_RUN_CONTRACT),
-        output_contracts=(BLEND_EVALUATION_CONTRACT, BLEND_DEPLOYMENT_PACKAGE_CONTRACT),
-    ),
-    WorkflowStep(
         key="generate_submission",
         label="📤 Generate submission",
         command_id="final_deployment_v1",
         description=(
-            "Select a completed run, generate a deployment draft from it, "
-            "validate the draft, and rehearse it on a synthetic fixture before "
-            "any competition submission."
+            "Select a completed Research v2 run or a canonical prediction "
+            "candidate, validate readiness, and generate a local Kaggle "
+            "submission CSV without upload."
         ),
         input_contracts=(
             RESEARCH_V2_RUN_CONTRACT,
             BLEND_DEPLOYMENT_PACKAGE_CONTRACT,
+            PREDICTION_CANDIDATE_CONTRACT,
+            PREDICTION_BLEND_CONTRACT,
         ),
-        intermediate_contracts=(DEPLOYMENT_DRAFT_CONTRACT, DEPLOYMENT_CONFIG_CONTRACT),
-        output_contracts=(DEPLOYMENT_ARTIFACT_CONTRACT,),
+        intermediate_contracts=(
+            DEPLOYMENT_DRAFT_CONTRACT,
+            DEPLOYMENT_CONFIG_CONTRACT,
+            CANDIDATE_SUBMISSION_CONTRACT,
+        ),
+        output_contracts=(DEPLOYMENT_ARTIFACT_CONTRACT, CANDIDATE_SUBMISSION_CONTRACT),
     ),
 )
 
 ADVANCED_OPERATIONS: tuple[AdvancedOperation, ...] = (
+    AdvancedOperation(
+        command_id="blend_evaluation_v1",
+        label="Fixed Blend Evaluation v1",
+        description=(
+            "Superseded fixed LightGBM + XGBoost blend evaluation. Prefer the "
+            "Blend Workspace for new multi-candidate blends. Kept only so "
+            "historical blend evaluations remain reproducible."
+        ),
+        badge=LEGACY_BADGE,
+        input_contracts=(BLEND_CONFIG_CONTRACT, RESEARCH_V2_RUN_CONTRACT),
+        output_contracts=(BLEND_EVALUATION_CONTRACT, BLEND_DEPLOYMENT_PACKAGE_CONTRACT),
+    ),
+    AdvancedOperation(
+        command_id="prediction_blend_v1",
+        label="Prediction Blend v1",
+        description=(
+            "Supporting CLI for the Blend Workspace. Prefer the Blend page; "
+            "this registry entry exists for authorized background jobs."
+        ),
+        badge=None,
+        input_contracts=(PREDICTION_CANDIDATE_CONTRACT, BLEND_UI_REQUEST_CONTRACT),
+        output_contracts=(PREDICTION_BLEND_CONTRACT, PREDICTION_CANDIDATE_CONTRACT),
+    ),
+    AdvancedOperation(
+        command_id="candidate_submission_v1",
+        label="Candidate Submission v1",
+        description=(
+            "Supporting CLI for canonical prediction-candidate submissions. "
+            "Prefer Generate submission with the Canonical prediction candidate "
+            "source."
+        ),
+        badge=None,
+        input_contracts=(PREDICTION_CANDIDATE_CONTRACT,),
+        output_contracts=(CANDIDATE_SUBMISSION_CONTRACT,),
+    ),
     AdvancedOperation(
         command_id="dataset_comparison_v1",
         label="Dataset Comparison v1",
@@ -169,7 +203,13 @@ ADVANCED_OPERATIONS: tuple[AdvancedOperation, ...] = (
 
 _STEPS_BY_COMMAND = {step.command_id: step for step in WORKFLOW_STEPS}
 _ADVANCED_BY_COMMAND = {item.command_id: item for item in ADVANCED_OPERATIONS}
-ADVANCED_ONLY_COMMAND_IDS: frozenset[str] = frozenset({"dataset_comparison_v1"})
+ADVANCED_ONLY_COMMAND_IDS: frozenset[str] = frozenset(
+    {
+        "dataset_comparison_v1",
+        "prediction_blend_v1",
+        "candidate_submission_v1",
+    }
+)
 
 
 def workflow_command_ids() -> tuple[str, ...]:
@@ -200,9 +240,10 @@ def visible_command_ids(
 ) -> list[str]:
     """Ordered command IDs to offer, restricted to registered commands.
 
-    The five workflow steps always come first in the declared order. Supporting
+    The workflow steps always come first in the declared order. Supporting
     operations follow so the registry stays the single source of truth. Legacy
     operations are appended only when the caller explicitly asks for them.
+    Advanced-only supporting commands stay hidden from the Operation selector.
     """
     known = list(available)
     legacy = legacy_command_ids()
@@ -216,6 +257,8 @@ def visible_command_ids(
         if item not in ordered and item not in legacy and item not in advanced_only
     )
     if include_legacy:
+        # Legacy and advanced-only supporting commands appear only when the
+        # operator explicitly enables Advanced / Legacy visibility.
         ordered.extend(item for item in tail if item not in ordered)
     return ordered
 
@@ -268,12 +311,16 @@ __all__ = [
     "ADVANCED_ONLY_COMMAND_IDS",
     "AdvancedOperation",
     "BLEND_DEPLOYMENT_PACKAGE_CONTRACT",
+    "BLEND_UI_REQUEST_CONTRACT",
+    "CANDIDATE_SUBMISSION_CONTRACT",
     "DATASET_COMPARISON_CONTRACT",
     "DEPLOYMENT_ARTIFACT_CONTRACT",
     "DEPLOYMENT_CONFIG_CONTRACT",
     "DEPLOYMENT_DRAFT_CONTRACT",
     "LEGACY_BADGE",
     "PAIRED_COMPARISON_CONTRACT",
+    "PREDICTION_BLEND_CONTRACT",
+    "PREDICTION_CANDIDATE_CONTRACT",
     "RESEARCH_V2_RUN_CONTRACT",
     "TRAIN_CONFIG_CONTRACT",
     "WORKFLOW_STEPS",

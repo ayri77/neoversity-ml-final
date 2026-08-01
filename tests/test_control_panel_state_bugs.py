@@ -33,7 +33,13 @@ from src.churn_ml.control_panel.selection_state import (
     widget_selection_key,
 )
 from tests.test_control_panel_results_workspace import _write_research_run
-from tests.test_control_panel_security import StartSpy, _apptest_run_page, _run_page, _select
+from tests.test_control_panel_security import (
+    StartSpy,
+    _apptest_run_page,
+    _check,
+    _run_page,
+    _select,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -567,6 +573,7 @@ def test_valid_widget_config_wins_over_stale_logical_example(
 
     spy = StartSpy()
     at = _run_page(monkeypatch, spy)
+    at = _check(at, "Show legacy operations")
     at = _select(at, "Operation", "blend_evaluation_v1")
     at = _select(at, "Action", "validate")
     existing_store = dict(_session_get(at, LOGICAL_SELECTION_KEY, {}) or {})

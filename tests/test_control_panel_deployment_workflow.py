@@ -582,7 +582,6 @@ def test_workflow_order_labels_and_legacy_visibility() -> None:
         "experiment_core_v2",
         "paired_comparison",
         "optuna_search_v1",
-        "blend_evaluation_v1",
         "final_deployment_v1",
     )
     assert all(command_id in registered for command_id in workflow_command_ids())
@@ -591,11 +590,13 @@ def test_workflow_order_labels_and_legacy_visibility() -> None:
     workflow = list(workflow_command_ids())
     assert standard[: len(workflow)] == workflow
     assert "research_v1" not in standard
+    assert "blend_evaluation_v1" not in standard
+    assert "prediction_blend_v1" not in standard
+    assert "candidate_submission_v1" not in standard
     assert [workflow_label(item, fallback=item) for item in workflow] == [
         "🧪 Train",
         "🔎 Compare",
         "🎛️ Tune",
-        "🧬 Blend",
         "📤 Generate submission",
     ]
     for command_id in workflow:
@@ -607,10 +608,17 @@ def test_workflow_order_labels_and_legacy_visibility() -> None:
     assert advanced[: len(standard)] == standard
     assert "research_v1" in advanced
     assert "dataset_comparison_v1" in advanced
+    assert "blend_evaluation_v1" in advanced
+    assert "prediction_blend_v1" in advanced
+    assert "candidate_submission_v1" in advanced
     assert sorted(advanced) == sorted(registered)
     assert is_legacy_command("research_v1") is True
+    assert is_legacy_command("blend_evaluation_v1") is True
     assert is_legacy_command("experiment_core_v2") is False
     assert LEGACY_BADGE in workflow_label("research_v1", fallback="research_v1")
+    assert LEGACY_BADGE in workflow_label(
+        "blend_evaluation_v1", fallback="blend_evaluation_v1"
+    )
 
     assert contract_declaration("experiment_core_v2") == {
         "input": (TRAIN_CONFIG_CONTRACT,),
@@ -620,7 +628,8 @@ def test_workflow_order_labels_and_legacy_visibility() -> None:
     submission = contract_declaration("final_deployment_v1")
     assert RESEARCH_V2_RUN_CONTRACT in submission["input"]
     assert "deployment_draft_v1" in submission["intermediate"]
-    assert submission["output"] == ("deployment_v1_submission_artifact",)
+    assert "deployment_v1_submission_artifact" in submission["output"]
+    assert "candidate_submission_v1" in submission["output"]
 
 
 def test_competition_test_safety_and_typed_deployment_inputs_unchanged() -> None:

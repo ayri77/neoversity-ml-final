@@ -82,6 +82,23 @@ from src.churn_ml.control_panel.config_schema_guard import (  # noqa: E402
 from src.churn_ml.competition_assets_v1 import (  # noqa: E402
     resolve_competition_assets,
 )
+from src.churn_ml.blending.artifact_v1 import load_blend_artifact  # noqa: E402
+from src.churn_ml.control_panel.blend_page import (  # noqa: E402
+    render_blend_workspace_page,
+)
+from src.churn_ml.control_panel.blend_workspace import (  # noqa: E402
+    apply_canonical_submission_handoff,
+    authorized_submission_argv_values,
+    discover_candidate_rows,
+    load_validated_submission_csv_bytes,
+    readiness_label,
+    resolve_canonical_submission_handoff,
+    suggest_submission_id,
+)
+from src.churn_ml.prediction_candidates.contract_v1 import (  # noqa: E402
+    MANIFEST_FILENAME as CANDIDATE_MANIFEST_FILENAME,
+    file_sha256,
+)
 from src.churn_ml.control_panel.deployment_candidates import (  # noqa: E402
     CANDIDATE_WIDGET_KEY,
     SUBMISSION_HANDOFF_KEY,
@@ -90,6 +107,9 @@ from src.churn_ml.control_panel.deployment_candidates import (  # noqa: E402
     candidate_label,
     evaluate_deployment_readiness,
     list_deployment_candidates,
+)
+from src.churn_ml.prediction_candidates.submission_v1 import (  # noqa: E402
+    evaluate_submission_readiness,
 )
 from src.churn_ml.control_panel.deployment_draft_builder import (  # noqa: E402
     DEFAULT_EXCEPTION_REASON,
@@ -521,28 +541,64 @@ def run_page() -> None:
         use_compare_driven = True
     else:
         use_compare_driven = False
-    if command_id == "final_deployment_v1" and "config" in action.placeholders:
-        (
-            prepared_deployment_config,
-            deployment_summary,
-            deployment_blocks_launch,
-        ) = _deployment_candidate_controls(loaded, action_id=action_id)
-        use_candidate_driven = True
-        dataset_driven_blocks_launch = (
-            dataset_driven_blocks_launch or deployment_blocks_launch
+    if command_id == "final_deployment_v1":
+        source_options = (
+            "Completed Research v2 run / deployment package",
+            "Canonical prediction candidate",
         )
-        if prepared_deployment_config:
-            values["config"] = prepared_deployment_config
-            selected_config = REPOSITORY_ROOT / prepared_deployment_config
-            config_widget = widget_selection_key(command_id, "config", "config")
-            st.session_state[config_widget] = prepared_deployment_config
-            set_logical_selection(
-                st.session_state,
-                command_id,
-                "config",
-                "config",
-                prepared_deployment_config,
+        source_key = "submission-source"
+        source_durable = ui_durable_key("run", "submission_source")
+        handoff = resolve_canonical_submission_handoff(
+            st.session_state, REPOSITORY_ROOT
+        )
+        if handoff is not None:
+            st.session_state[source_key] = source_options[1]
+            set_durable_value(st.session_state, source_durable, source_options[1])
+        sync_widget_with_durable(
+            st.session_state,
+            widget_key=source_key,
+            durable_key=source_durable,
+            allowed=list(source_options),
+            default=source_options[0],
+        )
+        submission_source = st.radio(
+            "Submission source",
+            source_options,
+            key=source_key,
+        )
+        remember_durable_value(
+            st.session_state,
+            durable_key=source_durable,
+            value=submission_source,
+            allowed=list(source_options),
+        )
+        if submission_source == source_options[1]:
+            _canonical_candidate_submission_controls(
+                loaded, action_id=action_id, handoff=handoff
             )
+            return
+        if "config" in action.placeholders:
+            (
+                prepared_deployment_config,
+                deployment_summary,
+                deployment_blocks_launch,
+            ) = _deployment_candidate_controls(loaded, action_id=action_id)
+            use_candidate_driven = True
+            dataset_driven_blocks_launch = (
+                dataset_driven_blocks_launch or deployment_blocks_launch
+            )
+            if prepared_deployment_config:
+                values["config"] = prepared_deployment_config
+                selected_config = REPOSITORY_ROOT / prepared_deployment_config
+                config_widget = widget_selection_key(command_id, "config", "config")
+                st.session_state[config_widget] = prepared_deployment_config
+                set_logical_selection(
+                    st.session_state,
+                    command_id,
+                    "config",
+                    "config",
+                    prepared_deployment_config,
+                )
 
     skip_config_placeholder = use_dataset_driven or use_candidate_driven or use_compare_driven
     prefill_values = (
@@ -797,9 +853,9 @@ def _render_advanced_operations_toggle(
             "Show legacy operations",
             key=widget_key,
             help=(
-                "Research evaluation v1 is a legacy training backend kept only "
-                "so historical runs remain reproducible. Do not use it for new "
-                "training."
+                "Reveals Legacy and supporting CLI operations (for example "
+                "Fixed Blend Evaluation v1). Prefer Blend Workspace and the "
+                "normal workflow for new work."
             ),
         )
         remember_durable_value(
@@ -1161,6 +1217,197 @@ def _compare_id_widget(
     with reset_cols[1]:
         st.caption(f"Suggested: `{st.session_state.get(suggested_key)}`")
     return str(comparison_id).strip() or suggested_id
+
+
+def _canonical_candidate_submission_controls(
+    loaded: ControlPanelRegistry,
+    *,
+    action_id: str,
+    handoff: dict[str, Any] | None,
+) -> None:
+    """Generate submission path for canonical prediction candidates."""
+    st.subheader("Canonical prediction candidate")
+    rows = discover_candidate_rows(REPOSITORY_ROOT, include_readiness=True)
+    if not rows:
+        st.info("No canonical prediction candidates are available.")
+        return
+    labels = {
+        str(row["candidate_id"]): str(row.get("label") or row["candidate_id"])
+        for row in rows
+    }
+    options = [str(row["candidate_id"]) for row in rows]
+    widget_key = "canonical-submission-candidate"
+    durable_key = ui_durable_key("run", "canonical_submission_candidate")
+    preferred = None if handoff is None else handoff.get("candidate_id")
+    if preferred in options:
+        st.session_state[widget_key] = preferred
+        set_durable_value(st.session_state, durable_key, preferred)
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=widget_key,
+        durable_key=durable_key,
+        allowed=options,
+        default=options[0],
+    )
+    selected_id = st.selectbox(
+        "Candidate",
+        options,
+        key=widget_key,
+        format_func=lambda value: labels.get(value, value),
+    )
+    remember_durable_value(
+        st.session_state,
+        durable_key=durable_key,
+        value=selected_id,
+        allowed=options,
+    )
+    selected = next(row for row in rows if row["candidate_id"] == selected_id)
+    readiness = evaluate_submission_readiness(
+        selected_id, repository_root=REPOSITORY_ROOT
+    )
+    st.write(
+        {
+            "Model / Blend": selected.get("label"),
+            "Source": selected.get("source_kind_label"),
+            "Dataset": selected.get("dataset_id"),
+            "Final threshold": readiness.get("threshold"),
+            "Exploratory": selected.get("exploratory"),
+            "Readiness": readiness_label(str(readiness.get("state") or "blocked")),
+        }
+    )
+    if selected.get("exploratory"):
+        st.warning(
+            "This candidate is exploratory and must remain visibly exploratory "
+            "downstream."
+        )
+    if readiness.get("blockers"):
+        st.error("Submission readiness blockers")
+        for blocker in readiness["blockers"]:
+            st.write(f"- `{blocker.get('code')}`: {blocker.get('message')}")
+    with st.expander("Technical details", expanded=False):
+        st.json(readiness)
+
+    suggested = suggest_submission_id(
+        str(selected.get("label") or selected_id), candidate_id=selected_id
+    )
+    submission_id = st.text_input(
+        "Submission ID",
+        value=suggested,
+        key="canonical-submission-id",
+    )
+    st.caption(
+        f"Expected output: `artifacts/candidate_submissions/{submission_id}/`"
+    )
+
+    validate_values = authorized_submission_argv_values(selected_id)
+    generate_values = authorized_submission_argv_values(
+        selected_id, submission_id=submission_id
+    )
+    consumed = st.session_state.setdefault("_consumed_launch_nonces", set())
+
+    if st.button("Validate readiness", key="canonical-validate-readiness"):
+        try:
+            built = build_command(
+                loaded.commands,
+                "candidate_submission_v1",
+                "validate",
+                validate_values,
+                repository_root=REPOSITORY_ROOT,
+            )
+            rendered = rendered_launch(built, None, consumed_nonces=consumed)
+            authorized = authorize_launch(
+                loaded.commands,
+                command_id="candidate_submission_v1",
+                action_id="validate",
+                values=validate_values,
+                repository_root=REPOSITORY_ROOT,
+                confirmed=True,
+                high_risk_acknowledged=True,
+                rendered=rendered,
+                consumed_nonces=consumed,
+            )
+            record = job_manager(loaded).start(
+                argv=authorized.argv,
+                redacted_argv=authorized.redacted_argv,
+                command_id="candidate_submission_v1",
+                action_id="validate",
+                references={
+                    "candidate_id": selected_id,
+                    "source_type": "canonical_prediction_candidate",
+                },
+            )
+            st.success(f"Started readiness validation job {record.job_id}.")
+        except (LaunchAuthorizationError, JobError, CommandBuildError) as error:
+            st.error(str(error))
+
+    ready = bool(readiness.get("ready"))
+    ack = st.checkbox(
+        "I explicitly acknowledge local competition-test submission generation "
+        "(no upload).",
+        key="canonical-submission-ack",
+        disabled=not ready,
+    )
+    if st.button(
+        "Generate submission",
+        type="primary",
+        disabled=not ready or not ack or action_id == "validate",
+        key="canonical-generate-submission",
+    ):
+        try:
+            built = build_command(
+                loaded.commands,
+                "candidate_submission_v1",
+                "generate",
+                generate_values,
+                repository_root=REPOSITORY_ROOT,
+            )
+            rendered = rendered_launch(built, None, consumed_nonces=consumed)
+            authorized = authorize_launch(
+                loaded.commands,
+                command_id="candidate_submission_v1",
+                action_id="generate",
+                values=generate_values,
+                repository_root=REPOSITORY_ROOT,
+                confirmed=True,
+                high_risk_acknowledged=ack,
+                rendered=rendered,
+                consumed_nonces=consumed,
+            )
+            record = job_manager(loaded).start(
+                argv=authorized.argv,
+                redacted_argv=authorized.redacted_argv,
+                command_id="candidate_submission_v1",
+                action_id="generate",
+                references={
+                    "candidate_id": selected_id,
+                    "submission_id": submission_id,
+                    "source_type": "canonical_prediction_candidate",
+                },
+            )
+            st.session_state["canonical-last-submission-id"] = submission_id
+            st.success(f"Started submission generation job {record.job_id}.")
+        except (LaunchAuthorizationError, JobError, CommandBuildError) as error:
+            st.error(str(error))
+
+    last_submission = st.session_state.get("canonical-last-submission-id")
+    if last_submission:
+        try:
+            csv_bytes = load_validated_submission_csv_bytes(
+                REPOSITORY_ROOT, str(last_submission)
+            )
+            st.success(
+                f"Submission `{last_submission}` validated. Generated locally. "
+                "Not uploaded to Kaggle."
+            )
+            st.download_button(
+                "Download submission.csv",
+                data=csv_bytes,
+                file_name="submission.csv",
+                mime="text/csv",
+                key="canonical-download-submission",
+            )
+        except Exception as error:  # noqa: BLE001
+            st.caption(f"Submission artifact not ready yet: {error}")
 
 
 def _deployment_candidate_controls(
@@ -2368,6 +2615,13 @@ def _results_inspect_tab(
                 "Prepared the allowlisted action. Open Run to review argv and start."
             )
 
+    if reader_id in {
+        "prediction_candidate_v1",
+        "prediction_blend_v1",
+        "candidate_submission_v1",
+    }:
+        _results_canonical_blend_actions(reader_id, selected)
+
     _results_registry_actions(loaded, reader_id)
 
 
@@ -3104,6 +3358,73 @@ def _cached_research_inventory_rows(
     del cache_version
     rows = build_research_inventory(Path(repository_root))
     return inventory_rows_as_mappings(rows)
+
+
+def _results_canonical_blend_actions(reader_id: str, selected: Any) -> None:
+    """Blend Workspace / submission handoff controls for canonical readers."""
+    st.subheader("Blend Workspace actions")
+    artifact_id = Path(selected.relative_path).name
+    if st.button(
+        "Open in Blend Workspace",
+        key=f"results-open-blend-{reader_id}-{artifact_id}",
+    ):
+        st.session_state["blend_workspace:focus_artifact"] = {
+            "reader_id": reader_id,
+            "relative_path": selected.relative_path,
+            "artifact_id": artifact_id,
+        }
+        st.success("Open the Blend page to continue with this artifact.")
+        try:
+            st.switch_page("Blend")
+        except Exception:  # noqa: BLE001
+            st.info("Open the Blend page from the top navigation.")
+
+    candidate_id: str | None = None
+    blend_id: str | None = None
+    if reader_id == "prediction_candidate_v1":
+        candidate_id = artifact_id
+    elif reader_id == "prediction_blend_v1":
+        blend_id = artifact_id
+        try:
+            loaded_blend = load_blend_artifact(
+                blend_id, repository_root=REPOSITORY_ROOT
+            )
+            candidate_id = str(loaded_blend.get("canonical_candidate_id") or "") or None
+        except Exception as error:  # noqa: BLE001
+            st.warning(f"Blend artifact could not be prepared for submission: {error}")
+            return
+    elif reader_id == "candidate_submission_v1":
+        manifest = selected.json_payloads.get("submission_manifest.json") or {}
+        candidate_id = str(manifest.get("candidate_id") or "") or None
+        blend_id = (
+            str(manifest.get("blend_id") or "") if manifest.get("blend_id") else None
+        )
+
+    if not candidate_id:
+        return
+    package_dir = REPOSITORY_ROOT / "artifacts" / "prediction_candidates" / candidate_id
+    manifest_path = package_dir / CANDIDATE_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        st.caption("Canonical candidate package is not available for handoff.")
+        return
+    if st.button(
+        "Prepare submission",
+        key=f"results-prepare-submission-{reader_id}-{artifact_id}",
+    ):
+        apply_canonical_submission_handoff(
+            st.session_state,
+            candidate_id=candidate_id,
+            manifest_sha256=file_sha256(manifest_path),
+            blend_id=blend_id,
+        )
+        st.session_state["run-command"] = "final_deployment_v1"
+        set_durable_value(
+            st.session_state, ui_durable_key("run", "command"), "final_deployment_v1"
+        )
+        st.success(
+            "Handoff ready. Open Run → Generate submission; the canonical "
+            "candidate source is preselected."
+        )
 
 
 def _results_registry_actions(loaded: ControlPanelRegistry, reader_id: str) -> None:
@@ -4215,6 +4536,15 @@ def _render_dataset_identity_summary(run_root: Path) -> None:
         )
 
 
+def blend_page() -> None:
+    loaded = registry()
+    render_blend_workspace_page(
+        repository_root=REPOSITORY_ROOT,
+        registry=loaded,
+        job_manager=job_manager(loaded),
+    )
+
+
 def main() -> None:
     try:
         registry()
@@ -4224,6 +4554,7 @@ def main() -> None:
     pages = [
         st.Page(dashboard_page, title="Dashboard", icon=":material/dashboard:"),
         st.Page(run_page, title="Run", icon=":material/play_arrow:"),
+        st.Page(blend_page, title="Blend", icon=":material/hub:"),
         st.Page(jobs_page, title="Jobs", icon=":material/work_history:"),
         st.Page(results_page, title="Results", icon=":material/analytics:"),
         st.Page(configuration_page, title="Configuration", icon=":material/settings:"),

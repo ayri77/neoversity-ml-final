@@ -5,6 +5,8 @@ approved_public_clis:
   - scripts/compare_research_v2.py
   - scripts/compare_research_v2_datasets.py
   - scripts/run_blend_evaluation_v1.py
+  - scripts/run_prediction_blend.py
+  - scripts/generate_candidate_submission.py
   - scripts/sync_mlflow.py
   - scripts/run_deployment_v1.py
   - scripts/run_optuna_search.py
@@ -742,3 +744,128 @@ commands:
         competition_test: false
         success_markers: ['"status": "exported"']
         failure_markers: ['"status": "failed"', "Traceback"]
+
+  - id: prediction_blend_v1
+    title: Prediction Blend v1
+    description: >
+      Supporting multi-candidate blend CLI used by Blend Workspace.
+      Prefer the Blend page for interactive selection and review.
+    category: Blend
+    argv_prefix: ["$PYTHON", "-u", "scripts/run_prediction_blend.py"]
+    allowed_config_globs:
+      - "artifacts/ui_blend_requests/*.json"
+    allowed_input_roots:
+      - "artifacts/ui_blend_requests"
+      - "artifacts/prediction_candidates"
+      - "artifacts/prediction_blends"
+    allowed_output_roots:
+      - "artifacts/prediction_blends"
+      - "artifacts/prediction_candidates"
+    result_reader_id: prediction_blend_v1
+    artifact_url: null
+    environment: []
+    actions:
+      - id: search
+        title: Search
+        description: Evaluate a blend request without writing immutable artifacts.
+        argv: ["search", "--request", "{request}"]
+        placeholders:
+          request:
+            type: path
+            role: config
+            required: true
+            roots: ["artifacts/ui_blend_requests"]
+            must_exist: true
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ['"ok": true', '"command": "search"']
+        failure_markers: ['"ok": false', "Traceback"]
+      - id: materialize
+        title: Materialize
+        description: Write an immutable blend artifact and canonical candidate.
+        argv: ["materialize", "--request", "{request}"]
+        placeholders:
+          request:
+            type: path
+            role: config
+            required: true
+            roots: ["artifacts/ui_blend_requests"]
+            must_exist: true
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ['"ok": true', '"command": "materialize"']
+        failure_markers: ['"ok": false', "Traceback"]
+      - id: inspect
+        title: Inspect
+        description: Strictly inspect one materialized blend artifact.
+        argv: ["inspect", "--blend-id", "{blend_id}"]
+        placeholders:
+          blend_id:
+            type: string
+            role: input
+            required: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ['"ok": true']
+        failure_markers: ['"ok": false', "Traceback"]
+
+  - id: candidate_submission_v1
+    title: Candidate Submission v1
+    description: >
+      Supporting CLI for local Kaggle submissions from canonical prediction
+      candidates. Prefer Generate submission with the Canonical source.
+    category: Deployment
+    argv_prefix: ["$PYTHON", "-u", "scripts/generate_candidate_submission.py"]
+    allowed_config_globs: []
+    allowed_input_roots:
+      - "artifacts/prediction_candidates"
+      - "artifacts/prediction_blends"
+      - "artifacts/candidate_submissions"
+    allowed_output_roots:
+      - "artifacts/candidate_submissions"
+    result_reader_id: candidate_submission_v1
+    artifact_url: null
+    environment: []
+    actions:
+      - id: validate
+        title: Validate readiness
+        description: Read-only submission-readiness evaluation for one candidate.
+        argv: ["validate", "--candidate-id", "{candidate_id}"]
+        placeholders:
+          candidate_id:
+            type: string
+            role: input
+            required: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ['"ok": true', '"command": "validate"']
+        failure_markers: ['"ok": false', "Traceback"]
+      - id: generate
+        title: Generate submission
+        description: >
+          Generate a validated local submission CSV from a ready candidate.
+          No upload. No network.
+        argv:
+          - "generate"
+          - "--candidate-id"
+          - "{candidate_id}"
+          - "--submission-id"
+          - "{submission_id}"
+        placeholders:
+          candidate_id:
+            type: string
+            role: input
+            required: true
+          submission_id:
+            type: string
+            role: output
+            required: true
+        confirmation: acknowledge
+        enabled: true
+        competition_test: true
+        success_markers: ['"ok": true', '"command": "generate"']
+        failure_markers: ['"ok": false', "Traceback"]

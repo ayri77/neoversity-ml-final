@@ -106,22 +106,25 @@ def test_three_comparison_scopes_exist() -> None:
     assert comparison_scope_label(COMPARE_SCOPE_SAME_DATASET).startswith("Same dataset")
 
 
-def test_workflow_still_five_steps_and_dataset_comparison_registered() -> None:
+def test_workflow_still_four_steps_and_dataset_comparison_registered() -> None:
     registered = list(load_registry(PROJECT_ROOT).commands)
     assert workflow_command_ids() == (
         "experiment_core_v2",
         "paired_comparison",
         "optuna_search_v1",
-        "blend_evaluation_v1",
         "final_deployment_v1",
     )
     assert "dataset_comparison_v1" in registered
     assert "dataset_comparison_v1" in advanced_command_ids()
     assert "dataset_comparison_v1" in ADVANCED_ONLY_COMMAND_IDS
+    assert "prediction_blend_v1" in ADVANCED_ONLY_COMMAND_IDS
+    assert "candidate_submission_v1" in ADVANCED_ONLY_COMMAND_IDS
     standard = visible_command_ids(registered)
     assert "dataset_comparison_v1" not in standard
+    assert "blend_evaluation_v1" not in standard
     advanced = visible_command_ids(registered, include_legacy=True)
     assert "dataset_comparison_v1" in advanced
+    assert "blend_evaluation_v1" in advanced
     assert DATASET_COMPARISON_CONTRACT == "dataset_comparison_v1_artifact"
 
 

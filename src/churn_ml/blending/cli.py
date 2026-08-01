@@ -26,6 +26,10 @@ from src.churn_ml.blending.evaluation_v1 import (
     BlendSettings,
 )
 from src.churn_ml.blending.optimization_v1 import BlendOptimizationError
+from src.churn_ml.blending.request_v1 import (
+    BlendUIRequestError,
+    load_blend_ui_request,
+)
 from src.churn_ml.prediction_candidates.contract_v1 import (
     CandidateConflictError,
     PredictionCandidateError,
@@ -100,21 +104,29 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_search_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--request",
+        default=None,
+        help=(
+            "Repository-relative blend_ui_request_v1 JSON. Incompatible with "
+            "direct candidate/settings arguments."
+        ),
+    )
     parser.add_argument("--candidate", action="append", default=[], dest="candidates")
     parser.add_argument(
         "--strategy",
         choices=("equal", "manual", "optimized"),
-        default="optimized",
+        default=None,
     )
     parser.add_argument(
         "--optimizer",
         choices=("native", "optuna"),
-        default="native",
+        default=None,
         help="Weight optimizer backend for strategy=optimized (default: native)",
     )
-    parser.add_argument("--folds", type=int, default=5)
-    parser.add_argument("--repeats", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--folds", type=int, default=None)
+    parser.add_argument("--repeats", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max-active-models", type=int, default=None)
     parser.add_argument("--weight", action="append", default=[], dest="weights")
     parser.add_argument("--dirichlet-draws", type=int, default=None)
@@ -156,6 +168,7 @@ def main(
         BlendCompatibilityError,
         BlendOptimizationError,
         BlendArtifactError,
+        BlendUIRequestError,
         CandidateSubmissionError,
         PredictionCandidateError,
         ValueError,
@@ -169,7 +182,54 @@ def main(
     return EXIT_INVALID
 
 
-def _settings_from_args(args: argparse.Namespace) -> BlendSettings:
+def _direct_settings_provided(args: argparse.Namespace) -> bool:
+    return any(
+        [
+            bool(args.candidates),
+            args.strategy is not None,
+            args.optimizer is not None,
+            args.folds is not None,
+            args.repeats is not None,
+            args.seed is not None,
+            args.max_active_models is not None,
+            bool(args.weights),
+            args.dirichlet_draws is not None,
+            args.pairwise_grid_step is not None,
+            args.optuna_trials is not None,
+            args.optuna_timeout_seconds is not None,
+            args.optuna_seed is not None,
+        ]
+    )
+
+
+def _resolve_search_inputs(
+    args: argparse.Namespace, root: Path
+) -> tuple[list[str], BlendSettings, str | None, str | None, str | None]:
+    """Return candidates, settings, candidate_root, blend_root, request_id."""
+    if getattr(args, "request", None):
+        if _direct_settings_provided(args):
+            raise BlendUIRequestError(
+                "--request cannot be mixed with direct candidate/settings arguments.",
+                reason_code="request_direct_conflict",
+            )
+        if args.candidate_root is not None or args.blend_root is not None:
+            raise BlendUIRequestError(
+                "--request cannot be mixed with --candidate-root/--blend-root.",
+                reason_code="request_direct_conflict",
+            )
+        request = load_blend_ui_request(args.request, repository_root=root)
+        return (
+            request.candidate_ids,
+            request.blend_settings(),
+            str(request.payload["candidate_root"]),
+            str(request.payload["blend_root"]),
+            request.request_id,
+        )
+    if not args.candidates:
+        raise BlendOptimizationError(
+            "Provide --candidate entries or --request.",
+            reason_code="candidates_missing",
+        )
     optuna_options_provided = (
         args.optuna_trials is not None
         or args.optuna_timeout_seconds is not None
@@ -178,11 +238,11 @@ def _settings_from_args(args: argparse.Namespace) -> BlendSettings:
     native_search_options_provided = (
         args.dirichlet_draws is not None or args.pairwise_grid_step is not None
     )
-    return BlendSettings(
-        strategy=args.strategy,
-        folds=args.folds,
-        repeats=args.repeats,
-        seed=args.seed,
+    settings = BlendSettings(
+        strategy=args.strategy or "optimized",
+        folds=5 if args.folds is None else int(args.folds),
+        repeats=2 if args.repeats is None else int(args.repeats),
+        seed=42 if args.seed is None else int(args.seed),
         max_active_models=args.max_active_models,
         manual_weights=tuple(args.weights),
         pairwise_grid_step=(
@@ -191,7 +251,7 @@ def _settings_from_args(args: argparse.Namespace) -> BlendSettings:
         dirichlet_draws=(
             32 if args.dirichlet_draws is None else int(args.dirichlet_draws)
         ),
-        optimizer_backend=args.optimizer,
+        optimizer_backend=args.optimizer or "native",
         optuna_trials=(
             DEFAULT_OPTUNA_TRIALS
             if args.optuna_trials is None
@@ -201,6 +261,13 @@ def _settings_from_args(args: argparse.Namespace) -> BlendSettings:
         optuna_seed=args.optuna_seed,
         optuna_options_provided=optuna_options_provided,
         native_search_options_provided=native_search_options_provided,
+    )
+    return (
+        list(args.candidates),
+        settings,
+        args.candidate_root,
+        args.blend_root,
+        None,
     )
 
 
@@ -268,14 +335,20 @@ def _cmd_analyze(args: argparse.Namespace, root: Path) -> int:
 
 
 def _cmd_search(args: argparse.Namespace, root: Path) -> int:
-    pool = load_compatible_candidates(
-        args.candidates,
-        repository_root=root,
-        candidates_root=args.candidate_root,
+    candidates, settings, candidate_root, blend_root, request_id = _resolve_search_inputs(
+        args, root
     )
-    payload = search_blend(pool, _settings_from_args(args))
+    del blend_root
+    pool = load_compatible_candidates(
+        candidates,
+        repository_root=root,
+        candidates_root=candidate_root,
+    )
+    payload = search_blend(pool, settings)
     payload["command"] = "search"
     payload["artifacts_written"] = False
+    if request_id is not None:
+        payload["request_id"] = request_id
     _emit(payload)
     print(
         f"STATUS: search complete for blend_id={payload['blend_id']}; not materialized",
@@ -285,21 +358,25 @@ def _cmd_search(args: argparse.Namespace, root: Path) -> int:
 
 
 def _cmd_materialize(args: argparse.Namespace, root: Path) -> int:
+    candidates, settings, candidate_root, blend_root, request_id = _resolve_search_inputs(
+        args, root
+    )
     pool = load_compatible_candidates(
-        args.candidates,
+        candidates,
         repository_root=root,
-        candidates_root=args.candidate_root,
+        candidates_root=candidate_root,
     )
     result = materialize_blend(
         pool,
-        _settings_from_args(args),
-        blend_root_relative=args.blend_root,
+        settings,
+        blend_root_relative=blend_root,
     )
     _emit(
         {
             "ok": True,
             "command": "materialize",
             "artifacts_written": True,
+            "request_id": request_id,
             "blend_id": result.blend_id,
             "blend_path": result.blend_dir.as_posix(),
             "canonical_candidate_id": result.candidate_package.candidate_id,
