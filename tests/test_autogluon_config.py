@@ -269,6 +269,7 @@ def test_profile_registry_and_unknown_profile() -> None:
         "catboost_only_cpu_v1",
         "lightgbmprep_only_cpu_v1",
         "extreme_seqmem_v1",
+        "focused_hybrid_v1",
     }
     assert get_profile("realtabpfn_only_v1").included_model_types == ("REALTABPFN-V2",)
     assert get_profile("tabm_only_gpu_v1").included_model_types == ("TABM",)

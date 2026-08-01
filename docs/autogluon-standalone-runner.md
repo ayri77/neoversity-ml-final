@@ -65,11 +65,29 @@ The registered profiles are:
 
 - `realtabpfn_only_v1`: all `REALTABPFN-V2` configurations from the
   `zeroshot_2025_12_18_gpu` portfolio.
+- `tabm_only_gpu_v1`: all `TABM` configurations from the
+  `zeroshot_2025_12_18_gpu` portfolio.
 - `catboost_only_cpu_v1`: the CPU portfolio `CAT` family, forced to CPU.
 - `lightgbmprep_only_cpu_v1`: the CPU portfolio `GBM_PREP` family, forced to CPU.
 - `extreme_seqmem_v1`: the GPU portfolio excluding `TABDPT`, `TABICL`, and `MITRA`,
   with explicit CPU/GPU family scoping and sequential model/fold fitting. It is a
   diagnostic profile, not a recommended default.
+- `focused_hybrid_v1`: a focused post-screening composite of 11 selected base
+  configurations resolved from three AutoGluon 1.5.0 built-in portfolios. It is
+  an experiment profile for follow-up after `extreme_seqmem_v1` screening, not an
+  automatic replacement for Research v2 evaluation. Exact sources:
+
+  - `zeroshot_2025_12_18_gpu`: `REALTABPFN-V2` `_r11`; `GBM_PREP` `_r31`,
+    `_r41`, `_r13`
+  - `zeroshot`: `XGB` default/index `0`, `_r33`, `_r89`; `XT` `Gini`, `_r42`
+  - `zeroshot_2025_12_18_cpu`: `NN_TORCH` `_r37`, `_r31`
+
+  Resource policy for this profile: `REALTABPFN-V2` and `NN_TORCH` use one GPU;
+  `GBM_PREP`, `XGB`, and `XT` are CPU-only (`num_gpus=0`). `NN_TORCH` is
+  explicitly GPU-enabled here even though its source portfolio is the CPU
+  zeroshot set. The profile requires `resources.num_gpus >= 1`, keeps
+  sequential fit/fold strategies, and still does not pass top-level
+  `num_gpus` to `predictor.fit()`.
 
 The supervisor persists `requested_seed` and the seed-bearing profile identity before
 launch, so they survive an early child crash. The requested seed is applied to every
