@@ -518,9 +518,30 @@ def load_candidate_manifest(path: Path) -> dict[str, Any]:
     return payload
 
 
-def discover_candidate_packages(repository_root: Path) -> list[dict[str, Any]]:
+def normalize_candidates_root_relative(candidates_root_relative: str | None) -> str:
+    """Return a repository-relative POSIX candidate root (no traversal)."""
+    relative = candidates_root_relative or CANDIDATE_ROOT_RELATIVE
+    if not relative or relative.startswith("/") or PurePosixPath(relative).is_absolute():
+        raise PredictionCandidateError(
+            f"Absolute or empty candidates root rejected: {relative!r}",
+            reason_code="path_traversal",
+        )
+    if ".." in PurePosixPath(relative).parts:
+        raise PredictionCandidateError(
+            f"Path traversal rejected: {relative!r}",
+            reason_code="path_traversal",
+        )
+    return PurePosixPath(relative).as_posix()
+
+
+def discover_candidate_packages(
+    repository_root: Path,
+    *,
+    candidates_root_relative: str | None = None,
+) -> list[dict[str, Any]]:
     root = repository_root.resolve()
-    candidates_root = root / Path(*PurePosixPath(CANDIDATE_ROOT_RELATIVE).parts)
+    relative = normalize_candidates_root_relative(candidates_root_relative)
+    candidates_root = root / Path(*PurePosixPath(relative).parts)
     if not candidates_root.is_dir():
         return []
     summaries: list[dict[str, Any]] = []
@@ -584,13 +605,15 @@ def load_candidate_package(
     package_dir: Path,
     *,
     repository_root: Path,
+    candidates_root_relative: str | None = None,
 ) -> CandidatePackage:
     root = repository_root.resolve()
     directory = package_dir.resolve(strict=True)
-    candidates_root = root / Path(*PurePosixPath(CANDIDATE_ROOT_RELATIVE).parts)
+    relative = normalize_candidates_root_relative(candidates_root_relative)
+    candidates_root = root / Path(*PurePosixPath(relative).parts)
     if not is_within(directory, candidates_root):
         raise PredictionCandidateError(
-            "Candidate package is outside artifacts/prediction_candidates.",
+            f"Candidate package is outside {relative}.",
             reason_code="path_traversal",
         )
     if not (directory / SUCCESS_FILENAME).is_file():
@@ -924,6 +947,7 @@ def create_candidate_package(
     test: pd.DataFrame,
     manifest_fields: Mapping[str, Any],
     source_metadata: Mapping[str, Any],
+    candidates_root_relative: str | None = None,
 ) -> CandidatePackage:
     """Create an immutable candidate package atomically.
 
@@ -931,7 +955,8 @@ def create_candidate_package(
     Conflicts when the same candidate_id exists with different content.
     """
     root = repository_root.resolve()
-    candidates_root = root / Path(*PurePosixPath(CANDIDATE_ROOT_RELATIVE).parts)
+    relative_root = normalize_candidates_root_relative(candidates_root_relative)
+    candidates_root = root / Path(*PurePosixPath(relative_root).parts)
     candidates_root.mkdir(parents=True, exist_ok=True)
 
     candidate_id = build_candidate_id(identity)
@@ -974,7 +999,7 @@ def create_candidate_package(
         )
         # Rewrite references to final relative paths before persisting manifest.
         oof_ref = FileReference(
-            path=f"{CANDIDATE_ROOT_RELATIVE}/{candidate_id}/{OOF_FILENAME}",
+            path=f"{relative_root}/{candidate_id}/{OOF_FILENAME}",
             sha256=oof_ref.sha256,
             size_bytes=oof_ref.size_bytes,
             row_count=oof_ref.row_count,
@@ -987,7 +1012,7 @@ def create_candidate_package(
             columns=TEST_COLUMNS,
         )
         test_ref = FileReference(
-            path=f"{CANDIDATE_ROOT_RELATIVE}/{candidate_id}/{TEST_FILENAME}",
+            path=f"{relative_root}/{candidate_id}/{TEST_FILENAME}",
             sha256=test_ref_tmp.sha256,
             size_bytes=test_ref_tmp.size_bytes,
             row_count=test_ref_tmp.row_count,
@@ -1064,7 +1089,11 @@ def create_candidate_package(
                 raise CandidateConflictError(
                     f"Incomplete candidate package already exists: {final_dir}"
                 )
-            existing = load_candidate_package(final_dir, repository_root=root)
+            existing = load_candidate_package(
+                final_dir,
+                repository_root=root,
+                candidates_root_relative=relative_root,
+            )
             existing_fp = _package_content_fingerprint(
                 existing.oof,
                 existing.test,
@@ -1090,7 +1119,11 @@ def create_candidate_package(
             shutil.rmtree(staging, ignore_errors=True)
         raise
 
-    return load_candidate_package(final_dir, repository_root=root)
+    return load_candidate_package(
+        final_dir,
+        repository_root=root,
+        candidates_root_relative=relative_root,
+    )
 
 
 def _manifest_identity_view(manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -1183,10 +1216,12 @@ __all__ = [
     "candidate_summary",
     "create_candidate_package",
     "discover_candidate_packages",
+    "file_sha256",
     "load_aligned_oof_probabilities",
     "load_aligned_test_probabilities",
     "load_candidate_manifest",
     "load_candidate_package",
+    "normalize_candidates_root_relative",
     "repository_relative_path",
     "resolve_under_repository",
     "row_position_hash",
