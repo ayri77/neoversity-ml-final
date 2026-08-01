@@ -39,7 +39,6 @@ from src.churn_ml.prediction_candidates.contract_v1 import (
     load_candidate_package,
     validate_candidate_package,
 )
-
 __all__ = [
     "CANDIDATE_ROOT_RELATIVE",
     "CANDIDATE_TYPE",

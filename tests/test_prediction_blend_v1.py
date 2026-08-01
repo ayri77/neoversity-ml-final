@@ -408,6 +408,12 @@ def test_meta_cv_leakage_and_coverage(repo: Path) -> None:
         assert len(train) + len(val) == len(pool.target)
     assert "full_OOF_descriptive" in result.full_oof_descriptive_metrics["label"]
     assert "cross_fitted" in result.cross_fitted_metrics["label"]
+    assert (
+        result.honest_meta_cv_metrics["primary_score"]
+        == "mean_repeat_balanced_accuracy"
+    )
+    assert len(result.held_out_decisions) == len(pool.target) * settings.repeats
+    assert set(result.held_out_decisions["prediction"].unique()).issubset({0, 1})
     assert result.deployment["weight_vector"] != result.fold_results[0]["weights"] or True
     # Final weights present and separate field from fold weights.
     assert "weights" in result.deployment
@@ -434,6 +440,16 @@ def test_materialize_canonical_candidate_and_artifacts(repo: Path) -> None:
     package = first.candidate_package
     validate_candidate_package(package, repository_root=repo)
     assert package.manifest["source_kind"] == "canonical_probability_blend_v1"
+    assert package.manifest["source_metric_name"] == "mean_repeat_balanced_accuracy"
+    assert package.manifest["source_metric_value"] == pytest.approx(
+        first.evaluation.honest_meta_cv_metrics["mean_repeat_balanced_accuracy"]
+    )
+    success = json.loads((first.blend_dir / "_SUCCESS").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (first.blend_dir / "blend_manifest.json").read_text(encoding="utf-8")
+    )
+    assert "manifest_sha256" not in manifest
+    assert success["manifest_sha256"]
     assert np.allclose(
         package.oof["probability_positive"].to_numpy(),
         first.evaluation.cross_fitted_oof,

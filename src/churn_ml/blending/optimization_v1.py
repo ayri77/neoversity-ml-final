@@ -200,22 +200,63 @@ def _selection_key(selection: WeightThresholdSelection) -> tuple[Any, ...]:
     )
 
 
-def enforce_max_active(weights: np.ndarray, max_active: int | None) -> np.ndarray:
-    array = validate_weights(weights, n_candidates=len(weights))
+def validate_max_active(max_active: int | None, *, n_candidates: int) -> int | None:
     if max_active is None:
-        return array
+        return None
     if max_active < 1:
         raise BlendOptimizationError(
             "max_active_models must be >= 1 when provided.",
             reason_code="max_active_invalid",
         )
-    if _active_count(array) <= max_active:
+    if max_active > n_candidates:
+        raise BlendOptimizationError(
+            f"max_active_models ({max_active}) exceeds selected candidate count "
+            f"({n_candidates}).",
+            reason_code="max_active_exceeds_candidates",
+        )
+    return int(max_active)
+
+
+def softmax_from_latents(latents: np.ndarray) -> np.ndarray:
+    """Numerically stable softmax mapping latents onto the probability simplex."""
+    values = np.asarray(latents, dtype=np.float64)
+    if values.ndim != 1 or values.size == 0:
+        raise BlendOptimizationError(
+            "Latents must be a non-empty one-dimensional array.",
+            reason_code="latent_shape_invalid",
+        )
+    if not np.isfinite(values).all():
+        raise BlendOptimizationError(
+            "Latents must be finite.",
+            reason_code="latent_nonfinite",
+        )
+    shifted = values - float(np.max(values))
+    exp = np.exp(shifted)
+    total = float(exp.sum())
+    if total <= 0.0 or not np.isfinite(total):
+        raise BlendOptimizationError(
+            "Softmax normalization failed.",
+            reason_code="softmax_failed",
+        )
+    return validate_weights(exp / total, n_candidates=len(values))
+
+
+def enforce_max_active(weights: np.ndarray, max_active: int | None) -> np.ndarray:
+    array = validate_weights(weights, n_candidates=len(weights))
+    limit = validate_max_active(max_active, n_candidates=len(array))
+    if limit is None:
         return array
-    order = np.argsort(-array, kind="stable")
-    keep = order[:max_active]
+    if _active_count(array) <= limit:
+        return array
+    # Prefer larger weight, break ties by canonical (lower) index order.
+    order = sorted(
+        range(len(array)),
+        key=lambda index: (-float(array[index]), index),
+    )
+    keep = order[:limit]
     projected = np.zeros_like(array)
     projected[keep] = array[keep]
-    total = projected.sum()
+    total = float(projected.sum())
     if total <= 0:
         projected[keep[0]] = 1.0
     else:
@@ -245,7 +286,13 @@ def generate_weight_proposals(
         vertex[index] = 1.0
         proposals.append(vertex)
 
-    active_limit = n_candidates if max_active is None else min(max_active, n_candidates)
+    active_limit = (
+        n_candidates
+        if max_active is None
+        else validate_max_active(max_active, n_candidates=n_candidates)
+    )
+    assert active_limit is not None or max_active is None
+    active_limit = n_candidates if active_limit is None else active_limit
     # Pairwise grids on all pairs (or active subsets of size 2).
     if active_limit >= 2:
         for i, j in combinations(range(n_candidates), 2):

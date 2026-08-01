@@ -21,13 +21,20 @@ from src.churn_ml.blending.compatibility_v1 import (
     resolve_candidates_root,
 )
 from src.churn_ml.blending.diversity_v1 import analyze_diversity
-from src.churn_ml.blending.evaluation_v1 import BlendSettings
+from src.churn_ml.blending.evaluation_v1 import (
+    DEFAULT_OPTUNA_TRIALS,
+    BlendSettings,
+)
 from src.churn_ml.blending.optimization_v1 import BlendOptimizationError
 from src.churn_ml.prediction_candidates.contract_v1 import (
     CandidateConflictError,
     PredictionCandidateError,
     candidate_summary,
     load_candidate_package,
+)
+from src.churn_ml.prediction_candidates.submission_v1 import (
+    CandidateSubmissionError,
+    evaluate_submission_readiness,
 )
 
 
@@ -82,6 +89,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="inspect one prediction_candidate_v1 package",
     )
     inspect_candidate.add_argument("--candidate-id", required=True)
+
+    readiness = sub.add_parser(
+        "submission-readiness",
+        parents=[common],
+        help="evaluate submission readiness for one candidate (read-only)",
+    )
+    readiness.add_argument("--candidate-id", required=True)
     return parser
 
 
@@ -92,13 +106,22 @@ def _add_search_args(parser: argparse.ArgumentParser) -> None:
         choices=("equal", "manual", "optimized"),
         default="optimized",
     )
+    parser.add_argument(
+        "--optimizer",
+        choices=("native", "optuna"),
+        default="native",
+        help="Weight optimizer backend for strategy=optimized (default: native)",
+    )
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-active-models", type=int, default=None)
     parser.add_argument("--weight", action="append", default=[], dest="weights")
-    parser.add_argument("--dirichlet-draws", type=int, default=32)
-    parser.add_argument("--pairwise-grid-step", type=float, default=0.1)
+    parser.add_argument("--dirichlet-draws", type=int, default=None)
+    parser.add_argument("--pairwise-grid-step", type=float, default=None)
+    parser.add_argument("--optuna-trials", type=int, default=None)
+    parser.add_argument("--optuna-timeout-seconds", type=float, default=None)
+    parser.add_argument("--optuna-seed", type=int, default=None)
 
 
 def main(
@@ -124,6 +147,8 @@ def main(
             return _cmd_inspect(args, root)
         if args.command == "inspect-candidate":
             return _cmd_inspect_candidate(args, root)
+        if args.command == "submission-readiness":
+            return _cmd_submission_readiness(args, root)
     except CandidateConflictError as error:
         _emit_error("conflict", str(error), reason_code=error.reason_code)
         return EXIT_CONFLICT
@@ -131,6 +156,7 @@ def main(
         BlendCompatibilityError,
         BlendOptimizationError,
         BlendArtifactError,
+        CandidateSubmissionError,
         PredictionCandidateError,
         ValueError,
     ) as error:
@@ -144,6 +170,14 @@ def main(
 
 
 def _settings_from_args(args: argparse.Namespace) -> BlendSettings:
+    optuna_options_provided = (
+        args.optuna_trials is not None
+        or args.optuna_timeout_seconds is not None
+        or args.optuna_seed is not None
+    )
+    native_search_options_provided = (
+        args.dirichlet_draws is not None or args.pairwise_grid_step is not None
+    )
     return BlendSettings(
         strategy=args.strategy,
         folds=args.folds,
@@ -151,8 +185,22 @@ def _settings_from_args(args: argparse.Namespace) -> BlendSettings:
         seed=args.seed,
         max_active_models=args.max_active_models,
         manual_weights=tuple(args.weights),
-        pairwise_grid_step=args.pairwise_grid_step,
-        dirichlet_draws=args.dirichlet_draws,
+        pairwise_grid_step=(
+            0.1 if args.pairwise_grid_step is None else float(args.pairwise_grid_step)
+        ),
+        dirichlet_draws=(
+            32 if args.dirichlet_draws is None else int(args.dirichlet_draws)
+        ),
+        optimizer_backend=args.optimizer,
+        optuna_trials=(
+            DEFAULT_OPTUNA_TRIALS
+            if args.optuna_trials is None
+            else int(args.optuna_trials)
+        ),
+        optuna_timeout_seconds=args.optuna_timeout_seconds,
+        optuna_seed=args.optuna_seed,
+        optuna_options_provided=optuna_options_provided,
+        native_search_options_provided=native_search_options_provided,
     )
 
 
@@ -258,8 +306,19 @@ def _cmd_materialize(args: argparse.Namespace, root: Path) -> int:
             "canonical_candidate_path": candidate_summary(result.candidate_package)[
                 "package_path"
             ],
+            "optimizer_backend": result.evaluation.settings.optimizer_backend,
+            "optimizer_settings": result.evaluation.search_budget,
             "deployment": result.evaluation.deployment,
-            "cross_fitted_metrics": result.evaluation.cross_fitted_metrics,
+            "final_deployment_weights": result.evaluation.deployment["weights"],
+            "final_deployment_threshold": result.evaluation.deployment["threshold"],
+            "honest_meta_cv_metrics": result.evaluation.honest_meta_cv_metrics,
+            "cross_fitted_probability_descriptive_metrics": (
+                result.evaluation.cross_fitted_probability_descriptive_metrics
+            ),
+            "submission_readiness": result.manifest.get("submission_readiness"),
+            "cross_fitted_metrics": (
+                result.evaluation.cross_fitted_probability_descriptive_metrics
+            ),
             "exploratory": pool.exploratory,
         }
     )
@@ -276,6 +335,7 @@ def _cmd_inspect(args: argparse.Namespace, root: Path) -> int:
         args.blend_id,
         repository_root=root,
         blend_root_relative=args.blend_root,
+        candidates_root_relative=args.candidate_root,
     )
     payload["command"] = "inspect"
     payload["artifacts_written"] = False
@@ -296,6 +356,12 @@ def _cmd_inspect_candidate(args: argparse.Namespace, root: Path) -> int:
         candidates_root_relative=relative,
     )
     summary = candidate_summary(package)
+    readiness = evaluate_submission_readiness(
+        package.candidate_id,
+        repository_root=root,
+        candidates_root_relative=relative,
+        blend_root_relative=args.blend_root,
+    )
     _emit(
         {
             "ok": True,
@@ -315,10 +381,45 @@ def _cmd_inspect_candidate(args: argparse.Namespace, root: Path) -> int:
                 "source_model_name": package.manifest["source_model_name"],
                 "oof_protocol": package.manifest["oof_protocol"],
             },
+            "final_deployment_threshold": package.source_metadata.get(
+                "final_deployment_threshold",
+                package.source_metadata.get("final_threshold"),
+            ),
+            "final_deployment_weights": package.source_metadata.get(
+                "final_deployment_weights",
+                package.source_metadata.get("final_weights"),
+            ),
+            "honest_meta_cv_metrics": package.source_metadata.get(
+                "honest_meta_cv_metrics"
+            ),
+            "submission_readiness": readiness,
         }
     )
     print(
         f"STATUS: inspected candidate {package.candidate_id}; read-only",
+        file=sys.stderr,
+    )
+    return EXIT_OK
+
+
+def _cmd_submission_readiness(args: argparse.Namespace, root: Path) -> int:
+    readiness = evaluate_submission_readiness(
+        args.candidate_id,
+        repository_root=root,
+        candidates_root_relative=args.candidate_root,
+        blend_root_relative=args.blend_root,
+    )
+    _emit(
+        {
+            "ok": True,
+            "command": "submission-readiness",
+            "artifacts_written": False,
+            **readiness,
+        }
+    )
+    state = readiness["state"]
+    print(
+        f"STATUS: submission-readiness for {args.candidate_id}: {state}; read-only",
         file=sys.stderr,
     )
     return EXIT_OK
