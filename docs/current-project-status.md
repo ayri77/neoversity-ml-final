@@ -3,7 +3,7 @@
 > Operational handoff document for continuing the project across development
 > sessions and assistant dialogs.
 
-**Last updated:** 2026-07-31  
+**Last updated:** 2026-08-01  
 **Repository:** `ayri77/neoversity-ml-final`  
 **Active task branch:** `feature/prepared-dataset-pipeline-v1`  
 **Current checkpoint:** Stage E Dataset Comparison v1 and the unified Compare
@@ -21,7 +21,10 @@
     for Dataset Comparison. Canonical submission workflow v1 remains available;
     network/Kaggle upload remains disabled. Stage D Dataset Campaign / Matrix
     Runner v1 remains committed (`6deafc3`) and the 21-run campaign has **not**
-    been executed via the Campaign Runner.
+    been executed via the Campaign Runner. The standalone AutoGluon runner now
+    also registers composite profile `focused_hybrid_v1` (11 selected base
+    configs from three AutoGluon 1.5.0 portfolios) with validate-only v3 smoke
+    and full YAML configs; no `focused_hybrid_v1` training has been run.
 
 ## 1. Purpose and maintenance policy
 
@@ -85,6 +88,12 @@ Immediate next actions:
 6. For local competition submission: select a completed run, prepare the
    resolved deployment draft, Validate, then Generate submission with explicit
    acknowledgement. Do not upload to Kaggle from this workflow.
+7. Optional AutoGluon follow-up after `extreme_seqmem_v1` screening: train
+   `focused_hybrid_v1` only with an explicit authorize-to-execute decision
+   (`configs/autogluon/focused_hybrid_v3_smoke.yaml` or
+   `focused_hybrid_v3.yaml`). It is a post-screening experiment profile, not a
+   Research v2 replacement. Validate-only and real-registry resolution already
+   pass; do not treat it as campaign work.
 
 The Experiment Control Panel dataset selector is implemented and covered by
 automated tests, including a validate-only smoke path for
@@ -199,7 +208,8 @@ The project already contains a substantial Experiment Platform:
 - blend evaluation;
 - final deployment;
 - Optuna integration;
-- standalone AutoGluon runner;
+- standalone AutoGluon runner, including versioned profiles and composite
+  profile `focused_hybrid_v1`;
 - optional MLflow mirroring;
 - Streamlit Experiment Control Panel;
 - saved OOF predictions, fold assignments, metrics, thresholds, identities, and
@@ -826,6 +836,13 @@ Threshold `0.117` is not universal.
 ## 19. Deferred direction — close the AutoGluon r31 gap
 
 This is not the next task. Revisit it only after dataset screening.
+
+Related AutoGluon profile note: `focused_hybrid_v1` is implemented as a
+fail-closed composite selection over `zeroshot_2025_12_18_gpu`, `zeroshot`, and
+`zeroshot_2025_12_18_cpu` (RealTabPFN `_r11`, three GBM_PREP configs, three XGB
+configs, two GPU `NN_TORCH` configs, two CPU XT configs). Existing single-
+portfolio profile hashes remain stable. Training remains unauthorized until
+explicitly requested.
 
 Priority order:
 
