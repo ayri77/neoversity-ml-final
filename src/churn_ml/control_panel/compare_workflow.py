@@ -24,6 +24,7 @@ from src.churn_ml.control_panel.path_safety import (
     require_safe_directory,
 )
 from src.churn_ml.control_panel.research_inventory import ResearchRunInventoryRow
+from src.churn_ml.control_panel.schemas import ActionSpec
 from src.churn_ml.dataset_comparison_v1 import (
     DEFAULT_OUTPUT_ROOT as DATASET_COMPARISON_DEFAULT_OUTPUT_ROOT,
     DatasetComparisonCompatibilitySummary,
@@ -81,6 +82,20 @@ def comparison_scope_label(scope: str) -> str:
 
 def is_descriptive_comparison_scope(scope: str) -> bool:
     return scope == COMPARE_SCOPE_DESCRIPTIVE
+
+
+def filter_compare_values_for_action(
+    values: Mapping[str, Any],
+    action: ActionSpec,
+) -> dict[str, Any]:
+    """Keep only placeholder names declared by the selected action schema.
+
+    Validate accepts baseline/candidate paths only. Compare/run also accepts
+    comparison_id and output_root. Preview fields may still be shown in the UI
+    without becoming command values.
+    """
+    allowed = set(action.placeholders)
+    return {name: value for name, value in values.items() if name in allowed}
 
 
 def exploratory_comparison_warning(
@@ -447,6 +462,7 @@ __all__ = [
     "default_same_dataset_output_root",
     "evaluate_dataset_comparison_readiness",
     "exploratory_comparison_warning",
+    "filter_compare_values_for_action",
     "filter_dataset_comparison_candidates",
     "filter_same_dataset_candidates",
     "is_descriptive_comparison_scope",

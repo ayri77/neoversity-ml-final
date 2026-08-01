@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from src.churn_ml.control_panel.command_builder import CommandBuildError, build_command
 from src.churn_ml.control_panel.compare_workflow import (
     COMPARE_SCOPE_DESCRIPTIVE,
     COMPARE_SCOPE_DIFFERENT_DATASETS,
@@ -14,6 +17,7 @@ from src.churn_ml.control_panel.compare_workflow import (
     default_same_dataset_comparison_id,
     default_same_dataset_output_root,
     exploratory_comparison_warning,
+    filter_compare_values_for_action,
     filter_dataset_comparison_candidates,
     filter_same_dataset_candidates,
     is_descriptive_comparison_scope,
@@ -245,4 +249,184 @@ def test_exploratory_warning_helper() -> None:
             candidate_target_dependency="none",
         )
         is None
+    )
+
+
+def _preview_values(
+    *,
+    baseline: str,
+    candidate: str,
+    comparison_id: str,
+    output_root: str,
+) -> dict[str, str]:
+    return {
+        "baseline_run_dir": baseline,
+        "candidate_run_dir": candidate,
+        "comparison_id": comparison_id,
+        "output_root": output_root,
+    }
+
+
+def _touch_run(root: Path, relative: str) -> str:
+    path = root / relative
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "_SUCCESS").write_text("ok\n", encoding="utf-8")
+    return relative
+
+
+@pytest.mark.parametrize(
+    ("command_id", "output_root"),
+    [
+        ("paired_comparison", "artifacts/research_v2_comparisons"),
+        ("dataset_comparison_v1", "artifacts/research_v2_dataset_comparisons"),
+    ],
+)
+def test_validate_action_rejects_preview_only_id_and_output_root(
+    tmp_path: Path,
+    command_id: str,
+    output_root: str,
+) -> None:
+    loaded = load_registry(PROJECT_ROOT)
+    action = loaded.commands[command_id].actions["validate"]
+    baseline = _touch_run(
+        tmp_path,
+        "artifacts/research_v2/plan/pipeline/baseline",
+    )
+    candidate = _touch_run(
+        tmp_path,
+        "artifacts/research_v2/plan/pipeline/candidate",
+    )
+    preview = _preview_values(
+        baseline=baseline,
+        candidate=candidate,
+        comparison_id="preview-id",
+        output_root=output_root,
+    )
+    with pytest.raises(CommandBuildError, match="Unknown placeholder values"):
+        build_command(
+            loaded.commands,
+            command_id,
+            "validate",
+            preview,
+            repository_root=tmp_path,
+        )
+    filtered = filter_compare_values_for_action(preview, action)
+    assert set(filtered) == {"baseline_run_dir", "candidate_run_dir"}
+    built = build_command(
+        loaded.commands,
+        command_id,
+        "validate",
+        filtered,
+        repository_root=tmp_path,
+    )
+    assert "--validate-only" in built.argv
+    assert "preview-id" not in built.argv
+    assert output_root not in built.argv
+
+
+@pytest.mark.parametrize(
+    ("command_id", "comparison_id", "output_root"),
+    [
+        (
+            "paired_comparison",
+            "v0_raw_minimal__lightgbm__vs__xgboost",
+            "artifacts/research_v2_comparisons",
+        ),
+        (
+            "dataset_comparison_v1",
+            "lightgbm__v0_raw_minimal__vs__v1_missingness_summary",
+            "artifacts/research_v2_dataset_comparisons",
+        ),
+    ],
+)
+def test_run_action_accepts_all_four_compare_values(
+    tmp_path: Path,
+    command_id: str,
+    comparison_id: str,
+    output_root: str,
+) -> None:
+    loaded = load_registry(PROJECT_ROOT)
+    action = loaded.commands[command_id].actions["run"]
+    baseline = _touch_run(
+        tmp_path,
+        "artifacts/research_v2/plan/pipeline/baseline",
+    )
+    candidate = _touch_run(
+        tmp_path,
+        "artifacts/research_v2/plan/pipeline/candidate",
+    )
+    preview = _preview_values(
+        baseline=baseline,
+        candidate=candidate,
+        comparison_id=comparison_id,
+        output_root=output_root,
+    )
+    filtered = filter_compare_values_for_action(preview, action)
+    assert set(filtered) == {
+        "baseline_run_dir",
+        "candidate_run_dir",
+        "comparison_id",
+        "output_root",
+    }
+    built = build_command(
+        loaded.commands,
+        command_id,
+        "run",
+        filtered,
+        repository_root=tmp_path,
+    )
+    assert comparison_id in built.argv
+    assert output_root in built.argv
+
+
+def test_action_switching_preserves_manual_id_and_filters_values() -> None:
+    loaded = load_registry(PROJECT_ROOT)
+    preview = _preview_values(
+        baseline="artifacts/research_v2/a/b/c",
+        candidate="artifacts/research_v2/d/e/f",
+        comparison_id="my-manual-comparison-id",
+        output_root="artifacts/research_v2_comparisons",
+    )
+    validate_values = filter_compare_values_for_action(
+        preview,
+        loaded.commands["paired_comparison"].actions["validate"],
+    )
+    run_values = filter_compare_values_for_action(
+        preview,
+        loaded.commands["paired_comparison"].actions["run"],
+    )
+    assert set(validate_values) == {"baseline_run_dir", "candidate_run_dir"}
+    assert run_values["comparison_id"] == "my-manual-comparison-id"
+    assert run_values["output_root"] == "artifacts/research_v2_comparisons"
+    # Switching Validate → Compare restores the same preview ID without loss.
+    restored = filter_compare_values_for_action(
+        {**validate_values, "comparison_id": preview["comparison_id"], "output_root": preview["output_root"]},
+        loaded.commands["paired_comparison"].actions["run"],
+    )
+    assert restored["comparison_id"] == "my-manual-comparison-id"
+    # Switching Compare → Validate drops ID/output again.
+    back = filter_compare_values_for_action(
+        restored,
+        loaded.commands["paired_comparison"].actions["validate"],
+    )
+    assert set(back) == {"baseline_run_dir", "candidate_run_dir"}
+
+
+def test_descriptive_scope_does_not_provide_launch_values() -> None:
+    assert is_descriptive_comparison_scope(COMPARE_SCOPE_DESCRIPTIVE) is True
+    loaded = load_registry(PROJECT_ROOT)
+    empty = filter_compare_values_for_action(
+        {},
+        loaded.commands["paired_comparison"].actions["validate"],
+    )
+    assert empty == {}
+
+
+def test_reset_suggested_id_helper_still_available() -> None:
+    # Durable/manual/reset behavior is owned by the Run Compare ID widget; the
+    # generator used after reset must remain stable and readable.
+    assert default_same_dataset_output_root() == "artifacts/research_v2_comparisons"
+    assert (
+        default_dataset_comparison_output_root()
+        == "artifacts/research_v2_dataset_comparisons"
     )

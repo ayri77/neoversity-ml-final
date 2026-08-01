@@ -139,6 +139,7 @@ from src.churn_ml.control_panel.compare_workflow import (  # noqa: E402
     default_same_dataset_output_root,
     evaluate_dataset_comparison_readiness,
     exploratory_comparison_warning,
+    filter_compare_values_for_action,
     filter_dataset_comparison_candidates,
     filter_same_dataset_candidates,
     is_descriptive_comparison_scope,
@@ -509,8 +510,10 @@ def run_page() -> None:
             compare_blocks_launch,
             compare_skip_placeholders,
             effective_command_id,
-        ) = _compare_workflow_controls(action_id=action_id)
-        values.update(compare_values)
+        ) = _compare_workflow_controls(action=action)
+        # Derive permitted values from the selected action schema so Validate
+        # never receives comparison_id/output_root as command values.
+        values.update(filter_compare_values_for_action(compare_values, action))
         dataset_driven_summary = {**compare_summary, **dataset_driven_summary}
         dataset_driven_blocks_launch = (
             dataset_driven_blocks_launch or compare_blocks_launch
@@ -616,11 +619,16 @@ def run_page() -> None:
         if action.enabled and not dataset_driven_blocks_launch and (
             not schema_blocks_launch
         ):
+            command_values = (
+                filter_compare_values_for_action(values, action)
+                if use_compare_driven
+                else values
+            )
             built = build_command(
                 loaded.commands,
                 effective_command_id,
                 action_id,
-                values,
+                command_values,
                 repository_root=REPOSITORY_ROOT,
             )
             pre_run = build_pre_run_summary(
@@ -628,7 +636,7 @@ def run_page() -> None:
                 action_id,
                 operation_label,
                 action.title,
-                values,
+                command_values,
                 REPOSITORY_ROOT,
             )
             if dataset_driven_summary:
@@ -743,11 +751,16 @@ def run_page() -> None:
         key="start-background-job",
     ):
         try:
+            launch_values = (
+                filter_compare_values_for_action(values, action)
+                if use_compare_driven
+                else values
+            )
             authorized = authorize_launch(
                 loaded.commands,
-                command_id=command_id,
+                command_id=effective_command_id,
                 action_id=action_id,
-                values=values,
+                values=launch_values,
                 repository_root=REPOSITORY_ROOT,
                 confirmed=confirmed,
                 high_risk_acknowledged=acknowledged,
@@ -757,12 +770,12 @@ def run_page() -> None:
             references = enrich_experiment_core_references(
                 authorized.references,
                 repository_root=REPOSITORY_ROOT,
-                command_id=command_id,
+                command_id=effective_command_id,
             )
             record = job_manager(loaded).start(
                 argv=authorized.argv,
                 redacted_argv=authorized.redacted_argv,
-                command_id=command_id,
+                command_id=effective_command_id,
                 action_id=action_id,
                 references=references,
             )
@@ -837,9 +850,14 @@ def _archived_research_run_paths() -> frozenset[str]:
 
 def _compare_workflow_controls(
     *,
-    action_id: str,
+    action: ActionSpec,
 ) -> tuple[dict[str, str], dict[str, str], bool, set[str], str]:
-    """Unified Compare workflow controls for the Run tab."""
+    """Unified Compare workflow controls for the Run tab.
+
+    Returns command values filtered to ``action.placeholders``. Comparison ID and
+    output root remain visible as a preview for Validate, but are only written
+    into command/logical placeholder state when the selected action declares them.
+    """
     scope_key = "compare-workflow-scope"
     scope_durable = ui_durable_key("run", "compare_scope")
     scope_values = [item[0] for item in COMPARE_SCOPE_LABELS]
@@ -1054,14 +1072,28 @@ def _compare_workflow_controls(
         baseline_path=baseline_path,
         candidate_path=candidate_path,
     )
-    values = {
+    st.caption(f"Output root: `{output_root}`")
+    if "comparison_id" not in action.placeholders:
+        st.caption(
+            "Comparison ID and output root are preview-only for Validate. "
+            "They become command values when Action is Compare."
+        )
+
+    preview_values = {
         "baseline_run_dir": baseline_path,
         "candidate_run_dir": candidate_path,
         "comparison_id": comparison_id,
         "output_root": output_root,
     }
+    values = filter_compare_values_for_action(preview_values, action)
     for name, value in values.items():
-        role = "input" if name.endswith("_dir") else "value" if name == "comparison_id" else "output"
+        role = (
+            "input"
+            if name.endswith("_dir")
+            else "value"
+            if name == "comparison_id"
+            else "output"
+        )
         if name == "output_root":
             role = "output"
         widget_key = widget_selection_key(effective_command_id, role, name)
@@ -1080,7 +1112,6 @@ def _compare_workflow_controls(
         st.text_input("Comparison ID", value=comparison_id, disabled=True)
         st.text_input("Output root", value=output_root, disabled=True)
 
-    del action_id
     return values, summary, blocks_launch, skip, effective_command_id
 
 
