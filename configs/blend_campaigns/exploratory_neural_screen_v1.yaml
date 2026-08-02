@@ -1,0 +1,59 @@
+schema_version: blend_campaign_v1
+campaign_id: exploratory_neural_screen_v1
+candidate_root: artifacts/prediction_candidates
+blend_root: artifacts/prediction_blends
+submission_root: artifacts/candidate_submissions
+
+candidates:
+  A_anchor_v3_r31: pc1_d833780dcc6565cb
+  N_v3_neuralnettorch_r31: pc1_82fd50055805314c
+
+experiments:
+  - experiment_id: baseline_a
+    candidates: [A_anchor_v3_r31, N_v3_neuralnettorch_r31]
+    strategy: manual
+    optimizer: native
+    folds: 5
+    repeats: 5
+    seed: 42
+    max_active_models: 2
+    manual_weights:
+      A_anchor_v3_r31: 1.0
+      N_v3_neuralnettorch_r31: 0.0
+    native_search: &native_search
+      pairwise_grid_step: 0.01
+      dirichlet_draws: 8
+    optuna: &optuna
+      trials: 200
+      timeout_seconds: null
+      seed: 42
+    threshold_policy: &threshold_policy
+      minimum: 0.05
+      maximum: 0.30
+      step: 0.001
+      maximizer_absolute_tolerance: 1.0e-12
+      constant_probability_fallback: 0.5
+    exploratory: true
+
+  - experiment_id: screen_a_n
+    candidates: [A_anchor_v3_r31, N_v3_neuralnettorch_r31]
+    strategy: optimized
+    optimizer: native
+    folds: 5
+    repeats: 5
+    seed: 42
+    max_active_models: 2
+    manual_weights: {}
+    native_search: *native_search
+    optuna: *optuna
+    threshold_policy: *threshold_policy
+    exploratory: true
+
+materialize_policy:
+  top_k: 0
+  experiment_ids: []
+
+submission_policy:
+  enabled: false
+  experiment_ids: []
+  id_prefix: exploratory_neural_screen_v1

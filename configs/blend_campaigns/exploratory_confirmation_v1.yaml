@@ -1,0 +1,89 @@
+schema_version: blend_campaign_v1
+campaign_id: exploratory_confirmation_v1
+candidate_root: artifacts/prediction_candidates
+blend_root: artifacts/prediction_blends
+submission_root: artifacts/candidate_submissions
+
+candidates:
+  A_anchor_v3_r31: pc1_d833780dcc6565cb
+  B_current_native_blend: pc1_c54c97e9c32f33a2
+  D_v6_lightgbmprep_r31: pc1_34ffeec20b01058f
+  H_v6_weighted_ensemble: pc1_ad1d75d8de7bd3cc
+
+experiments:
+  - experiment_id: baseline_a
+    candidates: [A_anchor_v3_r31, B_current_native_blend]
+    strategy: manual
+    optimizer: native
+    folds: 5
+    repeats: 5
+    seed: 42
+    max_active_models: 2
+    manual_weights:
+      A_anchor_v3_r31: 1.0
+      B_current_native_blend: 0.0
+    native_search: &native_search
+      pairwise_grid_step: 0.01
+      dirichlet_draws: 8
+    optuna: &optuna
+      trials: 200
+      timeout_seconds: null
+      seed: 42
+    threshold_policy: &threshold_policy
+      minimum: 0.05
+      maximum: 0.30
+      step: 0.001
+      maximizer_absolute_tolerance: 1.0e-12
+      constant_probability_fallback: 0.5
+    exploratory: true
+
+  - experiment_id: confirm_a_b
+    candidates: [A_anchor_v3_r31, B_current_native_blend]
+    strategy: optimized
+    optimizer: native
+    folds: 5
+    repeats: 5
+    seed: 42
+    max_active_models: 2
+    manual_weights: {}
+    native_search: *native_search
+    optuna: *optuna
+    threshold_policy: *threshold_policy
+    exploratory: true
+
+  - experiment_id: confirm_a_d
+    candidates: [A_anchor_v3_r31, D_v6_lightgbmprep_r31]
+    strategy: optimized
+    optimizer: native
+    folds: 5
+    repeats: 5
+    seed: 42
+    max_active_models: 2
+    manual_weights: {}
+    native_search: *native_search
+    optuna: *optuna
+    threshold_policy: *threshold_policy
+    exploratory: true
+
+  - experiment_id: confirm_a_h
+    candidates: [A_anchor_v3_r31, H_v6_weighted_ensemble]
+    strategy: optimized
+    optimizer: native
+    folds: 5
+    repeats: 5
+    seed: 42
+    max_active_models: 2
+    manual_weights: {}
+    native_search: *native_search
+    optuna: *optuna
+    threshold_policy: *threshold_policy
+    exploratory: true
+
+materialize_policy:
+  top_k: 0
+  experiment_ids: []
+
+submission_policy:
+  enabled: false
+  experiment_ids: []
+  id_prefix: exploratory_confirmation_v1
