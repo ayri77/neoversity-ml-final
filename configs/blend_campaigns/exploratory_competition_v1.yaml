@@ -4,24 +4,19 @@ candidate_root: artifacts/prediction_candidates
 blend_root: artifacts/prediction_blends
 submission_root: artifacts/candidate_submissions
 
-# Replace every TODO value with one exact immutable prediction_candidate_v1 ID.
-# A is the historical AutoGluon LightGBMPrep_r31 v3 anchor associated with the
-# external Public 0.9112 benchmark. That score is context only and is never a
-# campaign ranking or optimization input.
 candidates:
-  A: TODO_EXACT_CANDIDATE_ID_A
-  B: TODO_EXACT_CANDIDATE_ID_B
-  C: TODO_EXACT_CANDIDATE_ID_C
-  D: TODO_EXACT_CANDIDATE_ID_D
-  E: TODO_EXACT_CANDIDATE_ID_E
-  F: TODO_EXACT_CANDIDATE_ID_F
-  G: TODO_EXACT_CANDIDATE_ID_G
-  H: TODO_EXACT_CANDIDATE_ID_H
-  I: TODO_EXACT_CANDIDATE_ID_I
+  A_anchor_v3_r31: pc1_d833780dcc6565cb
+  B_current_native_blend: pc1_c54c97e9c32f33a2
+  C_v5_weighted_ensemble: pc1_8da68e3d2071fb71
+  D_v6_lightgbmprep_r31: pc1_34ffeec20b01058f
+  E_v6_lightgbmprep_r41: pc1_5f0e0dfc3434464c
+  F_v6_neuralnettorch_r37: pc1_9cff07244534e636
+  G_v6_realtabpfn_r11: pc1_ba144f24d499e09a
+  H_v6_weighted_ensemble: pc1_ad1d75d8de7bd3cc
 
 experiments:
   - experiment_id: pair_a_b
-    candidates: [A, B]
+    candidates: [A_anchor_v3_r31, B_current_native_blend]
     strategy: optimized
     optimizer: native
     folds: 5
@@ -30,8 +25,8 @@ experiments:
     max_active_models: 2
     manual_weights: {}
     native_search: &native_search
-      pairwise_grid_step: 0.1
-      dirichlet_draws: 32
+      pairwise_grid_step: 0.05
+      dirichlet_draws: 64
     optuna: &optuna
       trials: 200
       timeout_seconds: null
@@ -45,7 +40,7 @@ experiments:
     exploratory: true
 
   - experiment_id: pair_a_c
-    candidates: [A, C]
+    candidates: [A_anchor_v3_r31, C_v5_weighted_ensemble]
     strategy: optimized
     optimizer: native
     folds: 5
@@ -59,7 +54,7 @@ experiments:
     exploratory: true
 
   - experiment_id: pair_a_d
-    candidates: [A, D]
+    candidates: [A_anchor_v3_r31, D_v6_lightgbmprep_r31]
     strategy: optimized
     optimizer: native
     folds: 5
@@ -73,7 +68,7 @@ experiments:
     exploratory: true
 
   - experiment_id: pair_a_e
-    candidates: [A, E]
+    candidates: [A_anchor_v3_r31, E_v6_lightgbmprep_r41]
     strategy: optimized
     optimizer: native
     folds: 5
@@ -87,7 +82,7 @@ experiments:
     exploratory: true
 
   - experiment_id: pair_a_f
-    candidates: [A, F]
+    candidates: [A_anchor_v3_r31, F_v6_neuralnettorch_r37]
     strategy: optimized
     optimizer: native
     folds: 5
@@ -101,7 +96,7 @@ experiments:
     exploratory: true
 
   - experiment_id: pair_a_g
-    candidates: [A, G]
+    candidates: [A_anchor_v3_r31, G_v6_realtabpfn_r11]
     strategy: optimized
     optimizer: native
     folds: 5
@@ -115,57 +110,13 @@ experiments:
     exploratory: true
 
   - experiment_id: pair_a_h
-    candidates: [A, H]
+    candidates: [A_anchor_v3_r31, H_v6_weighted_ensemble]
     strategy: optimized
     optimizer: native
     folds: 5
     repeats: 2
     seed: 42
     max_active_models: 2
-    manual_weights: {}
-    native_search: *native_search
-    optuna: *optuna
-    threshold_policy: *threshold_policy
-    exploratory: true
-
-  - experiment_id: pair_a_i
-    candidates: [A, I]
-    strategy: optimized
-    optimizer: native
-    folds: 5
-    repeats: 2
-    seed: 42
-    max_active_models: 2
-    manual_weights: {}
-    native_search: *native_search
-    optuna: *optuna
-    threshold_policy: *threshold_policy
-    exploratory: true
-
-  # Triple experiments are explicit in v1. Add, remove, or replace these only
-  # before freezing a campaign; no score-driven expansion occurs at runtime.
-  - experiment_id: triple_a_b_c
-    candidates: [A, B, C]
-    strategy: optimized
-    optimizer: native
-    folds: 5
-    repeats: 2
-    seed: 42
-    max_active_models: 3
-    manual_weights: {}
-    native_search: *native_search
-    optuna: *optuna
-    threshold_policy: *threshold_policy
-    exploratory: true
-
-  - experiment_id: triple_a_d_e
-    candidates: [A, D, E]
-    strategy: optimized
-    optimizer: native
-    folds: 5
-    repeats: 2
-    seed: 42
-    max_active_models: 3
     manual_weights: {}
     native_search: *native_search
     optuna: *optuna

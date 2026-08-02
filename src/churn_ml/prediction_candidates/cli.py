@@ -26,6 +26,11 @@ from src.churn_ml.prediction_candidates.contract_v1 import (
     resolve_under_repository,
     validate_candidate_package,
 )
+from src.churn_ml.prediction_candidates.explicit_export_v1 import (
+    ExplicitExportRequest,
+    import_explicit_export_candidate,
+    validate_explicit_export,
+)
 from src.churn_ml.prediction_candidates.preparation_request_v1 import (
     PreparationRequestError,
     load_preparation_request,
@@ -41,8 +46,8 @@ EXIT_CONFLICT = 3
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Import selected AutoGluon models into immutable "
-            "prediction_candidate_v1 packages. No training, network, or UI."
+            "Import selected AutoGluon models or aligned explicit exports into "
+            "immutable prediction_candidate_v1 packages. No training, network, or UI."
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -63,6 +68,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="import selected models as canonical prediction candidates",
     )
     _add_selection_args(import_parser)
+
+    validate_explicit_parser = subparsers.add_parser(
+        "validate-explicit",
+        help="validate aligned explicit Parquet exports without loading a predictor",
+    )
+    _add_explicit_export_args(validate_explicit_parser)
+
+    import_explicit_parser = subparsers.add_parser(
+        "import-explicit",
+        help="import aligned explicit Parquet exports without loading a predictor",
+    )
+    _add_explicit_export_args(import_explicit_parser)
 
     inspect_parser = subparsers.add_parser(
         "inspect", help="inspect an existing canonical prediction candidate"
@@ -86,6 +103,24 @@ def _add_selection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", action="append", default=[], dest="models")
 
 
+def _add_explicit_export_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--oof", required=True, type=Path)
+    parser.add_argument("--test", required=True, type=Path)
+    parser.add_argument("--dataset-id", required=True)
+    parser.add_argument("--source-model-name", required=True)
+    parser.add_argument("--source-kind", required=True)
+    parser.add_argument("--source-run-path", required=True)
+    parser.add_argument("--threshold", required=True, type=float)
+    declaration = parser.add_mutually_exclusive_group(required=True)
+    declaration.add_argument("--exploratory", dest="exploratory", action="store_true")
+    declaration.add_argument(
+        "--non-exploratory", dest="exploratory", action="store_false"
+    )
+    parser.add_argument("--validation-balanced-accuracy", type=float)
+    parser.add_argument("--historical-kaggle-public-score", type=float)
+    parser.add_argument("--source-model-type", default="unavailable")
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -102,6 +137,10 @@ def main(
             return _cmd_validate(args, root)
         if args.command == "import":
             return _cmd_import(args, root)
+        if args.command == "validate-explicit":
+            return _cmd_validate_explicit(args, root)
+        if args.command == "import-explicit":
+            return _cmd_import_explicit(args, root)
         if args.command == "inspect":
             return _cmd_inspect(args, root)
     except CandidateConflictError as error:
@@ -262,6 +301,71 @@ def _cmd_import(args: argparse.Namespace, root: Path) -> int:
     _emit(payload)
     print(
         f"STATUS: imported {len(imported)} candidate package(s); _SUCCESS written last",
+        file=sys.stderr,
+    )
+    return EXIT_OK
+
+
+def _explicit_request(args: argparse.Namespace) -> ExplicitExportRequest:
+    return ExplicitExportRequest(
+        oof_path=args.oof,
+        test_path=args.test,
+        dataset_id=str(args.dataset_id),
+        source_model_name=str(args.source_model_name),
+        source_kind=str(args.source_kind),
+        source_run_path=str(args.source_run_path),
+        threshold=float(args.threshold),
+        exploratory=bool(args.exploratory),
+        validation_balanced_accuracy=args.validation_balanced_accuracy,
+        historical_kaggle_public_score=args.historical_kaggle_public_score,
+        source_model_type=str(args.source_model_type),
+    )
+
+
+def _cmd_validate_explicit(args: argparse.Namespace, root: Path) -> int:
+    result = validate_explicit_export(_explicit_request(args), repository_root=root)
+    payload = {"command": "validate-explicit", **result}
+    _emit(payload)
+    print(
+        "STATUS: explicit exports validated; no predictor loaded; read-only",
+        file=sys.stderr,
+    )
+    return EXIT_OK
+
+
+def _cmd_import_explicit(args: argparse.Namespace, root: Path) -> int:
+    package = import_explicit_export_candidate(
+        _explicit_request(args), repository_root=root
+    )
+    source_metadata = package.source_metadata
+    threshold = float(source_metadata["final_deployment_threshold"])
+    payload = {
+        "ok": True,
+        "command": "import-explicit",
+        "artifacts_written": True,
+        "candidate_id": package.candidate_id,
+        "package_path": candidate_summary(package)["package_path"],
+        "dataset_id": package.manifest["dataset_id"],
+        "target_dependency": package.manifest["target_dependency"],
+        "exploratory": bool(package.manifest["exploratory"]),
+        "source_model_name": package.manifest["source_model_name"],
+        "source_kind": package.manifest["source_kind"],
+        "oof_export": source_metadata["oof_export"],
+        "test_export": source_metadata["test_export"],
+        "train_row_count": package.manifest["train_row_count"],
+        "test_row_count": package.manifest["test_row_count"],
+        "threshold": threshold,
+        "predicted_positive_count": int(
+            (package.test["probability_positive"] >= threshold).sum()
+        ),
+        "predictor_loaded": False,
+        "predictions_generated": False,
+        "success_marker": "_SUCCESS",
+    }
+    _emit(payload)
+    print(
+        f"STATUS: imported explicit candidate {package.candidate_id}; "
+        "no predictor loaded; _SUCCESS written last",
         file=sys.stderr,
     )
     return EXIT_OK
