@@ -1,7 +1,7 @@
 {
   "schema_version": "final_artifact_manifest_v1",
-  "generated_at_utc": "2026-08-02T16:54:54.087502Z",
-  "source_git_commit": "86f90424ab775e8e5567bbe063e6164dcd21d6dd",
+  "generated_at_utc": "2026-08-02T17:35:48.621984Z",
+  "source_git_commit": "c715a5c159f99716e7c093973bd2759a865677af",
   "verification_mode": "local_immutable_artifacts",
   "artifacts": [
     {
