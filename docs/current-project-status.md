@@ -56,6 +56,15 @@ a dedicated campaign-results matrix, canonical completed-artifact handoffs for a
 Tune/Blend paths, and further deployment-result UI cleanup. No new research is
 required for submission.
 
+## Publication status
+
+The finalized feature branch `feature/prepared-dataset-pipeline-v1` is published
+to `origin`. Direct integration into the default branch `master` was intentionally
+not attempted because the complete test suite is not clean under the current local
+persisted artifact state; exact blockers are recorded in `docs/final-audit.md`.
+The pushed feature-branch URL is the submission-ready fallback. No final tag is
+created unless the finalized state is later verified on the remote default branch.
+
 ## Immediate next action
 
 Verify the rendered GitHub README and notebook, confirm the same five Kaggle
