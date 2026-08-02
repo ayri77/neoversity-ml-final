@@ -124,8 +124,13 @@ def test_results_only_selected_view_runs(panel) -> None:
         patch.object(panel, "st") as fake_st,
         patch.object(
             panel,
-            "_results_experiments_tab",
-            side_effect=lambda *a, **k: calls.append("experiments"),
+            "_results_model_runs_tab",
+            side_effect=lambda *a, **k: calls.append("model_runs"),
+        ),
+        patch.object(
+            panel,
+            "_results_entity_tab",
+            side_effect=lambda *a, **k: calls.append("entity"),
         ),
         patch.object(
             panel,
@@ -134,18 +139,13 @@ def test_results_only_selected_view_runs(panel) -> None:
         ),
         patch.object(
             panel,
-            "_results_compare_tab",
-            side_effect=lambda *a, **k: calls.append("compare"),
-        ),
-        patch.object(
-            panel,
             "_results_research_workspace_tab",
             side_effect=lambda *a, **k: calls.append("research"),
         ),
     ):
-        fake_st.session_state = {"results-active-view": "Inspect result"}
+        fake_st.session_state = {"results-active-view": "Inspect artifact"}
         fake_st.checkbox.return_value = False
-        fake_st.segmented_control.return_value = "Inspect result"
+        fake_st.segmented_control.return_value = "Inspect artifact"
         panel.results_page()
     assert calls == ["inspect"]
 

@@ -171,9 +171,12 @@ def test_results_page_has_research_workspace_tabs(
     import apps.experiment_control_panel as panel
 
     view_labels = [
-        "Experiments",
-        "Inspect result",
-        "Compare experiments",
+        "Model runs",
+        "Comparisons",
+        "Prediction candidates",
+        "Blends",
+        "Submissions",
+        "Inspect artifact",
         "Research Workspace",
     ]
     calls: list[str] = []
@@ -188,18 +191,18 @@ def test_results_page_has_research_workspace_tabs(
         patch.object(panel, "ArchiveRegistry"),
         patch.object(
             panel,
-            "_results_experiments_tab",
-            side_effect=lambda *a, **k: calls.append("Experiments"),
+            "_results_model_runs_tab",
+            side_effect=lambda *a, **k: calls.append("Model runs"),
+        ),
+        patch.object(
+            panel,
+            "_results_entity_tab",
+            side_effect=lambda *a, **k: calls.append(k.get("view_name", "entity")),
         ),
         patch.object(
             panel,
             "_results_inspect_tab",
-            side_effect=lambda *a, **k: calls.append("Inspect result"),
-        ),
-        patch.object(
-            panel,
-            "_results_compare_tab",
-            side_effect=lambda *a, **k: calls.append("Compare experiments"),
+            side_effect=lambda *a, **k: calls.append("Inspect artifact"),
         ),
         patch.object(
             panel,
@@ -464,6 +467,15 @@ def test_compatibility_shown_before_paired_comparison(
     assert summary["descriptive_only"] is False
 
     at = _load_results(monkeypatch, tmp_path)
+    assert not at.exception
+    at.segmented_control[0].set_value("Comparisons").run()
+    assert not at.exception
+    builder = next(
+        box
+        for box in at.checkbox
+        if "Research comparison builder" in str(box.label)
+    )
+    builder.check().run()
     assert not at.exception
     subheaders = [str(getattr(item, "value", item)) for item in at.subheader]
     assert (

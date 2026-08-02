@@ -30,7 +30,6 @@ from src.churn_ml.control_panel.artifacts import (  # noqa: E402
     ArtifactRecord,
     ArtifactReadError,
     artifact_selector_options,
-    build_experiment_table_rows,
     configured_artifact_file,
     comparison_rows,
     csv_preview,
@@ -230,6 +229,25 @@ from src.churn_ml.control_panel.job_summary import (  # noqa: E402
 from src.churn_ml.control_panel.mlflow_post_index import (  # noqa: E402
     DEFAULT_MLFLOW_CONFIG,
     maybe_index_successful_job,
+)
+from src.churn_ml.control_panel.results_adapters import (  # noqa: E402
+    ENTITY_VIEW_READERS,
+    adapt_artifact,
+)
+from src.churn_ml.control_panel.results_mlflow import (  # noqa: E402
+    build_mlflow_projection,
+    mlflow_projection_fingerprint,
+)
+from src.churn_ml.control_panel.results_views import (  # noqa: E402
+    entity_options,
+    filter_model_runs,
+    load_view_entities,
+    mlflow_status_map,
+    render_archive_caption,
+    render_entity_details,
+    render_entity_table,
+    render_mlflow_diagnostics,
+    select_entity,
 )
 from src.churn_ml.control_panel.placeholder_suggestions import (  # noqa: E402
     SuggestionError,
@@ -2347,8 +2365,9 @@ def results_page() -> None:
     loaded = registry()
     st.title("Results")
     st.caption(
-        "Archive hides an item from the workspace lists and charts without "
-        "moving or deleting authoritative experiment artifacts."
+        "Schema-aware entity views. Archive hides an item from workspace lists "
+        "without moving or deleting authoritative experiment artifacts. "
+        "MLflow status is read-only and never syncs from Results."
     )
     if loaded.settings.mlflow_url:
         st.link_button("Open MLflow", loaded.settings.mlflow_url)
@@ -2361,13 +2380,33 @@ def results_page() -> None:
         "Show archived", value=False, key="results-show-archived"
     )
     results_view_options = (
-        "Experiments",
-        "Inspect result",
-        "Compare experiments",
+        "Model runs",
+        "Comparisons",
+        "Prediction candidates",
+        "Blends",
+        "Submissions",
+        "Inspect artifact",
         "Research Workspace",
     )
+    # Migrate durable values from the pre-redesign Results navigation.
+    _legacy_results_view_aliases = {
+        "Experiments": "Model runs",
+        "Inspect result": "Inspect artifact",
+        "Compare experiments": "Comparisons",
+    }
     results_view_key = "results-active-view"
     results_view_durable = ui_durable_key("results", "active_view")
+    current_durable = get_durable_value(st.session_state, results_view_durable)
+    if current_durable in _legacy_results_view_aliases:
+        set_durable_value(
+            st.session_state,
+            results_view_durable,
+            _legacy_results_view_aliases[current_durable],
+        )
+    if st.session_state.get(results_view_key) in _legacy_results_view_aliases:
+        st.session_state[results_view_key] = _legacy_results_view_aliases[
+            st.session_state[results_view_key]
+        ]
     sync_widget_with_durable(
         st.session_state,
         widget_key=results_view_key,
@@ -2390,16 +2429,24 @@ def results_page() -> None:
         allowed=list(results_view_options),
     )
     with performance_stage(f"results_view:{selected_view}"):
-        if selected_view == "Experiments":
-            _results_experiments_tab(
+        if selected_view == "Model runs":
+            _results_model_runs_tab(
                 loaded, archive=archive, show_archived=show_archived
             )
-        elif selected_view == "Inspect result":
+        elif selected_view in {
+            "Comparisons",
+            "Prediction candidates",
+            "Blends",
+            "Submissions",
+        }:
+            _results_entity_tab(
+                loaded,
+                view_name=selected_view,
+                archive=archive,
+                show_archived=show_archived,
+            )
+        elif selected_view == "Inspect artifact":
             _results_inspect_tab(
-                loaded, archive=archive, show_archived=show_archived
-            )
-        elif selected_view == "Compare experiments":
-            _results_compare_tab(
                 loaded, archive=archive, show_archived=show_archived
             )
         else:
@@ -2430,6 +2477,124 @@ def _cached_discover_artifacts(
             "diagnostic": item.diagnostic,
         }
         for item in records
+    ]
+
+
+@st.cache_data(show_spinner="Loading MLflow status…")
+def _cached_mlflow_projection(root: str, fingerprint: str) -> dict[str, Any]:
+    """Cache contract: read-only MLflow projection keyed by cheap store fingerprint."""
+    del fingerprint
+    projection = build_mlflow_projection(Path(root))
+    return {
+        "store_available": projection.store_available,
+        "by_source_path": {
+            path: {
+                "run_uuid": item.run_uuid,
+                "experiment_id": item.experiment_id,
+                "experiment_name": item.experiment_name,
+                "source_type": item.source_type,
+                "source_identity": item.source_identity,
+                "source_relative_path": item.source_relative_path,
+                "source_run_id": item.source_run_id,
+                "source_key": item.source_key,
+                "status": item.status,
+                "lifecycle_stage": item.lifecycle_stage,
+            }
+            for path, item in projection.by_source_path.items()
+        },
+        "job_indexes": [
+            {
+                "job_id": item.job_id,
+                "source_type": item.source_type,
+                "artifact_path": item.artifact_path,
+                "status": item.status,
+                "message": item.message,
+                "attempted": item.attempted,
+            }
+            for item in projection.job_indexes
+        ],
+        "orphans": [
+            {
+                "run_uuid": item.run_uuid,
+                "experiment_id": item.experiment_id,
+                "experiment_name": item.experiment_name,
+                "source_type": item.source_type,
+                "source_identity": item.source_identity,
+                "source_relative_path": item.source_relative_path,
+                "source_run_id": item.source_run_id,
+                "source_key": item.source_key,
+                "status": item.status,
+                "lifecycle_stage": item.lifecycle_stage,
+            }
+            for item in projection.orphans
+        ],
+        "experiment_names": dict(projection.experiment_names),
+        "diagnostics": {
+            "indexed_local_runs": projection.diagnostics.indexed_local_runs,
+            "unindexed_eligible_runs": projection.diagnostics.unindexed_eligible_runs,
+            "failed_index_records": projection.diagnostics.failed_index_records,
+            "stale_failure_records": projection.diagnostics.stale_failure_records,
+            "orphaned_mlflow_runs": projection.diagnostics.orphaned_mlflow_runs,
+            "invalid_records": projection.diagnostics.invalid_records,
+            "store_available": projection.diagnostics.store_available,
+            "duplicate_source_identities": projection.diagnostics.duplicate_source_identities,
+        },
+    }
+
+
+def _mlflow_projection_from_cache() -> Any:
+    from src.churn_ml.control_panel.results_mlflow import (
+        JobIndexEvidence,
+        MLflowDiagnosticsSummary,
+        MLflowProjection,
+        MLflowRunEvidence,
+    )
+
+    fingerprint = mlflow_projection_fingerprint(REPOSITORY_ROOT)
+    payload = _cached_mlflow_projection(str(REPOSITORY_ROOT), fingerprint)
+    by_path = {
+        path: MLflowRunEvidence(**item)
+        for path, item in payload["by_source_path"].items()
+    }
+    by_identity: dict[str, list[Any]] = {}
+    for item in by_path.values():
+        if item.source_identity:
+            by_identity.setdefault(item.source_identity, []).append(item)
+    return MLflowProjection(
+        store_available=bool(payload["store_available"]),
+        by_source_path=by_path,
+        by_source_identity={key: tuple(value) for key, value in by_identity.items()},
+        job_indexes=tuple(
+            JobIndexEvidence(**item) for item in payload["job_indexes"]
+        ),
+        orphans=tuple(MLflowRunEvidence(**item) for item in payload["orphans"]),
+        experiment_names=dict(payload["experiment_names"]),
+        diagnostics=MLflowDiagnosticsSummary(**payload["diagnostics"]),
+    )
+
+
+def _discover_reader_artifacts(reader_id: str) -> list[ArtifactRecord]:
+    loaded = registry()
+    reader = loaded.readers[reader_id]
+    if st.session_state.pop(f"results-force-refresh-{reader_id}", None):
+        _cached_discover_artifacts.clear()
+    fingerprint = _reader_inventory_fingerprint(reader)
+    payloads = _cached_discover_artifacts(
+        str(REPOSITORY_ROOT),
+        reader_id,
+        fingerprint,
+    )
+    return [
+        ArtifactRecord(
+            reader_id=item["reader_id"],
+            root=Path(item["root"]),
+            relative_path=item["relative_path"],
+            state=item["state"],
+            summaries=item["summaries"],
+            json_payloads=item["json_payloads"],
+            diagnostic=item.get("diagnostic"),
+        )
+        for item in payloads
     ]
 
 
@@ -2542,209 +2707,211 @@ def _results_reader_select(loaded: ControlPanelRegistry, key: str) -> Any:
     return selected
 
 
+def _results_model_runs_tab(
+    loaded: ControlPanelRegistry,
+    *,
+    archive: ArchiveRegistry,
+    show_archived: bool,
+) -> None:
+    refresh = st.button("Refresh Model runs", key="results-refresh-model-runs")
+    if refresh:
+        _cached_discover_artifacts.clear()
+        _cached_mlflow_projection.clear()
+    entities, shown, archived_hidden, total = load_view_entities(
+        repository_root=REPOSITORY_ROOT,
+        loaded=loaded,
+        view_name="Model runs",
+        archive=archive,
+        show_archived=show_archived,
+        discover=_discover_reader_artifacts,
+    )
+    render_archive_caption(shown, archived_hidden, total, st)
+    projection = _mlflow_projection_from_cache()
+    mlflow_map = mlflow_status_map(entities, projection)
+    render_mlflow_diagnostics(st, projection, entities)
+
+    datasets = sorted(
+        {
+            str(entity.dataset_id.value)
+            for entity in entities
+            if entity.dataset_id.is_available()
+        }
+    )
+    models = sorted(
+        {
+            str(entity.fields["model_family"].value)
+            for entity in entities
+            if entity.fields.get("model_family") is not None
+            and entity.fields["model_family"].is_available()
+        }
+    )
+    frameworks = sorted(
+        {
+            str(entity.fields["framework"].value)
+            for entity in entities
+            if entity.fields.get("framework") is not None
+            and entity.fields["framework"].is_available()
+        }
+    )
+    states = sorted(
+        {
+            str(entity.state.value)
+            for entity in entities
+            if entity.state.is_available()
+        }
+    )
+    mlflow_states = sorted({status.status.value for status in mlflow_map.values()})
+    cols = st.columns(7)
+    run_type = cols[0].selectbox(
+        "Run type", ["All", "research_v2", "autogluon"], key="results-mr-run-type"
+    )
+    dataset = cols[1].selectbox("Dataset", ["All", *datasets], key="results-mr-dataset")
+    model_family = cols[2].selectbox(
+        "Model family", ["All", *models], key="results-mr-model"
+    )
+    framework = cols[3].selectbox(
+        "Framework", ["All", *frameworks], key="results-mr-framework"
+    )
+    state = cols[4].selectbox("State", ["All", *states], key="results-mr-state")
+    exploratory = cols[5].selectbox(
+        "Exploratory", ["All", "true", "false"], key="results-mr-exploratory"
+    )
+    mlflow_status = cols[6].selectbox(
+        "MLflow status", ["All", *mlflow_states], key="results-mr-mlflow"
+    )
+    filtered = filter_model_runs(
+        entities,
+        run_type=run_type,
+        dataset=dataset,
+        model_family=model_family,
+        framework=framework,
+        state=state,
+        exploratory=exploratory,
+        mlflow_status=mlflow_status,
+        mlflow_by_path=mlflow_map,
+    )
+    rows = render_entity_table(
+        st, "Model runs", filtered, mlflow_by_path=mlflow_map
+    )
+    if not filtered:
+        return
+    options = entity_options(filtered)
+    selected_path = st.selectbox(
+        "Inspect selected run",
+        [path for path, _ in options],
+        format_func=lambda value: next(
+            label for path, label in options if path == value
+        ),
+        key="results-mr-selected",
+    )
+    selected = select_entity(filtered, selected_path)
+    if selected is None:
+        return
+    render_entity_details(st, selected)
+    status = mlflow_map.get(selected.source_path)
+    if status is not None:
+        st.subheader("MLflow status")
+        st.write(
+            {
+                "state": status.status.value,
+                "experiment": status.experiment_name,
+                "mlflow_run_id": status.mlflow_run_id,
+                "source_path": status.source_relative_path,
+                "source_identity": status.source_identity,
+                "message": status.message,
+                "job_id": status.job_id,
+            }
+        )
+    _render_results_archive_controls(
+        artifacts=_discover_reader_artifacts(selected.reader_id),
+        reader_id=selected.reader_id,
+        archive=archive,
+        show_archived=show_archived,
+        key_prefix="results-mr",
+    )
+    del rows
+
+
+def _results_entity_tab(
+    loaded: ControlPanelRegistry,
+    *,
+    view_name: str,
+    archive: ArchiveRegistry,
+    show_archived: bool,
+) -> None:
+    refresh = st.button(f"Refresh {view_name}", key=f"results-refresh-{view_name}")
+    if refresh:
+        for reader_id in ENTITY_VIEW_READERS.get(view_name, ()):
+            st.session_state[f"results-force-refresh-{reader_id}"] = True
+        _cached_discover_artifacts.clear()
+    entities, shown, archived_hidden, total = load_view_entities(
+        repository_root=REPOSITORY_ROOT,
+        loaded=loaded,
+        view_name=view_name,
+        archive=archive,
+        show_archived=show_archived,
+        discover=_discover_reader_artifacts,
+    )
+    render_archive_caption(shown, archived_hidden, total, st)
+    render_entity_table(st, view_name, entities)
+    if entities:
+        options = entity_options(entities)
+        selected_path = st.selectbox(
+            f"Selected {view_name[:-1] if view_name.endswith('s') else view_name}",
+            [path for path, _ in options],
+            format_func=lambda value: next(
+                label for path, label in options if path == value
+            ),
+            key=f"results-entity-selected-{view_name}",
+        )
+        selected = select_entity(entities, selected_path)
+        if selected is not None:
+            render_entity_details(st, selected)
+            _render_results_archive_controls(
+                artifacts=_discover_reader_artifacts(selected.reader_id),
+                reader_id=selected.reader_id,
+                archive=archive,
+                show_archived=show_archived,
+                key_prefix=f"results-{view_name}",
+            )
+    if view_name == "Comparisons":
+        st.divider()
+        st.subheader("Research comparison builder")
+        st.caption(
+            "Builds official Research v2 paired comparisons only. "
+            "Candidates, blends, submissions, and recorded comparison packages "
+            "are never passed into Research fingerprint compatibility."
+        )
+        # Keep recorded-comparison browsing fast: load the Research builder only
+        # when explicitly requested (Streamlit still executes expander bodies).
+        if st.checkbox(
+            "Open Research comparison builder",
+            value=False,
+            key="results-open-research-compare-builder",
+        ):
+            _results_compare_tab(
+                loaded,
+                archive=archive,
+                show_archived=show_archived,
+                research_only=True,
+            )
+        else:
+            st.info(
+                "Recorded comparison packages are shown above. "
+                "Enable the builder to select Research v2 runs for official "
+                "Paired Comparison preparation."
+            )
+
+
 def _results_experiments_tab(
     loaded: ControlPanelRegistry,
     *,
     archive: ArchiveRegistry,
     show_archived: bool,
 ) -> None:
-    reader_id = _results_reader_select(loaded, "results-experiments-reader")
-    artifacts = _visible_results_artifacts(
-        loaded, reader_id, archive=archive, show_archived=show_archived
-    )
-    if not artifacts:
-        st.info("No artifacts match this configured reader and visibility filter.")
-        return
+    """Backward-compatible alias used by older tests; routes to Model runs."""
+    _results_model_runs_tab(loaded, archive=archive, show_archived=show_archived)
 
-    rows = build_experiment_table_rows(artifacts, repo_root=REPOSITORY_ROOT)
-    archived_keys = archive.archived_artifact_keys()
-    for row in rows:
-        path = str(row.get("Artifact path") or "")
-        if (reader_id, path) in archived_keys:
-            status = str(row.get("Status") or "")
-            row["Status"] = f"archived · {status}" if status else "archived"
-    datasets = sorted(
-        {
-            str(row["Dataset"])
-            for row in rows
-            if row.get("Dataset") not in {None, "", "Not available"}
-        }
-    )
-    models = sorted(
-        {str(row["Model"]) for row in rows if row["Model"] != "Not available"}
-    )
-    modes = sorted({str(row["Mode"]) for row in rows if row["Mode"] != "Not available"})
-    statuses = sorted({str(row["Status"]) for row in rows})
-
-    filter_cols = st.columns(5)
-    dataset_key = f"results-exp-filter-dataset-{reader_id}"
-    model_key = f"results-exp-filter-model-{reader_id}"
-    mode_key = f"results-exp-filter-mode-{reader_id}"
-    status_key = f"results-exp-filter-status-{reader_id}"
-    search_key = f"results-exp-filter-search-{reader_id}"
-    dataset_options = ["All", *datasets]
-    model_options = ["All", *models]
-    mode_options = ["All", *modes]
-    status_options = ["All", *statuses]
-    sync_widget_with_durable(
-        st.session_state,
-        widget_key=dataset_key,
-        durable_key=ui_durable_key("results", "filter", reader_id, "dataset"),
-        allowed=dataset_options,
-        default="All",
-    )
-    sync_widget_with_durable(
-        st.session_state,
-        widget_key=model_key,
-        durable_key=ui_durable_key("results", "filter", reader_id, "model"),
-        allowed=model_options,
-        default="All",
-    )
-    sync_widget_with_durable(
-        st.session_state,
-        widget_key=mode_key,
-        durable_key=ui_durable_key("results", "filter", reader_id, "mode"),
-        allowed=mode_options,
-        default="All",
-    )
-    sync_widget_with_durable(
-        st.session_state,
-        widget_key=status_key,
-        durable_key=ui_durable_key("results", "filter", reader_id, "status"),
-        allowed=status_options,
-        default="All",
-    )
-    sync_widget_with_durable(
-        st.session_state,
-        widget_key=search_key,
-        durable_key=ui_durable_key("results", "filter", reader_id, "search"),
-        allowed=None,
-        default="",
-    )
-    selected_dataset = filter_cols[0].selectbox(
-        "Dataset",
-        dataset_options,
-        key=dataset_key,
-    )
-    selected_model = filter_cols[1].selectbox(
-        "Model",
-        model_options,
-        key=model_key,
-    )
-    selected_mode = filter_cols[2].selectbox(
-        "Mode",
-        mode_options,
-        key=mode_key,
-    )
-    selected_status = filter_cols[3].selectbox(
-        "Status",
-        status_options,
-        key=status_key,
-    )
-    search = filter_cols[4].text_input(
-        "Search experiment/config",
-        key=search_key,
-    )
-    remember_durable_value(
-        st.session_state,
-        durable_key=ui_durable_key("results", "filter", reader_id, "dataset"),
-        value=selected_dataset,
-        allowed=dataset_options,
-    )
-    remember_durable_value(
-        st.session_state,
-        durable_key=ui_durable_key("results", "filter", reader_id, "model"),
-        value=selected_model,
-        allowed=model_options,
-    )
-    remember_durable_value(
-        st.session_state,
-        durable_key=ui_durable_key("results", "filter", reader_id, "mode"),
-        value=selected_mode,
-        allowed=mode_options,
-    )
-    remember_durable_value(
-        st.session_state,
-        durable_key=ui_durable_key("results", "filter", reader_id, "status"),
-        value=selected_status,
-        allowed=status_options,
-    )
-    remember_durable_value(
-        st.session_state,
-        durable_key=ui_durable_key("results", "filter", reader_id, "search"),
-        value=search,
-        allowed=None,
-    )
-
-    filtered = []
-    for row in rows:
-        if selected_dataset != "All" and row.get("Dataset") != selected_dataset:
-            continue
-        if selected_model != "All" and row["Model"] != selected_model:
-            continue
-        if selected_mode != "All" and row["Mode"] != selected_mode:
-            continue
-        if selected_status != "All" and row["Status"] != selected_status:
-            continue
-        if search:
-            needle = search.lower()
-            haystack = " ".join(
-                str(row.get(key, ""))
-                for key in (
-                    "Dataset",
-                    "Parent dataset",
-                    "Experiment",
-                    "Model",
-                    "Mode",
-                    "Artifact path",
-                )
-            ).lower()
-            if needle not in haystack:
-                continue
-        filtered.append(row)
-
-    display_columns = [
-        "Dataset",
-        "Parent dataset",
-        "Target dependency",
-        "Features",
-        "Model",
-        "Mode",
-        "Experiment",
-        "Created date",
-        "Created time",
-        "Balanced Accuracy",
-        "Sensitivity",
-        "Specificity",
-        "ROC AUC",
-        "Average Precision",
-        "Brier score",
-        "Threshold median",
-        "Status",
-        "Artifact path",
-    ]
-    display_rows = [{key: row.get(key) for key in display_columns} for row in filtered]
-    if not display_rows:
-        st.info("No experiments match the current filters.")
-    else:
-        st.dataframe(
-            display_rows,
-            width="stretch",
-            hide_index=True,
-        )
-        st.caption(
-            "Select one or more rows when Streamlit selection is available. "
-            "Artifact path is technical metadata only."
-        )
-
-    _render_experiment_charts(filtered)
-    _render_results_archive_controls(
-        artifacts=artifacts,
-        reader_id=reader_id,
-        archive=archive,
-        show_archived=show_archived,
-        key_prefix="results-exp",
-    )
 
 
 def _render_results_archive_controls(
@@ -2984,9 +3151,16 @@ def _results_inspect_tab(
     st.write(f"Status: `{selected.state}`")
     if selected.diagnostic:
         st.warning(selected.diagnostic)
+    archived = (reader_id, selected.relative_path) in archive.archived_artifact_keys()
+    entity = adapt_artifact(
+        selected, repository_root=REPOSITORY_ROOT, archived=archived
+    )
+    if entity is not None:
+        render_entity_details(st, entity)
+        st.subheader("Raw configured summaries")
     if reader_id == "research_v2":
         _render_dataset_identity_summary(selected.root)
-    elif reader_id == "research_v2_comparisons":
+    elif reader_id == "paired_comparison":
         try:
             baseline_ds, candidate_ds = read_paired_comparison_datasets(selected.root)
             st.subheader("Comparison datasets")
@@ -3003,7 +3177,10 @@ def _results_inspect_tab(
     if selected.summaries:
         st.dataframe(
             [
-                {"field": key, "value": "" if value is None else str(value)}
+                {
+                    "field": key,
+                    "value": "None" if value is None else str(value),
+                }
                 for key, value in selected.summaries.items()
             ],
             width="stretch",
@@ -3089,8 +3266,20 @@ def _results_compare_tab(
     *,
     archive: ArchiveRegistry,
     show_archived: bool,
+    research_only: bool = False,
 ) -> None:
-    reader_id = _results_reader_select(loaded, "results-compare-reader")
+    if research_only:
+        reader_id = "research_v2"
+        st.caption("Artifact type locked to Experiment Core v2 runs.")
+    else:
+        reader_id = _results_reader_select(loaded, "results-compare-reader")
+        if reader_id != "research_v2":
+            st.warning(
+                "Research fingerprint compatibility and Paired Comparison preparation "
+                "apply only to Research v2 runs. Select Experiment Core v2 runs, or use "
+                "the recorded Comparisons entity view for comparison packages."
+            )
+            return
     reader = loaded.readers[reader_id]
     artifacts = _visible_results_artifacts(
         loaded, reader_id, archive=archive, show_archived=show_archived

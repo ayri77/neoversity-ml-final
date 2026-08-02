@@ -21,6 +21,11 @@ readers:
         fields:
           Threshold median: "median"
           Threshold IQR: "interquartile_range"
+      - path: "run_metadata.json"
+        fields:
+          Run ID: "run_id"
+          Started: "started_at_utc"
+          Adapter: "candidate_adapter_id"
     csv_previews: ["metrics/repeats.csv", "metrics/outer_folds.csv"]
     log_files: []
     compare_fields:
@@ -32,6 +37,36 @@ readers:
       - "Brier score"
       - "Threshold median"
       - "Threshold IQR"
+
+  - id: autogluon_v1
+    title: AutoGluon standalone runs
+    artifact_roots: ["artifacts/autogluon_runs"]
+    discovery_glob: "*"
+    success_markers: ["_SUCCESS"]
+    failure_markers: ["_FAILED"]
+    summary_files:
+      - path: "run_metadata.json"
+        fields:
+          Run ID: "run_id"
+          Dataset version: "dataset_version"
+          Profile: "profile_id"
+          Seed: "requested_seed"
+          Duration seconds: "duration_seconds"
+          Started: "started_at_utc"
+      - path: "execution_status.json"
+        fields:
+          Execution status: "status"
+      - path: "inspection/summary.json"
+        fields:
+          Best model: "best_model"
+          Decision threshold: "decision_threshold"
+    csv_previews: ["inspection/leaderboard.csv"]
+    log_files: []
+    compare_fields:
+      - "Dataset version"
+      - "Profile"
+      - "Best model"
+      - "Decision threshold"
 
   - id: research_v1
     title: Research evaluation v1 runs
