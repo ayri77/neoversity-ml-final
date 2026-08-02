@@ -5,6 +5,10 @@ Disabled by default. Enable with environment variable
 
 Captured data stays in-process (session dict / console). Nothing is written
 under repository ``artifacts/``.
+
+``begin_render()`` resets *current-render* stage/counter state. Session
+cumulative totals remain available separately so multi-rerun profiles do not
+inflate the current-render total.
 """
 
 from __future__ import annotations
@@ -23,10 +27,14 @@ except Exception:  # pragma: no cover - Streamlit optional outside UI extra
 
 _ENV_FLAG = "CHURN_ML_CONTROL_PANEL_PERF"
 _ENABLED = False
-_STAGES: list["StageRecord"] = []
-_COUNTERS: dict[str, int] = {}
+_CURRENT_STAGES: list["StageRecord"] = []
+_CURRENT_COUNTERS: dict[str, int] = {}
+_CUMULATIVE_STAGES: list["StageRecord"] = []
+_CUMULATIVE_COUNTERS: dict[str, int] = {}
 _STACK: list[str] = []
+_ACTIVE: list["_ActiveStage"] = []
 _RENDER_STARTED: float | None = None
+_RENDER_COUNT = 0
 
 
 @dataclass
@@ -54,9 +62,6 @@ class _ActiveStage:
     parent: str | None = None
 
 
-_ACTIVE: list[_ActiveStage] = []
-
-
 def performance_enabled() -> bool:
     if _ENABLED:
         return True
@@ -70,20 +75,29 @@ def enable_performance(enabled: bool = True) -> None:
 
 
 def reset_performance() -> None:
-    """Clear in-memory stage/counter state without changing the enable flag."""
-    _STAGES.clear()
-    _COUNTERS.clear()
+    """Clear current and cumulative in-memory state without changing enable."""
+    _CURRENT_STAGES.clear()
+    _CURRENT_COUNTERS.clear()
+    _CUMULATIVE_STAGES.clear()
+    _CUMULATIVE_COUNTERS.clear()
     _STACK.clear()
     _ACTIVE.clear()
-    global _RENDER_STARTED
+    global _RENDER_STARTED, _RENDER_COUNT
     _RENDER_STARTED = None
+    _RENDER_COUNT = 0
 
 
 def begin_render() -> None:
+    """Start a new render and reset current-render stages/counters only."""
     if not performance_enabled():
         return
-    global _RENDER_STARTED
+    global _RENDER_STARTED, _RENDER_COUNT
+    _CURRENT_STAGES.clear()
+    _CURRENT_COUNTERS.clear()
+    _STACK.clear()
+    _ACTIVE.clear()
     _RENDER_STARTED = time.perf_counter()
+    _RENDER_COUNT += 1
 
 
 def record_counter(name: str, count: int = 1) -> None:
@@ -92,7 +106,8 @@ def record_counter(name: str, count: int = 1) -> None:
     if count == 0:
         return
     key = str(name)
-    _COUNTERS[key] = int(_COUNTERS.get(key, 0)) + int(count)
+    _CURRENT_COUNTERS[key] = int(_CURRENT_COUNTERS.get(key, 0)) + int(count)
+    _CUMULATIVE_COUNTERS[key] = int(_CUMULATIVE_COUNTERS.get(key, 0)) + int(count)
     if _ACTIVE:
         current = _ACTIVE[-1]
         if key.endswith("_files_inspected") or key == "files_inspected":
@@ -143,56 +158,78 @@ def performance_stage(name: str) -> Iterator[None]:
         elapsed_ms = (time.perf_counter() - stage.started) * 1000.0
         _ACTIVE.pop()
         _STACK.pop()
-        _STAGES.append(
-            StageRecord(
-                name=stage.name,
-                elapsed_ms=elapsed_ms,
-                files_inspected=stage.files_inspected,
-                files_read=stage.files_read,
-                bytes_read=stage.bytes_read,
-                cache_hits=stage.cache_hits,
-                cache_misses=stage.cache_misses,
-                parent=stage.parent,
-            )
+        record = StageRecord(
+            name=stage.name,
+            elapsed_ms=elapsed_ms,
+            files_inspected=stage.files_inspected,
+            files_read=stage.files_read,
+            bytes_read=stage.bytes_read,
+            cache_hits=stage.cache_hits,
+            cache_misses=stage.cache_misses,
+            parent=stage.parent,
         )
+        _CURRENT_STAGES.append(record)
+        _CUMULATIVE_STAGES.append(record)
 
 
 def performance_snapshot() -> dict[str, Any]:
-    """Return a redacted in-memory snapshot suitable for UI/console diagnostics."""
+    """Return a redacted snapshot with current-render and cumulative sections."""
     total_ms: float | None = None
     if _RENDER_STARTED is not None:
         total_ms = (time.perf_counter() - _RENDER_STARTED) * 1000.0
-    aggregated = _aggregate_stages(_STAGES)
     return {
         "enabled": performance_enabled(),
+        "current": {
+            "total_render_ms": total_ms,
+            "stages": _aggregate_stages(_CURRENT_STAGES),
+            "counters": dict(sorted(_CURRENT_COUNTERS.items())),
+        },
+        "cumulative": {
+            "renders": _RENDER_COUNT,
+            "stages": _aggregate_stages(_CUMULATIVE_STAGES),
+            "counters": dict(sorted(_CUMULATIVE_COUNTERS.items())),
+        },
+        # Backward-compatible aliases emphasize the current render.
         "total_render_ms": total_ms,
-        "stages": aggregated,
-        "counters": dict(sorted(_COUNTERS.items())),
+        "stages": _aggregate_stages(_CURRENT_STAGES),
+        "counters": dict(sorted(_CURRENT_COUNTERS.items())),
     }
 
 
 def format_performance_snapshot(snapshot: Mapping[str, Any] | None = None) -> str:
     data = dict(snapshot or performance_snapshot())
+    current = dict(data.get("current") or {})
+    cumulative = dict(data.get("cumulative") or {})
     lines = [
         f"enabled={data.get('enabled')}",
-        f"total_render_ms={_fmt_ms(data.get('total_render_ms'))}",
+        "",
+        "Current render",
+        "--------------",
+        f"total_render_ms={_fmt_ms(current.get('total_render_ms', data.get('total_render_ms')))}",
         "stages:",
     ]
-    for stage in data.get("stages") or []:
-        lines.append(
-            "  - "
-            f"{stage.get('name')}: {_fmt_ms(stage.get('elapsed_ms'))} ms "
-            f"(calls={stage.get('call_count', 0)}, "
-            f"files_inspected={stage.get('files_inspected', 0)}, "
-            f"files_read={stage.get('files_read', 0)}, "
-            f"bytes_read={stage.get('bytes_read', 0)}, "
-            f"cache_hits={stage.get('cache_hits', 0)}, "
-            f"cache_misses={stage.get('cache_misses', 0)})"
-        )
-    counters = data.get("counters") or {}
+    for stage in current.get("stages") or data.get("stages") or []:
+        lines.append(_format_stage_line(stage))
+    counters = current.get("counters") or data.get("counters") or {}
     if counters:
         lines.append("counters:")
         for key, value in counters.items():
+            lines.append(f"  - {key}: {value}")
+    lines.extend(
+        [
+            "",
+            "Session cumulative",
+            "------------------",
+            f"renders={cumulative.get('renders', 0)}",
+            "stages:",
+        ]
+    )
+    for stage in cumulative.get("stages") or []:
+        lines.append(_format_stage_line(stage))
+    cum_counters = cumulative.get("counters") or {}
+    if cum_counters:
+        lines.append("counters:")
+        for key, value in cum_counters.items():
             lines.append(f"  - {key}: {value}")
     return "\n".join(lines)
 
@@ -206,6 +243,19 @@ def render_performance_expander(streamlit_module: Any | None = None) -> None:
         return
     with st.expander("Performance diagnostics", expanded=False):
         st.code(format_performance_snapshot(), language="text")
+
+
+def _format_stage_line(stage: Mapping[str, Any]) -> str:
+    return (
+        "  - "
+        f"{stage.get('name')}: {_fmt_ms(stage.get('elapsed_ms'))} ms "
+        f"(calls={stage.get('call_count', 0)}, "
+        f"files_inspected={stage.get('files_inspected', 0)}, "
+        f"files_read={stage.get('files_read', 0)}, "
+        f"bytes_read={stage.get('bytes_read', 0)}, "
+        f"cache_hits={stage.get('cache_hits', 0)}, "
+        f"cache_misses={stage.get('cache_misses', 0)})"
+    )
 
 
 def _aggregate_stages(stages: list[StageRecord]) -> list[dict[str, Any]]:

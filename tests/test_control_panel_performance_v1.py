@@ -61,6 +61,7 @@ def test_disabled_profiler_has_negligible_behavior() -> None:
 
 def test_stages_record_elapsed_when_enabled() -> None:
     perf.enable_performance(True)
+    perf.begin_render()
     with perf.performance_stage("candidate_discovery"):
         total = 0
         for index in range(1000):
@@ -71,10 +72,12 @@ def test_stages_record_elapsed_when_enabled() -> None:
     assert snap["stages"][0]["name"] == "candidate_discovery"
     assert snap["stages"][0]["elapsed_ms"] >= 0.0
     assert snap["stages"][0]["call_count"] == 1
+    assert snap["current"]["stages"][0]["name"] == "candidate_discovery"
 
 
 def test_nested_stages_remain_valid() -> None:
     perf.enable_performance(True)
+    perf.begin_render()
     with perf.performance_stage("outer"):
         with perf.performance_stage("inner"):
             perf.record_counter("files_inspected", 2)
@@ -87,9 +90,31 @@ def test_nested_stages_remain_valid() -> None:
 
 def test_counters_aggregate_correctly() -> None:
     perf.enable_performance(True)
+    perf.begin_render()
     perf.record_counter("candidate_manifest_reads", 2)
     perf.record_counter("candidate_manifest_reads", 3)
     assert perf.performance_snapshot()["counters"]["candidate_manifest_reads"] == 5
+
+
+def test_begin_render_resets_current_but_keeps_cumulative() -> None:
+    perf.enable_performance(True)
+    perf.begin_render()
+    with perf.performance_stage("first"):
+        perf.record_counter("files_read", 1)
+    first = perf.performance_snapshot()
+    assert first["current"]["counters"]["files_read"] == 1
+    perf.begin_render()
+    with perf.performance_stage("second"):
+        perf.record_counter("files_read", 2)
+    second = perf.performance_snapshot()
+    assert second["current"]["counters"]["files_read"] == 2
+    assert "first" not in {item["name"] for item in second["current"]["stages"]}
+    assert second["cumulative"]["renders"] == 2
+    assert second["cumulative"]["counters"]["files_read"] == 3
+    assert {item["name"] for item in second["cumulative"]["stages"]} == {
+        "first",
+        "second",
+    }
 
 
 def test_snapshots_contain_no_arbitrary_sensitive_values(tmp_path: Path) -> None:

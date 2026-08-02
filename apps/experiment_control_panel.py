@@ -93,19 +93,14 @@ from src.churn_ml.control_panel.blend_workspace import (  # noqa: E402
     apply_canonical_submission_handoff,
     authorized_submission_argv_values,
     load_validated_submission_csv_bytes,
-    readiness_label,
     resolve_canonical_submission_handoff,
     suggest_submission_id,
-)
-from src.churn_ml.control_panel.fs_signatures import (  # noqa: E402
-    path_stat_mapping,
 )
 from src.churn_ml.control_panel.performance import (  # noqa: E402
     begin_render,
     enable_performance,
     performance_enabled,
     performance_stage,
-    record_counter,
     render_performance_expander,
 )
 from src.churn_ml.prediction_candidates.contract_v1 import (  # noqa: E402
@@ -121,8 +116,10 @@ from src.churn_ml.control_panel.deployment_candidates import (  # noqa: E402
     evaluate_deployment_readiness,
     list_deployment_candidates,
 )
-from src.churn_ml.prediction_candidates.submission_v1 import (  # noqa: E402
-    evaluate_submission_readiness,
+from src.churn_ml.control_panel.submission_eligibility import (  # noqa: E402
+    eligibility_cache_fingerprint,
+    eligibility_label,
+    project_candidate_submission_eligibility,
 )
 from src.churn_ml.control_panel.deployment_draft_builder import (  # noqa: E402
     DEFAULT_EXCEPTION_REASON,
@@ -1267,36 +1264,16 @@ def _compare_id_widget(
 
 
 @st.cache_data(show_spinner=False)
-def _cached_selected_submission_readiness(
+def _cached_selected_submission_eligibility(
     root: str,
     candidate_id: str,
     fingerprint: str,
 ) -> dict[str, Any]:
+    """Cache contract: cheap eligibility projection keyed by metadata stats."""
     del fingerprint
-    return evaluate_submission_readiness(
+    return project_candidate_submission_eligibility(
         candidate_id, repository_root=Path(root)
-    )
-
-
-def _selected_candidate_readiness_fingerprint(candidate_id: str) -> str:
-    package_dir = (
-        REPOSITORY_ROOT / "artifacts" / "prediction_candidates" / candidate_id
-    )
-    return json.dumps(
-        {
-            "candidate_id": candidate_id,
-            "manifest": path_stat_mapping(
-                package_dir / CANDIDATE_MANIFEST_FILENAME, relative="manifest"
-            ),
-            "success": path_stat_mapping(
-                package_dir / "_SUCCESS", relative="success"
-            ),
-            "source_metadata": path_stat_mapping(
-                package_dir / "source_metadata.json", relative="source_metadata"
-            ),
-        },
-        sort_keys=True,
-    )
+    ).to_mapping()
 
 
 def _canonical_candidate_submission_controls(
@@ -1309,7 +1286,7 @@ def _canonical_candidate_submission_controls(
     st.subheader("Canonical prediction candidate")
     if st.button("Refresh candidates", key="canonical-refresh-candidates"):
         load_cached_candidate_inventory(REPOSITORY_ROOT, force_refresh=True)
-        _cached_selected_submission_readiness.clear()
+        _cached_selected_submission_eligibility.clear()
     with performance_stage("run_canonical_candidate_inventory"):
         rows = load_cached_candidate_inventory(REPOSITORY_ROOT)
     if not rows:
@@ -1346,42 +1323,61 @@ def _canonical_candidate_submission_controls(
         allowed=options,
     )
     selected = next(row for row in rows if row["candidate_id"] == selected_id)
-    with performance_stage("run_selected_readiness"):
-        readiness = _cached_selected_submission_readiness(
-            str(REPOSITORY_ROOT),
-            selected_id,
-            _selected_candidate_readiness_fingerprint(selected_id),
-        )
-        record_counter("selected_readiness_evaluations", 1)
+    fingerprint = eligibility_cache_fingerprint(
+        selected_id, repository_root=REPOSITORY_ROOT
+    )
+    eligibility = _cached_selected_submission_eligibility(
+        str(REPOSITORY_ROOT),
+        selected_id,
+        fingerprint,
+    )
+    blend_id = eligibility.get("blend_id") or (
+        None if handoff is None else handoff.get("blend_id")
+    )
     st.write(
         {
-            "Model / Blend": selected.get("label"),
-            "Dataset": selected.get("dataset_label") or selected.get("dataset_id"),
-            "Source": selected.get("source_kind_label"),
-            "Final threshold": readiness.get("threshold"),
-            "Exploratory": selected.get("exploratory"),
-            "Readiness": readiness_label(str(readiness.get("state") or "blocked")),
+            "Candidate": selected.get("label") or selected_id,
+            "Source type": selected.get("source_kind_label")
+            or eligibility.get("source_kind"),
+            "Dataset": selected.get("dataset_label")
+            or eligibility.get("dataset_id")
+            or selected.get("dataset_id"),
+            "Recorded threshold": eligibility.get("threshold"),
+            "Recorded test rows": eligibility.get("test_row_count"),
+            "Blend ID": blend_id,
+            "Metadata eligibility": eligibility_label(
+                str(eligibility.get("state") or "blocked_before_generation")
+            ),
+            "Strict validation": "Runs inside generation Job",
+            "Exploratory": bool(
+                eligibility.get("exploratory", selected.get("exploratory"))
+            ),
         }
     )
+    st.caption(str(eligibility.get("note") or ""))
     with st.expander("Technical details", expanded=False):
         st.json(
             {
                 "candidate_id": selected_id,
-                "manifest_sha256": selected.get("manifest_sha256"),
-                "blend_id": None if handoff is None else handoff.get("blend_id"),
+                "blend_id": blend_id,
+                "parent_candidate_ids": list(
+                    eligibility.get("parent_candidate_ids") or []
+                ),
+                "strict_validation_required": True,
+                "eligibility": eligibility,
             }
         )
-    if selected.get("exploratory"):
+    if eligibility.get("exploratory") or selected.get("exploratory"):
         st.warning(
             "This candidate is exploratory and must remain visibly exploratory "
             "downstream."
         )
-    if readiness.get("blockers"):
-        st.error("Submission readiness blockers")
-        for blocker in readiness["blockers"]:
+    for warning in eligibility.get("warnings") or []:
+        st.warning(f"`{warning.get('code')}`: {warning.get('message')}")
+    if eligibility.get("blockers"):
+        st.error("Metadata eligibility blockers")
+        for blocker in eligibility["blockers"]:
             st.write(f"- `{blocker.get('code')}`: {blocker.get('message')}")
-    with st.expander("Technical details", expanded=False):
-        st.json(readiness)
 
     suggested = suggest_submission_id(
         str(selected.get("label") or selected_id), candidate_id=selected_id
@@ -1401,7 +1397,14 @@ def _canonical_candidate_submission_controls(
     )
     consumed = st.session_state.setdefault("_consumed_launch_nonces", set())
 
-    if st.button("Validate readiness", key="canonical-validate-readiness"):
+    if st.button(
+        "Validate readiness (Job)",
+        key="canonical-validate-readiness",
+        help=(
+            "Starts a Job that runs full strict readiness in a subprocess. "
+            "Ordinary UI reruns never perform that validation."
+        ),
+    ):
         try:
             built = build_command(
                 loaded.commands,
@@ -1436,17 +1439,17 @@ def _canonical_candidate_submission_controls(
         except (LaunchAuthorizationError, JobError, CommandBuildError) as error:
             st.error(str(error))
 
-    ready = bool(readiness.get("ready"))
+    eligible = bool(eligibility.get("eligible_to_attempt"))
     ack = st.checkbox(
         "I explicitly acknowledge local competition-test submission generation "
         "(no upload).",
         key="canonical-submission-ack",
-        disabled=not ready,
+        disabled=not eligible,
     )
     if st.button(
         "Generate submission",
         type="primary",
-        disabled=not ready or not ack or action_id == "validate",
+        disabled=not eligible or not ack or action_id == "validate",
         key="canonical-generate-submission",
     ):
         try:

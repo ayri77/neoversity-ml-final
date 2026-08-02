@@ -34,7 +34,7 @@ def test_canonical_submission_skips_research_inventory(panel) -> None:
         registry.assert_not_called()
 
 
-def test_canonical_checkbox_reuses_cached_readiness(panel) -> None:
+def test_canonical_checkbox_uses_cached_eligibility_not_strict(panel) -> None:
     row = {
         "candidate_id": "pc1_demo",
         "label": "Demo",
@@ -44,23 +44,37 @@ def test_canonical_checkbox_reuses_cached_readiness(panel) -> None:
         "exploratory": False,
         "manifest_sha256": "abc",
     }
-    readiness = {
-        "state": "ready",
-        "ready": True,
+    eligibility = {
+        "candidate_id": "pc1_demo",
+        "state": "eligible_to_attempt",
+        "eligible_to_attempt": True,
+        "source_kind": "autogluon_standalone_v1",
+        "exploratory": False,
         "threshold": 0.17,
+        "test_row_count": 2500,
+        "dataset_id": "v0_raw_minimal",
+        "blend_id": None,
+        "parent_candidate_ids": [],
         "blockers": [],
+        "warnings": [],
+        "strict_validation_required": True,
+        "note": "Metadata checks passed.",
     }
     with (
         patch.object(panel, "load_cached_candidate_inventory", return_value=[row]),
         patch.object(
             panel,
-            "_cached_selected_submission_readiness",
-            return_value=readiness,
+            "_cached_selected_submission_eligibility",
+            return_value=eligibility,
         ) as cached,
         patch.object(
             panel,
-            "evaluate_submission_readiness",
-            side_effect=AssertionError("strict readiness should be cached"),
+            "eligibility_cache_fingerprint",
+            return_value="fp",
+        ),
+        patch(
+            "src.churn_ml.prediction_candidates.submission_v1.evaluate_submission_readiness",
+            side_effect=AssertionError("strict readiness must not run on UI reruns"),
         ),
         patch.object(panel, "st") as fake_st,
     ):

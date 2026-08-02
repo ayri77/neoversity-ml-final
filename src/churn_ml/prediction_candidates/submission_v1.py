@@ -147,6 +147,25 @@ def evaluate_submission_readiness(
     require_blend_artifact: bool = True,
 ) -> dict[str, Any]:
     """Evaluate whether a canonical prediction candidate can produce a submission."""
+    readiness, _package = _evaluate_submission_readiness_with_package(
+        candidate_id,
+        repository_root=repository_root,
+        candidates_root_relative=candidates_root_relative,
+        blend_root_relative=blend_root_relative,
+        require_blend_artifact=require_blend_artifact,
+    )
+    return readiness
+
+
+def _evaluate_submission_readiness_with_package(
+    candidate_id: str,
+    *,
+    repository_root: Path,
+    candidates_root_relative: str | None = None,
+    blend_root_relative: str | None = None,
+    require_blend_artifact: bool = True,
+) -> tuple[dict[str, Any], Any | None]:
+    """Strict readiness plus the validated package when load succeeds."""
     root = repository_root.resolve()
     blockers: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
@@ -165,15 +184,18 @@ def evaluate_submission_readiness(
                 "message": str(error),
             }
         )
-        return {
-            "state": "blocked",
-            "ready": False,
-            "candidate_id": candidate_id,
-            "threshold": None,
-            "warnings": warnings,
-            "blockers": blockers,
-            "competition_identity": {},
-        }
+        return (
+            {
+                "state": "blocked",
+                "ready": False,
+                "candidate_id": candidate_id,
+                "threshold": None,
+                "warnings": warnings,
+                "blockers": blockers,
+                "competition_identity": {},
+            },
+            None,
+        )
 
     if not (package.package_dir / "_SUCCESS").is_file():
         blockers.append(
@@ -367,18 +389,25 @@ def evaluate_submission_readiness(
                     )
 
     ready = not blockers
-    return {
-        "state": "ready" if ready else "blocked",
-        "ready": ready,
-        "candidate_id": candidate_id,
-        "threshold": None if threshold is None or not np.isfinite(threshold) else float(threshold),
-        "warnings": warnings,
-        "blockers": blockers,
-        "competition_identity": competition_identity,
-        "source_kind": manifest.get("source_kind"),
-        "exploratory": bool(manifest.get("exploratory")),
-        "blend_id": source_metadata.get("blend_id"),
-    }
+    return (
+        {
+            "state": "ready" if ready else "blocked",
+            "ready": ready,
+            "candidate_id": candidate_id,
+            "threshold": (
+                None
+                if threshold is None or not np.isfinite(threshold)
+                else float(threshold)
+            ),
+            "warnings": warnings,
+            "blockers": blockers,
+            "competition_identity": competition_identity,
+            "source_kind": manifest.get("source_kind"),
+            "exploratory": bool(manifest.get("exploratory")),
+            "blend_id": source_metadata.get("blend_id"),
+        },
+        package,
+    )
 
 
 def _atomic_write_bytes(path: Path, raw: bytes) -> None:
@@ -425,26 +454,21 @@ def generate_candidate_submission(
             f"Unsafe submission_id: {submission_id!r}",
             reason_code="submission_id_invalid",
         )
-    readiness = evaluate_submission_readiness(
+    readiness, package = _evaluate_submission_readiness_with_package(
         candidate_id,
         repository_root=root,
         candidates_root_relative=candidates_root_relative,
         blend_root_relative=blend_root_relative,
         require_blend_artifact=True,
     )
-    if not readiness["ready"]:
+    if not readiness["ready"] or package is None:
         raise CandidateSubmissionError(
             "Candidate is not submission-ready: "
             + "; ".join(item["message"] for item in readiness["blockers"]),
             reason_code="submission_not_ready",
         )
 
-    package = _load_package(
-        candidate_id,
-        repository_root=root,
-        candidates_root_relative=candidates_root_relative,
-    )
-    validate_candidate_package(package, repository_root=root)
+    # Package already loaded and validated by one complete strict readiness pass.
     threshold = extract_final_deployment_threshold(package.source_metadata)
     if threshold is None:
         raise CandidateSubmissionError(
