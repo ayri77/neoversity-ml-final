@@ -257,7 +257,8 @@ def test_discover_valid_succeeded_search_without_session(repo: Path) -> None:
     assert saved.max_active_models == 3
     assert saved.optimizer_backend == "native"
     assert saved.honest_mean_balanced_accuracy is not None
-    assert "LGB" in " ".join(saved.candidate_labels)
+    joined = " ".join(saved.candidate_labels)
+    assert "LightGBMPrep_r31" in joined or "LGB" in joined
     assert all(not label.startswith("pc1_") for label in saved.candidate_labels)
     assert saved.search_result is not None
     assert "honest_meta_cv_metrics" in saved.search_result

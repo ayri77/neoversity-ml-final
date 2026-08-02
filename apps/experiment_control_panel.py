@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from collections import Counter
 from dataclasses import replace
@@ -201,6 +202,22 @@ from src.churn_ml.control_panel.jobs import (  # noqa: E402
     JobError,
     JobManager,
 )
+from src.churn_ml.control_panel.job_logs import (  # noqa: E402
+    INLINE_RENDER_MAX_BYTES,
+    format_log_window_status,
+    inspect_job_log,
+    job_log_download_bytes,
+    read_job_log_full,
+    read_job_log_head,
+    read_job_log_tail,
+    resolve_job_log_path,
+)
+from src.churn_ml.control_panel.job_summary import (  # noqa: E402
+    build_job_summary,
+    lightweight_job_list_label,
+    resolve_job_references,
+    summary_cache_fingerprint,
+)
 from src.churn_ml.control_panel.mlflow_post_index import (  # noqa: E402
     DEFAULT_MLFLOW_CONFIG,
     maybe_index_successful_job,
@@ -259,6 +276,23 @@ def job_primary_label(
     """Label adapter used by Dashboard and Jobs ``_job_label``."""
     if repository_root is not None:
         set_presentation_repository_root(repository_root)
+    cheap = lightweight_job_list_label(record_job)
+    if cheap:
+        created = record_job.get("created_at_utc")
+        suffix_parts: list[str] = []
+        if isinstance(created, str) and created:
+            date_label = format_date(created)
+            time_label = format_time(created)
+            if date_label and date_label not in {"—", "Invalid timestamp"}:
+                suffix_parts.append(date_label)
+            if time_label:
+                suffix_parts.append(time_label)
+        job_id = record_job.get("job_id")
+        if isinstance(job_id, str) and len(job_id) >= 8:
+            suffix_parts.append(job_id[:8])
+        if suffix_parts:
+            return f"{cheap} · {' · '.join(suffix_parts)}"
+        return cheap
     return _IMPORTED_JOB_PRIMARY_LABEL(record_job, record_commands)
 
 
@@ -1268,13 +1302,21 @@ def _canonical_candidate_submission_controls(
     st.write(
         {
             "Model / Blend": selected.get("label"),
+            "Dataset": selected.get("dataset_label") or selected.get("dataset_id"),
             "Source": selected.get("source_kind_label"),
-            "Dataset": selected.get("dataset_id"),
             "Final threshold": readiness.get("threshold"),
             "Exploratory": selected.get("exploratory"),
             "Readiness": readiness_label(str(readiness.get("state") or "blocked")),
         }
     )
+    with st.expander("Technical details", expanded=False):
+        st.json(
+            {
+                "candidate_id": selected_id,
+                "manifest_sha256": selected.get("manifest_sha256"),
+                "blend_id": None if handoff is None else handoff.get("blend_id"),
+            }
+        )
     if selected.get("exploratory"):
         st.warning(
             "This candidate is exploratory and must remain visibly exploratory "
@@ -1791,23 +1833,6 @@ def jobs_page() -> None:
     created = record.job.get("created_at_utc")
     columns[2].metric("Date", format_date(created))
     columns[3].metric("Time", format_time(created))
-    references = record.job.get("references")
-    if isinstance(references, Mapping) and (
-        references.get("dataset_id")
-        or references.get("experiment_id")
-        or references.get("plan_id")
-        or references.get("config")
-    ):
-        st.markdown(
-            "  \n".join(
-                [
-                    f"**Dataset ID:** `{references.get('dataset_id') or 'Not available'}`",
-                    f"**Experiment ID:** `{references.get('experiment_id') or 'Not available'}`",
-                    f"**Plan ID:** `{references.get('plan_id') or 'Not available'}`",
-                    f"**Config:** `{references.get('config') or 'Not available'}`",
-                ]
-            )
-        )
     if status.get("diagnostic"):
         st.warning(str(status["diagnostic"]))
     index_result = _maybe_post_index_job(loaded, record)
@@ -1827,33 +1852,33 @@ def jobs_page() -> None:
                 "separately without changing job status."
                 + (f" ({index_result.message})" if index_result.message else "")
             )
-    with st.expander("Technical details", expanded=False):
+    summary_tab, stdout_tab, stderr_tab, references_tab, technical_tab = st.tabs(
+        ["Summary", "stdout", "stderr", "References", "Technical details"]
+    )
+    with summary_tab:
+        _render_job_structured_summary(record)
+    with stdout_tab:
+        _render_job_log_viewer(
+            record,
+            log_name="stdout.log",
+            default_lines=loaded.settings.log_tail_lines,
+        )
+    with stderr_tab:
+        _render_job_log_viewer(
+            record,
+            log_name="stderr.log",
+            default_lines=loaded.settings.log_tail_lines,
+        )
+    with references_tab:
+        _render_job_references(record)
+    with technical_tab:
         st.json(dict(record.job), expanded=False)
         st.caption(
             f"PID: {status.get('pid') or '—'}  |  "
             f"Exit code: {status.get('exit_code') if status.get('exit_code') is not None else '—'}"
         )
-    with st.expander("Technical command", expanded=False):
-        st.code(display_argv(tuple(record.command["argv"])), language="python")
-    stdout, stderr = st.tabs(["stdout", "stderr"])
-    with stdout:
-        st.code(
-            text_tail(
-                record.root / "stdout.log",
-                lines=loaded.settings.log_tail_lines,
-            )
-            or "(empty)",
-            language="text",
-        )
-    with stderr:
-        st.code(
-            text_tail(
-                record.root / "stderr.log",
-                lines=loaded.settings.log_tail_lines,
-            )
-            or "(empty)",
-            language="text",
-        )
+        with st.expander("Technical command", expanded=False):
+            st.code(display_argv(tuple(record.command["argv"])), language="python")
     if loaded.settings.allow_process_stop and status["state"] == "running":
         stop_confirmed = st.checkbox(
             "I confirm that I want to stop this process group."
@@ -1884,6 +1909,228 @@ def _job_label_with_archive(
 ) -> str:
     label = _job_label(record, commands=commands)
     return f"[archived] {label}" if archived else label
+
+
+@st.cache_data(show_spinner=False)
+def _cached_job_summary(
+    fingerprint: str,
+    job_json: str,
+    status_json: str,
+    job_root: str,
+    repository_root: str,
+) -> dict[str, Any]:
+    del fingerprint
+    summary = build_job_summary(
+        job=json.loads(job_json),
+        status=json.loads(status_json),
+        job_root=Path(job_root),
+        repository_root=Path(repository_root),
+    )
+    return {
+        "title": summary.title,
+        "status": summary.status,
+        "rows": list(summary.rows),
+        "tables": [(name, list(rows)) for name, rows in summary.tables],
+        "notes": list(summary.notes),
+        "technical": dict(summary.technical),
+        "available": summary.available,
+        "pending": summary.pending,
+    }
+
+
+def _render_job_structured_summary(record: Any) -> None:
+    stdout_info = inspect_job_log(Path(record.root) / "stdout.log")
+    state = str(record.status.get("state") or "")
+    fingerprint = summary_cache_fingerprint(
+        job=record.job,
+        status=record.status,
+        stdout_size=stdout_info.size_bytes,
+        stdout_mtime_ns=stdout_info.modified_at_ns,
+    )
+    if state in {"running", "queued", "starting"} or not stdout_info.exists:
+        summary = build_job_summary(
+            job=record.job,
+            status=record.status,
+            job_root=Path(record.root),
+            repository_root=REPOSITORY_ROOT,
+        )
+        payload = {
+            "title": summary.title,
+            "status": summary.status,
+            "rows": list(summary.rows),
+            "tables": [(name, list(rows)) for name, rows in summary.tables],
+            "notes": list(summary.notes),
+            "technical": dict(summary.technical),
+            "available": summary.available,
+            "pending": summary.pending,
+        }
+    else:
+        payload = _cached_job_summary(
+            fingerprint,
+            json.dumps(dict(record.job), sort_keys=True, default=str),
+            json.dumps(dict(record.status), sort_keys=True, default=str),
+            str(Path(record.root)),
+            str(REPOSITORY_ROOT),
+        )
+    st.subheader(str(payload.get("title") or "Summary"))
+    if not payload.get("available", True):
+        st.warning("Structured summary unavailable")
+    elif payload.get("pending"):
+        st.info("Structured summary not available yet")
+    for key, value in payload.get("rows") or []:
+        if value is None:
+            continue
+        st.write(f"**{key}:** {value}")
+    for table_name, rows in payload.get("tables") or []:
+        if not rows:
+            continue
+        st.markdown(f"#### {table_name}")
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    for note in payload.get("notes") or []:
+        st.caption(note)
+    technical = payload.get("technical") or {}
+    if technical.get("optuna_study_summaries"):
+        with st.expander("Optuna study details", expanded=False):
+            st.json(technical.get("optuna_study_summaries"), expanded=False)
+    with st.expander("Technical details", expanded=False):
+        st.json(technical, expanded=False)
+
+
+def _render_job_log_viewer(
+    record: Any,
+    *,
+    log_name: str,
+    default_lines: int,
+) -> None:
+    job_id = str(record.job_id)
+    try:
+        path = resolve_job_log_path(record.root, log_name)
+    except Exception as error:  # noqa: BLE001
+        st.error(str(error))
+        return
+    info = inspect_job_log(path)
+    relative = f"artifacts/ui_jobs/{job_id}/{log_name}"
+    st.write(
+        {
+            "File": relative,
+            "Size": f"{info.size_bytes:,} bytes" if info.exists else "missing",
+            "Total lines": info.line_count if info.exists else 0,
+            "Last modified": info.modified_at_ns if info.exists else "—",
+        }
+    )
+    if not info.exists:
+        st.info(f"{log_name} is missing.")
+        return
+    mode = st.radio(
+        "View mode",
+        ("Last N lines", "First N lines", "Full log"),
+        horizontal=True,
+        key=f"jobs-{job_id}-{log_name}-mode",
+    )
+    line_choices = [100, 300, 1000, 3000]
+    initial = default_lines if default_lines in line_choices else 300
+    n_lines = st.selectbox(
+        "N",
+        line_choices,
+        index=line_choices.index(initial),
+        key=f"jobs-{job_id}-{log_name}-n",
+    )
+    download_name = f"{job_id}-{log_name}"
+    st.download_button(
+        f"Download full {log_name}",
+        data=job_log_download_bytes(path),
+        file_name=download_name,
+        mime="text/plain",
+        key=f"jobs-{job_id}-{log_name}-download",
+    )
+    st.caption(f"Local path: `{relative}`")
+    if mode == "Full log":
+        if info.size_bytes > INLINE_RENDER_MAX_BYTES:
+            st.warning(
+                f"Full log is {info.size_bytes:,} bytes ({info.line_count:,} lines). "
+                "Rendering it inline may slow the browser. Download remains complete."
+            )
+            ack = st.checkbox(
+                "I understand and want to render the full log inline",
+                key=f"jobs-{job_id}-{log_name}-full-ack",
+            )
+            if not ack:
+                st.info(
+                    format_log_window_status(
+                        mode="full",
+                        requested_lines=info.line_count,
+                        total_lines=info.line_count,
+                        rendered_lines=0,
+                    )
+                    + " · inline render deferred"
+                )
+                return
+        content = read_job_log_full(path)
+        st.caption(
+            format_log_window_status(
+                mode="full",
+                requested_lines=info.line_count,
+                total_lines=info.line_count,
+                rendered_lines=info.line_count,
+            )
+        )
+        st.code(content or "(empty)", language="text")
+        return
+    if mode == "First N lines":
+        content = read_job_log_head(path, n_lines)
+        rendered = min(n_lines, info.line_count)
+        st.caption(
+            format_log_window_status(
+                mode="first",
+                requested_lines=n_lines,
+                total_lines=info.line_count,
+                rendered_lines=rendered,
+            )
+        )
+        st.code(content or "(empty)", language="text")
+        return
+    content = read_job_log_tail(path, n_lines)
+    rendered = min(n_lines, info.line_count)
+    st.caption(
+        format_log_window_status(
+            mode="last",
+            requested_lines=n_lines,
+            total_lines=info.line_count,
+            rendered_lines=rendered,
+        )
+    )
+    st.code(content or "(empty)", language="text")
+
+
+def _render_job_references(record: Any) -> None:
+    resolved = resolve_job_references(record.job, repository_root=REPOSITORY_ROOT)
+    candidates = resolved.get("candidates") or []
+    if candidates:
+        st.markdown("**Candidates:**")
+        for index, label in enumerate(candidates, start=1):
+            st.write(f"{index}. {label}")
+    parents = resolved.get("parents") or []
+    if parents:
+        st.markdown("**Parents:**")
+        for index, label in enumerate(parents, start=1):
+            st.write(f"{index}. {label}")
+    selected_models = resolved.get("selected_models") or []
+    if selected_models:
+        st.markdown("**Selected models:**")
+        for index, label in enumerate(selected_models, start=1):
+            st.write(f"{index}. {label}")
+    if resolved.get("source_model_name"):
+        st.write(f"**Source model:** {resolved['source_model_name']}")
+    if resolved.get("blend_id"):
+        st.write(f"**Blend ID:** `{resolved['blend_id']}`")
+    if resolved.get("request_id"):
+        st.write(f"**Request ID:** `{resolved['request_id']}`")
+    with st.expander("Technical references", expanded=False):
+        technical = resolved.get("technical") or {}
+        for key, value in technical.items():
+            st.write(f"`{key}`: `{value}`")
+        if not technical:
+            st.caption("No technical references recorded for this job.")
 
 
 def _render_job_archive_controls(

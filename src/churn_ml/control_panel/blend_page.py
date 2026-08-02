@@ -36,6 +36,15 @@ from src.churn_ml.control_panel.blend_workspace import (
     run_diversity,
     selection_fingerprint,
 )
+from src.churn_ml.control_panel.candidate_display import (
+    candidate_display_map,
+    disambiguate_compact_labels,
+    project_candidate_quality_rows,
+    project_optuna_study_rows,
+    project_pairwise_rows,
+    project_weight_rows,
+    resolve_candidate_display,
+)
 from src.churn_ml.control_panel.candidate_preparation_page import (
     render_prepare_candidates_tab,
 )
@@ -267,8 +276,8 @@ def _render_candidate_inventory(rows: list[dict[str, Any]]) -> None:
         [
             {
                 "Model": row.get("label"),
+                "Dataset": row.get("dataset_label") or row.get("dataset_id"),
                 "Source": row.get("source_kind_label"),
-                "Dataset": row.get("dataset_id"),
                 "Metric": row.get("source_metric_value"),
                 "Exploratory": row.get("exploratory"),
                 "OOF protocol": row.get("oof_protocol"),
@@ -401,23 +410,30 @@ def _render_diversity(repository_root: Path, selected_ids: list[str]) -> None:
         "Candidate metrics below are descriptive. You remain responsible for "
         "candidate selection; highly correlated candidates are not removed automatically."
     )
+    displays = candidate_display_map(selected_ids, repository_root=repository_root)
     quality = result.get("candidate_quality") or result.get("candidate_metrics") or []
     if quality:
         st.markdown("#### Candidate quality")
-        st.dataframe(pd.DataFrame(quality), width="stretch", hide_index=True)
+        st.dataframe(
+            pd.DataFrame(project_candidate_quality_rows(quality, displays)),
+            width="stretch",
+            hide_index=True,
+        )
     pairwise = result.get("pairwise") or result.get("pairwise_analysis") or []
     if pairwise:
         st.markdown("#### Pairwise diversity")
-        frame = pd.DataFrame(pairwise)
+        unique_labels = disambiguate_compact_labels(list(displays.values()))
+        projected = project_pairwise_rows(
+            pairwise, displays, unique_labels=unique_labels
+        )
+        frame = pd.DataFrame(projected)
         st.dataframe(frame, width="stretch", hide_index=True)
-        if px is not None and {"candidate_a", "candidate_b", "pearson_correlation"}.issubset(
-            set(frame.columns)
-        ):
+        if px is not None and {"Model A", "Model B", "Pearson"}.issubset(set(frame.columns)):
             try:
                 heat = frame.pivot(
-                    index="candidate_a",
-                    columns="candidate_b",
-                    values="pearson_correlation",
+                    index="Model A",
+                    columns="Model B",
+                    values="Pearson",
                 )
                 st.plotly_chart(
                     px.imshow(heat, title="Pearson correlation"),
@@ -916,17 +932,31 @@ def _render_search_result(result: Mapping[str, Any], rows: list[dict[str, Any]])
     weights = result.get("final_deployment_weights") or (
         (result.get("deployment") or {}).get("weights")
     )
-    labels = {
-        str(row["candidate_id"]): str(row.get("label") or row["candidate_id"])
+    metadata_by_id = {
+        str(row["candidate_id"]): {
+            "candidate_id": row.get("candidate_id"),
+            "source_model_name": row.get("source_model_name"),
+            "source_kind": row.get("source_kind"),
+            "dataset_id": row.get("dataset_id"),
+            "exploratory": row.get("exploratory"),
+        }
         for row in rows
     }
+    candidate_ids = [str(item) for item in (result.get("candidate_ids") or [])]
+    if not candidate_ids and isinstance(weights, Mapping):
+        candidate_ids = [str(key) for key in weights]
+    displays = candidate_display_map(
+        candidate_ids or list(metadata_by_id),
+        metadata_by_id=metadata_by_id,
+    )
     if isinstance(weights, Mapping):
-        st.write(
-            {
-                labels.get(str(key), str(key)): value
-                for key, value in weights.items()
-            }
+        st.dataframe(
+            pd.DataFrame(project_weight_rows(weights, displays)),
+            width="stretch",
+            hide_index=True,
         )
+        with st.expander("Technical details — weight order", expanded=False):
+            st.json(dict(weights))
     st.write(
         {
             "Final threshold": result.get("final_deployment_threshold")
@@ -940,7 +970,12 @@ def _render_search_result(result: Mapping[str, Any], rows: list[dict[str, Any]])
     if result.get("optuna_study_summaries"):
         with st.expander("Optuna study details", expanded=False):
             summaries = list(result["optuna_study_summaries"])[:20]
-            st.dataframe(pd.DataFrame(summaries), width="stretch", hide_index=True)
+            projected = project_optuna_study_rows(
+                summaries, displays, candidate_ids
+            )
+            st.dataframe(pd.DataFrame(projected), width="stretch", hide_index=True)
+            with st.expander("Technical Optuna summaries", expanded=False):
+                st.json(summaries)
 
 
 def _render_materialize_controls(
@@ -1036,20 +1071,41 @@ def _render_materialize_controls(
         blend_id = str(payload.get("blend_id") or "")
         loaded = load_blend_artifact(blend_id, repository_root=repository_root)
         st.success("Blend materialized and strictly validated.")
+        candidate_id = str(payload.get("canonical_candidate_id") or "")
+        displays = candidate_display_map(
+            list(request.candidate_ids), repository_root=repository_root
+        )
+        weights = loaded.get("final_deployment_weights")
         st.write(
             {
                 "Blend ID": blend_id,
-                "Candidate": payload.get("canonical_candidate_id"),
+                "Candidate": (
+                    resolve_candidate_display(
+                        candidate_id, repository_root=repository_root
+                    ).primary_label
+                    if candidate_id
+                    else None
+                ),
                 "Honest score": (loaded.get("honest_meta_cv_metrics") or {}).get(
                     "mean_repeat_balanced_accuracy"
                 ),
-                "Final weights": loaded.get("final_deployment_weights"),
                 "Final threshold": loaded.get("final_deployment_threshold"),
                 "Exploratory": (loaded.get("manifest") or {}).get("exploratory"),
                 "Submission readiness": loaded.get("submission_readiness"),
             }
         )
-        candidate_id = str(payload.get("canonical_candidate_id") or "")
+        st.dataframe(
+            pd.DataFrame(project_weight_rows(weights, displays)),
+            width="stretch",
+            hide_index=True,
+        )
+        with st.expander("Technical details", expanded=False):
+            st.json(
+                {
+                    "canonical_candidate_id": candidate_id,
+                    "final_deployment_weights": weights,
+                }
+            )
         if candidate_id and st.button("Prepare submission", key=_state_key("handoff")):
             package_dir = resolve_under_repository(
                 f"artifacts/prediction_candidates/{candidate_id}",
@@ -1086,30 +1142,40 @@ def _render_materialized_blends(repository_root: Path) -> None:
     if not blends:
         st.caption("No materialized canonical blends found.")
         return
-    frame = pd.DataFrame(
-        [
+    materialized_rows: list[dict[str, Any]] = []
+    for item in blends:
+        parent_ids = list(item.get("candidate_ids") or [])
+        parent_displays = candidate_display_map(parent_ids, repository_root=repository_root)
+        parent_models = " + ".join(
+            parent_displays[cid].compact_label
+            if cid in parent_displays
+            else cid
+            for cid in parent_ids
+        )
+        materialized_rows.append(
             {
                 "Blend": item.get("label") or item.get("blend_id"),
-                "Parents": len(item.get("candidate_ids") or []),
+                "Parents": len(parent_ids),
+                "Parent models": parent_models,
                 "Optimizer": item.get("optimizer_backend"),
                 "Honest BA": (
                     (item.get("honest_meta_cv_metrics") or {}).get(
                         "mean_repeat_balanced_accuracy"
                     )
                 ),
-                "Final threshold": item.get("final_deployment_threshold"),
-                "Exploratory": item.get("exploratory"),
-                "Submission readiness": (
-                    (item.get("submission_readiness") or {}).get("state")
+                "Threshold": item.get("final_deployment_threshold"),
+                "Submission readiness": readiness_label(
+                    str(
+                        (item.get("submission_readiness") or {}).get("state")
+                        or "unknown"
+                    )
                 ),
                 "Created": item.get("created_at_utc"),
-                "Status": item.get("status"),
                 "Blend ID": item.get("blend_id"),
+                "Canonical candidate ID": item.get("canonical_candidate_id"),
             }
-            for item in blends
-        ]
-    )
-    st.dataframe(frame, width="stretch", hide_index=True)
+        )
+    st.dataframe(pd.DataFrame(materialized_rows), width="stretch", hide_index=True)
     options = [
         str(item["blend_id"])
         for item in blends
@@ -1131,7 +1197,43 @@ def _render_materialized_blends(repository_root: Path) -> None:
         ),
     )
     chosen = next(item for item in blends if item.get("blend_id") == selected)
-    st.write(chosen.get("summary") or chosen)
+    parent_ids = list(chosen.get("candidate_ids") or [])
+    parent_displays = candidate_display_map(parent_ids, repository_root=repository_root)
+    loaded = chosen.get("loaded") or {}
+    weights = loaded.get("final_deployment_weights") or chosen.get(
+        "final_deployment_weights"
+    )
+    st.markdown("#### Parent weights")
+    st.dataframe(
+        pd.DataFrame(project_weight_rows(weights, parent_displays)),
+        width="stretch",
+        hide_index=True,
+    )
+    canonical_id = chosen.get("canonical_candidate_id")
+    if canonical_id:
+        st.write(
+            {
+                "Canonical candidate": resolve_candidate_display(
+                    str(canonical_id), repository_root=repository_root
+                ).primary_label,
+                "Honest BA": (
+                    (chosen.get("honest_meta_cv_metrics") or {}).get(
+                        "mean_repeat_balanced_accuracy"
+                    )
+                ),
+                "Threshold": chosen.get("final_deployment_threshold"),
+            }
+        )
+    with st.expander("Technical details", expanded=False):
+        st.json(
+            {
+                "blend_id": chosen.get("blend_id"),
+                "canonical_candidate_id": canonical_id,
+                "candidate_ids": parent_ids,
+                "final_deployment_weights": weights,
+                "manifest_sha256": chosen.get("manifest_sha256"),
+            }
+        )
     if chosen.get("canonical_candidate_id") and st.button(
         "Prepare submission from selected blend",
         key=_state_key("handoff_existing"),

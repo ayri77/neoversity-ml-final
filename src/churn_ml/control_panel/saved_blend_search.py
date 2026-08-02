@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -20,6 +19,10 @@ from src.churn_ml.control_panel.blend_workspace import (
     list_jobs_for_request,
     parse_job_stdout_json,
     verify_search_result,
+)
+from src.churn_ml.control_panel.candidate_display import (
+    compact_model_name,
+    resolve_candidate_display,
 )
 from src.churn_ml.control_panel.selection_state import (
     get_durable_value,
@@ -39,14 +42,6 @@ BLEND_COMMAND_ID = "prediction_blend_v1"
 DURABLE_LOADED_CONFIG_KEY = "prediction_blend_v1::loaded_config"
 DURABLE_LOAD_PENDING_KEY = "prediction_blend_v1::load_pending"
 NUMERIC_COMPARE_TOLERANCE = 1.0e-12
-
-_SHORT_MODEL = re.compile(
-    r"^(?P<family>LightGBMPrep|NeuralNetTorch|RealTabPFN(?:-v2)?|XGBoost|"
-    r"CatBoost|ExtraTrees(?:Gini)?|WeightedEnsemble)"
-    r"(?:[_-](?P<tag>r?\d+|L\d+|c\d+))?",
-    re.IGNORECASE,
-)
-
 
 @dataclass(frozen=True)
 class SavedBlendSearch:
@@ -95,27 +90,21 @@ class SavedBlendSearch:
 
 
 def short_model_label(model_name: str, *, dataset_id: str | None = None) -> str:
-    text = str(model_name or "model")
-    match = _SHORT_MODEL.match(text)
-    if not match:
-        short = text.replace("_BAG_L1", "").replace("_BAG_L2", "")
-    else:
-        family = match.group("family")
-        tag = match.group("tag")
-        aliases = {
-            "LightGBMPrep": "LGB",
-            "NeuralNetTorch": "NNT",
-            "RealTabPFN-v2": "RealTabPFN",
-            "RealTabPFN": "RealTabPFN",
-            "WeightedEnsemble": "WeightedEnsemble",
-            "ExtraTreesGini": "ExtraTrees",
+    """History/table model fragment backed by the central display resolver."""
+    if "WeightedEnsemble" in str(model_name or ""):
+        version = ""
+        if dataset_id and str(dataset_id).startswith("v"):
+            version = str(dataset_id).split("_", 1)[0]
+        return f"WeightedEnsemble {version}".strip()
+    display = resolve_candidate_display(
+        {
+            "candidate_id": "pc1_0000000000000000",
+            "source_model_name": model_name,
+            "source_kind": "autogluon_standalone_v1",
+            "dataset_id": dataset_id or "",
         }
-        short = aliases.get(family, family)
-        if tag:
-            short = f"{short} {tag}"
-    if dataset_id and str(dataset_id).startswith("v") and "WeightedEnsemble" in short:
-        return f"{dataset_id.split('_')[0]} {short}"
-    return short
+    )
+    return compact_model_name(display.model_name or model_name)
 
 
 def experiment_label_for(
@@ -336,17 +325,22 @@ def _project_search_job(
                 candidate_datasets.append("")
                 manifest_hashes.append("")
                 continue
-            summary = {
-                "source_model_name": package.manifest.get("source_model_name"),
-                "source_kind": package.manifest.get("source_kind"),
-                "dataset_id": package.manifest.get("dataset_id"),
-            }
+            display = resolve_candidate_display(
+                {
+                    "candidate_id": candidate_id,
+                    "source_model_name": package.manifest.get("source_model_name"),
+                    "source_kind": package.manifest.get("source_kind"),
+                    "dataset_id": package.manifest.get("dataset_id"),
+                    "source_metadata": package.source_metadata,
+                    "exploratory": package.manifest.get("exploratory"),
+                }
+            )
             label = short_model_label(
-                str(summary.get("source_model_name") or candidate_id),
-                dataset_id=str(summary.get("dataset_id") or "") or None,
+                display.model_name or candidate_id,
+                dataset_id=display.dataset_id or None,
             )
             candidate_labels.append(label)
-            candidate_datasets.append(str(summary.get("dataset_id") or ""))
+            candidate_datasets.append(str(display.dataset_id or ""))
             package_dir = resolve_under_repository(
                 f"artifacts/prediction_candidates/{candidate_id}",
                 repository_root,

@@ -15,6 +15,11 @@ from src.churn_ml.control_panel.blend_workspace import (
     list_jobs_for_request,
     parse_job_stdout_json,
 )
+from src.churn_ml.control_panel.candidate_display import (
+    candidate_display_map,
+    project_weight_rows,
+    resolve_candidate_display,
+)
 from src.churn_ml.control_panel.command_builder import build_command
 from src.churn_ml.control_panel.jobs import JobError, JobManager
 from src.churn_ml.control_panel.launch import (
@@ -441,19 +446,40 @@ def _render_saved_search_actions(
                 )
             return
         st.success("Blend materialized and strictly validated.")
+        candidate_id = str(payload.get("canonical_candidate_id") or "")
+        displays = candidate_display_map(
+            list(saved.candidate_ids), repository_root=repository_root
+        )
+        weights = loaded.get("final_deployment_weights")
         st.write(
             {
                 "Blend ID": blend_id,
-                "Canonical candidate": payload.get("canonical_candidate_id"),
+                "Canonical candidate": (
+                    resolve_candidate_display(
+                        candidate_id, repository_root=repository_root
+                    ).primary_label
+                    if candidate_id
+                    else None
+                ),
                 "Honest BA": (loaded.get("honest_meta_cv_metrics") or {}).get(
                     "mean_repeat_balanced_accuracy"
                 ),
-                "Final weights": loaded.get("final_deployment_weights"),
                 "Final threshold": loaded.get("final_deployment_threshold"),
                 "Submission readiness": loaded.get("submission_readiness"),
             }
         )
-        candidate_id = str(payload.get("canonical_candidate_id") or "")
+        st.dataframe(
+            pd.DataFrame(project_weight_rows(weights, displays)),
+            width="stretch",
+            hide_index=True,
+        )
+        with st.expander("Technical details", expanded=False):
+            st.json(
+                {
+                    "canonical_candidate_id": candidate_id,
+                    "final_deployment_weights": weights,
+                }
+            )
         if candidate_id and st.button(
             "Prepare submission",
             key=_state_key(f"handoff_{saved.request_id}"),

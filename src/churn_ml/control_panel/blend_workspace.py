@@ -33,6 +33,9 @@ from src.churn_ml.control_panel.blend_ui_request_v1 import (
     materialize_blend_ui_request,
     validate_candidate_ids,
 )
+from src.churn_ml.control_panel.candidate_display import (
+    resolve_candidate_display,
+)
 from src.churn_ml.control_panel.command_builder import SAFE_STRING
 from src.churn_ml.prediction_candidates.contract_v1 import (
     MANIFEST_FILENAME,
@@ -131,40 +134,42 @@ def readiness_label(state: str) -> str:
 
 
 def candidate_display_label(summary: Mapping[str, Any]) -> str:
-    model = str(summary.get("source_model_name") or summary.get("model") or "Unknown model")
-    kind = source_kind_label(str(summary.get("source_kind") or ""))
-    dataset = str(summary.get("dataset_id") or "unknown dataset")
-    return f"{model} · {kind} · {dataset}"
+    return resolve_candidate_display(summary).primary_label
 
 
-def blend_display_label(manifest_or_summary: Mapping[str, Any]) -> str:
-    settings = manifest_or_summary.get("settings") or {}
-    strategy = str(settings.get("strategy") or manifest_or_summary.get("strategy") or "")
-    optimizer = str(
-        settings.get("optimizer_backend")
-        or manifest_or_summary.get("optimizer_backend")
-        or ""
+def blend_display_label(
+    manifest_or_summary: Mapping[str, Any],
+    *,
+    repository_root: Path | str | None = None,
+) -> str:
+    display = resolve_candidate_display(
+        {
+            "candidate_id": manifest_or_summary.get("canonical_candidate_id")
+            or manifest_or_summary.get("candidate_id")
+            or "",
+            "source_model_name": manifest_or_summary.get("source_model_name")
+            or (
+                f"blend_"
+                f"{manifest_or_summary.get('strategy') or (manifest_or_summary.get('settings') or {}).get('strategy') or 'optimized'}_"
+                f"{manifest_or_summary.get('optimizer_backend') or (manifest_or_summary.get('settings') or {}).get('optimizer_backend') or 'native'}"
+            ),
+            "source_kind": manifest_or_summary.get("source_kind")
+            or "canonical_probability_blend_v1",
+            "dataset_id": manifest_or_summary.get("dataset_id") or "",
+            "candidate_ids": manifest_or_summary.get("candidate_ids")
+            or manifest_or_summary.get("parent_candidate_ids")
+            or [],
+            "final_deployment_weights": manifest_or_summary.get(
+                "final_deployment_weights"
+            ),
+            "settings": manifest_or_summary.get("settings") or {},
+            "strategy": manifest_or_summary.get("strategy"),
+            "optimizer_backend": manifest_or_summary.get("optimizer_backend"),
+            "exploratory": manifest_or_summary.get("exploratory"),
+        },
+        repository_root=repository_root,
     )
-    method = manifest_or_summary.get("method")
-    if isinstance(method, str):
-        label = method_label(method)
-    else:
-        label = optimizer_label(strategy, optimizer)
-    parent_ids = manifest_or_summary.get("candidate_ids") or manifest_or_summary.get(
-        "parent_candidate_ids"
-    ) or []
-    parent_count = len(parent_ids)
-    honest = manifest_or_summary.get("honest_meta_cv_metrics") or {}
-    score = honest.get("mean_repeat_balanced_accuracy")
-    if score is None:
-        score = manifest_or_summary.get("source_metric_value")
-    if score is not None:
-        try:
-            score_text = f"{float(score):.4f}"
-        except (TypeError, ValueError):
-            score_text = str(score)
-        return f"{label} · {parent_count} parents · honest BA {score_text}"
-    return f"{label} · {parent_count} parents"
+    return display.primary_label
 
 
 def candidate_inventory_fingerprint(
@@ -254,21 +259,24 @@ def discover_candidate_rows(
         exploratory = summary.get("exploratory")
         probability_min: float | None = None
         probability_max: float | None = None
+        loaded_package = None
         try:
-            package = load_candidate_package(
+            loaded_package = load_candidate_package(
                 package_dir,
                 repository_root=root,
                 candidates_root_relative=relative_root,
             )
-            manifest = package.manifest
+            manifest = loaded_package.manifest
             parent_dataset_id = manifest.get("parent_dataset_id", parent_dataset_id)
             target_dependency = manifest.get("target_dependency", target_dependency)
             exploratory = bool(manifest.get("exploratory", exploratory))
-            probs = package.test["probability_positive"].to_numpy(dtype=np.float64)
+            probs = loaded_package.test["probability_positive"].to_numpy(dtype=np.float64)
             if probs.size:
                 probability_min = float(np.min(probs))
                 probability_max = float(np.max(probs))
-            threshold = extract_final_deployment_threshold(package.source_metadata)
+            threshold = extract_final_deployment_threshold(
+                loaded_package.source_metadata
+            )
             if threshold is not None and np.isfinite(threshold):
                 final_threshold = float(threshold)
             if include_readiness:
@@ -283,6 +291,7 @@ def discover_candidate_rows(
                     final_threshold = float(readiness["threshold"])
         except (PredictionCandidateError, OSError, json.JSONDecodeError, ValueError):
             package_status = "invalid"
+            loaded_package = None
             if include_readiness:
                 readiness_state = "blocked"
                 readiness_blockers = [
@@ -291,23 +300,42 @@ def discover_candidate_rows(
                         "message": "Candidate package failed strict validation.",
                     }
                 ]
-        label = candidate_display_label(
-            {
+        if loaded_package is not None:
+            label_payload: dict[str, Any] = {
+                "candidate_id": candidate_id,
+                "source_model_name": loaded_package.manifest.get(
+                    "source_model_name", summary.get("source_model_name")
+                ),
+                "source_kind": loaded_package.manifest.get(
+                    "source_kind", summary.get("source_kind")
+                ),
+                "dataset_id": loaded_package.manifest.get(
+                    "dataset_id", summary.get("dataset_id")
+                ),
+                "source_metadata": loaded_package.source_metadata,
+                "exploratory": loaded_package.manifest.get("exploratory"),
+            }
+        else:
+            label_payload = {
+                "candidate_id": candidate_id,
                 "source_model_name": summary.get("source_model_name"),
                 "source_kind": summary.get("source_kind"),
                 "dataset_id": summary.get("dataset_id"),
             }
-        )
+        display = resolve_candidate_display(label_payload, repository_root=root)
+        label = display.primary_label
         rows.append(
             {
                 "candidate_id": candidate_id,
                 "label": label,
+                "compact_label": display.compact_label,
                 "source_model_name": summary.get("source_model_name"),
                 "source_kind": summary.get("source_kind"),
                 "source_kind_label": source_kind_label(
                     str(summary.get("source_kind") or "")
                 ),
                 "dataset_id": summary.get("dataset_id"),
+                "dataset_label": display.dataset_label,
                 "parent_dataset_id": parent_dataset_id,
                 "target_dependency": target_dependency,
                 "exploratory": exploratory,
@@ -675,7 +703,19 @@ def discover_materialized_blends(
                 {
                     "blend_id": blend_id,
                     "status": "completed",
-                    "label": blend_display_label(manifest),
+                    "label": blend_display_label(
+                        {
+                            **manifest,
+                            "optimizer_backend": loaded.get("optimizer_backend"),
+                            "final_deployment_weights": loaded.get(
+                                "final_deployment_weights"
+                            ),
+                            "canonical_candidate_id": loaded.get(
+                                "canonical_candidate_id"
+                            ),
+                        },
+                        repository_root=root,
+                    ),
                     "candidate_ids": list(manifest.get("candidate_ids") or []),
                     "optimizer_backend": loaded.get("optimizer_backend"),
                     "honest_meta_cv_metrics": loaded.get("honest_meta_cv_metrics"),
