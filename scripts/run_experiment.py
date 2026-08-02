@@ -13,13 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.churn_ml.features import load_dataset
-from src.churn_ml.config import (
+from src.churn_ml.features import load_dataset  # noqa: E402
+from src.churn_ml.config import (  # noqa: E402
     ManualExperimentConfig,
     load_manual_experiment_config,
     validate_config_against_manifest,
 )
-from src.churn_ml.manual_lightgbm import (
+from src.churn_ml.manual_lightgbm import (  # noqa: E402
     FeatureSchema,
     ParityReport,
     build_submission,
@@ -28,7 +28,7 @@ from src.churn_ml.manual_lightgbm import (
     prepare_model_features,
     run_manual_lightgbm_cross_validation,
 )
-from src.churn_ml.run_artifacts import (
+from src.churn_ml.run_artifacts import (  # noqa: E402
     RunArtifactStore,
     RunFailureFinalizationError,
     collect_environment_versions,
