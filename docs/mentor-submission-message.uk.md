@@ -1,10 +1,10 @@
 # Повідомлення ментору
 
 Вітаю! Надсилаю фінальний проєкт з прогнозування відтоку клієнтів:
-https://github.com/ayri77/neoversity-ml-final
+https://github.com/ayri77/neoversity-ml-final/tree/feature/prepared-dataset-pipeline-v1
 
 Фінальний виконаний notebook:
-https://github.com/ayri77/neoversity-ml-final/blob/master/notebooks/09_final_project_report.ipynb
+https://github.com/ayri77/neoversity-ml-final/blob/feature/prepared-dataset-pipeline-v1/notebooks/09_final_project_report.ipynb
 
 Найкращий перевірений Kaggle Public Score — **0,9112**. У проєкті реалізовано не
 лише моделі, а й контрольовану ML-платформу: immutable Dataset Registry, Research
