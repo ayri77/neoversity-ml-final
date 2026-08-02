@@ -28,6 +28,7 @@ PREDICTION_CANDIDATE_CONTRACT = "prediction_candidate_v1"
 PREDICTION_BLEND_CONTRACT = "prediction_blend_v1"
 CANDIDATE_SUBMISSION_CONTRACT = "candidate_submission_v1"
 BLEND_UI_REQUEST_CONTRACT = "blend_ui_request_v1"
+AUTOGLUON_PREPARATION_REQUEST_CONTRACT = "autogluon_candidate_preparation_request_v1"
 DEPLOYMENT_DRAFT_CONTRACT = "deployment_draft_v1"
 DEPLOYMENT_CONFIG_CONTRACT = "deployment_v1_config"
 DEPLOYMENT_ARTIFACT_CONTRACT = "deployment_v1_submission_artifact"
@@ -144,6 +145,17 @@ ADVANCED_OPERATIONS: tuple[AdvancedOperation, ...] = (
         output_contracts=(BLEND_EVALUATION_CONTRACT, BLEND_DEPLOYMENT_PACKAGE_CONTRACT),
     ),
     AdvancedOperation(
+        command_id="autogluon_candidate_preparation_v1",
+        label="AutoGluon Candidate Preparation v1",
+        description=(
+            "Supporting CLI for Blend Workspace → Prepare candidates. Prefer "
+            "the Blend page; this registry entry exists for authorized jobs."
+        ),
+        badge=None,
+        input_contracts=(AUTOGLUON_PREPARATION_REQUEST_CONTRACT,),
+        output_contracts=(PREDICTION_CANDIDATE_CONTRACT,),
+    ),
+    AdvancedOperation(
         command_id="prediction_blend_v1",
         label="Prediction Blend v1",
         description=(
@@ -208,6 +220,7 @@ ADVANCED_ONLY_COMMAND_IDS: frozenset[str] = frozenset(
         "dataset_comparison_v1",
         "prediction_blend_v1",
         "candidate_submission_v1",
+        "autogluon_candidate_preparation_v1",
     }
 )
 
@@ -310,6 +323,7 @@ __all__ = [
     "ADVANCED_OPERATIONS",
     "ADVANCED_ONLY_COMMAND_IDS",
     "AdvancedOperation",
+    "AUTOGLUON_PREPARATION_REQUEST_CONTRACT",
     "BLEND_DEPLOYMENT_PACKAGE_CONTRACT",
     "BLEND_UI_REQUEST_CONTRACT",
     "CANDIDATE_SUBMISSION_CONTRACT",

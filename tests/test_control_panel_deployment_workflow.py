@@ -593,6 +593,7 @@ def test_workflow_order_labels_and_legacy_visibility() -> None:
     assert "blend_evaluation_v1" not in standard
     assert "prediction_blend_v1" not in standard
     assert "candidate_submission_v1" not in standard
+    assert "autogluon_candidate_preparation_v1" not in standard
     assert [workflow_label(item, fallback=item) for item in workflow] == [
         "🧪 Train",
         "🔎 Compare",
@@ -611,6 +612,7 @@ def test_workflow_order_labels_and_legacy_visibility() -> None:
     assert "blend_evaluation_v1" in advanced
     assert "prediction_blend_v1" in advanced
     assert "candidate_submission_v1" in advanced
+    assert "autogluon_candidate_preparation_v1" in advanced
     assert sorted(advanced) == sorted(registered)
     assert is_legacy_command("research_v1") is True
     assert is_legacy_command("blend_evaluation_v1") is True

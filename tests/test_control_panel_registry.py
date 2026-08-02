@@ -30,6 +30,7 @@ def test_repository_registry_is_strict_and_cross_referenced() -> None:
         "optuna_search_v1",
         "prediction_blend_v1",
         "candidate_submission_v1",
+        "autogluon_candidate_preparation_v1",
     }
     assert set(loaded.readers) == {
         "research_v2",

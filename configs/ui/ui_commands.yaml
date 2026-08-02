@@ -7,6 +7,7 @@ approved_public_clis:
   - scripts/run_blend_evaluation_v1.py
   - scripts/run_prediction_blend.py
   - scripts/generate_candidate_submission.py
+  - scripts/import_autogluon_prediction_candidates.py
   - scripts/sync_mlflow.py
   - scripts/run_deployment_v1.py
   - scripts/run_optuna_search.py
@@ -868,4 +869,59 @@ commands:
         enabled: true
         competition_test: true
         success_markers: ['"ok": true', '"command": "generate"']
+        failure_markers: ['"ok": false', "Traceback"]
+
+  - id: autogluon_candidate_preparation_v1
+    title: AutoGluon Candidate Preparation v1
+    description: >
+      Supporting CLI for preparing prediction_candidate_v1 packages from
+      managed AutoGluon runs. Prefer Blend Workspace → Prepare candidates.
+    category: Blend
+    argv_prefix: ["$PYTHON", "-u", "scripts/import_autogluon_prediction_candidates.py"]
+    allowed_config_globs:
+      - "artifacts/ui_candidate_preparation_requests/*.json"
+    allowed_input_roots:
+      - "artifacts/ui_candidate_preparation_requests"
+      - "artifacts/autogluon_runs"
+      - "data/processed"
+      - "configs/competition"
+    allowed_output_roots:
+      - "artifacts/prediction_candidates"
+    result_reader_id: prediction_candidate_v1
+    artifact_url: null
+    environment: []
+    actions:
+      - id: validate
+        title: Validate selected models
+        description: Read-only importability validation for selected AutoGluon models.
+        argv: ["validate", "--request", "{request}"]
+        placeholders:
+          request:
+            type: path
+            role: config
+            required: true
+            roots: ["artifacts/ui_candidate_preparation_requests"]
+            must_exist: true
+        confirmation: none
+        enabled: true
+        competition_test: false
+        success_markers: ['"ok": true', '"command": "validate"']
+        failure_markers: ['"ok": false', "Traceback"]
+      - id: prepare
+        title: Prepare selected candidates
+        description: >
+          Export genuine OOF and test probabilities for selected models into
+          immutable prediction_candidate_v1 packages. No training. No upload.
+        argv: ["import", "--request", "{request}"]
+        placeholders:
+          request:
+            type: path
+            role: config
+            required: true
+            roots: ["artifacts/ui_candidate_preparation_requests"]
+            must_exist: true
+        confirmation: confirm
+        enabled: true
+        competition_test: false
+        success_markers: ['"ok": true', '"command": "import"']
         failure_markers: ['"ok": false', "Traceback"]

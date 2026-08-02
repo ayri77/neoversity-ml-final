@@ -119,6 +119,7 @@ def test_workflow_still_four_steps_and_dataset_comparison_registered() -> None:
     assert "dataset_comparison_v1" in ADVANCED_ONLY_COMMAND_IDS
     assert "prediction_blend_v1" in ADVANCED_ONLY_COMMAND_IDS
     assert "candidate_submission_v1" in ADVANCED_ONLY_COMMAND_IDS
+    assert "autogluon_candidate_preparation_v1" in ADVANCED_ONLY_COMMAND_IDS
     standard = visible_command_ids(registered)
     assert "dataset_comparison_v1" not in standard
     assert "blend_evaluation_v1" not in standard

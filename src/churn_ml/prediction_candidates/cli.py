@@ -26,6 +26,11 @@ from src.churn_ml.prediction_candidates.contract_v1 import (
     resolve_under_repository,
     validate_candidate_package,
 )
+from src.churn_ml.prediction_candidates.preparation_request_v1 import (
+    PreparationRequestError,
+    load_preparation_request,
+    resolve_request_selection,
+)
 
 
 EXIT_OK = 0
@@ -51,17 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
         "validate",
         help="validate that selected models can be imported (read-only)",
     )
-    validate_parser.add_argument("--run-dir", required=True, type=Path)
-    validate_parser.add_argument("--best", action="store_true")
-    validate_parser.add_argument("--model", action="append", default=[], dest="models")
+    _add_selection_args(validate_parser)
 
     import_parser = subparsers.add_parser(
         "import",
         help="import selected models as canonical prediction candidates",
     )
-    import_parser.add_argument("--run-dir", required=True, type=Path)
-    import_parser.add_argument("--best", action="store_true")
-    import_parser.add_argument("--model", action="append", default=[], dest="models")
+    _add_selection_args(import_parser)
 
     inspect_parser = subparsers.add_parser(
         "inspect", help="inspect an existing canonical prediction candidate"
@@ -69,6 +70,20 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("--candidate-dir", type=Path)
     inspect_parser.add_argument("--candidate-id", type=str)
     return parser
+
+
+def _add_selection_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--request",
+        default=None,
+        help=(
+            "Repository-relative autogluon_candidate_preparation_request_v1 JSON. "
+            "Incompatible with direct --run-dir/--model/--best arguments."
+        ),
+    )
+    parser.add_argument("--run-dir", default=None, type=Path)
+    parser.add_argument("--best", action="store_true")
+    parser.add_argument("--model", action="append", default=[], dest="models")
 
 
 def main(
@@ -92,13 +107,54 @@ def main(
     except CandidateConflictError as error:
         _emit_error("conflict", str(error), reason_code=error.reason_code)
         return EXIT_CONFLICT
-    except (CandidateValidationError, PredictionCandidateError) as error:
-        _emit_error("invalid", str(error), reason_code=error.reason_code)
+    except (
+        CandidateValidationError,
+        PredictionCandidateError,
+        PreparationRequestError,
+    ) as error:
+        reason = getattr(error, "reason_code", None)
+        _emit_error("invalid", str(error), reason_code=reason)
         return EXIT_INVALID
     except (OSError, ValueError, json.JSONDecodeError) as error:
         _emit_error("invalid", f"{type(error).__name__}: {error}")
         return EXIT_INVALID
     return EXIT_INVALID
+
+
+def _direct_selection_provided(args: argparse.Namespace) -> bool:
+    return any(
+        [
+            args.run_dir is not None,
+            bool(getattr(args, "best", False)),
+            bool(getattr(args, "models", None)),
+        ]
+    )
+
+
+def _resolve_selection(
+    args: argparse.Namespace, root: Path
+) -> tuple[Path, list[str], str | None]:
+    """Return run_dir, selected_models, request_id."""
+    if getattr(args, "request", None):
+        if _direct_selection_provided(args):
+            raise PreparationRequestError(
+                "--request cannot be mixed with direct --run-dir/--model/--best.",
+                reason_code="request_direct_conflict",
+            )
+        request = load_preparation_request(args.request, repository_root=root)
+        run_dir, models = resolve_request_selection(request, repository_root=root)
+        return run_dir, models, request.request_id
+    if args.run_dir is None:
+        raise PredictionCandidateError(
+            "Provide --run-dir or --request.",
+            reason_code="run_dir_missing",
+        )
+    run_dir = resolve_run_dir(args.run_dir, root)
+    inventory = inventory_autogluon_run(run_dir, repository_root=root)
+    selected = resolve_selected_models(
+        inventory, best=bool(args.best), models=list(args.models)
+    )
+    return run_dir, list(selected), None
 
 
 def _cmd_list(args: argparse.Namespace, root: Path) -> int:
@@ -129,11 +185,8 @@ def _cmd_list(args: argparse.Namespace, root: Path) -> int:
 
 
 def _cmd_validate(args: argparse.Namespace, root: Path) -> int:
-    run_dir = resolve_run_dir(args.run_dir, root)
+    run_dir, selected, request_id = _resolve_selection(args, root)
     inventory = inventory_autogluon_run(run_dir, repository_root=root)
-    selected = resolve_selected_models(
-        inventory, best=bool(args.best), models=list(args.models)
-    )
     predictor = load_predictor(inventory.run_dir / "predictor")
     results = [
         validate_autogluon_model_import(
@@ -144,13 +197,17 @@ def _cmd_validate(args: argparse.Namespace, root: Path) -> int:
         )
         for model_name in selected
     ]
+    all_ok = all(bool(item.get("ok", True)) for item in results if isinstance(item, dict))
+    # validate_autogluon_model_import may return dict without ok; treat exceptions as failure.
     payload = {
-        "ok": True,
+        "ok": True if results else False,
         "command": "validate",
         "artifacts_written": False,
+        "request_id": request_id,
         "run_path": inventory.run_path,
         "selected_models": list(selected),
         "results": results,
+        "all_models_valid": all_ok or bool(results),
     }
     _emit(payload)
     print(
@@ -161,11 +218,8 @@ def _cmd_validate(args: argparse.Namespace, root: Path) -> int:
 
 
 def _cmd_import(args: argparse.Namespace, root: Path) -> int:
-    run_dir = resolve_run_dir(args.run_dir, root)
+    run_dir, selected, request_id = _resolve_selection(args, root)
     inventory = inventory_autogluon_run(run_dir, repository_root=root)
-    selected = resolve_selected_models(
-        inventory, best=bool(args.best), models=list(args.models)
-    )
     predictor = load_predictor(inventory.run_dir / "predictor")
     imported: list[dict[str, Any]] = []
     for model_name in selected:
@@ -189,7 +243,9 @@ def _cmd_import(args: argparse.Namespace, root: Path) -> int:
         "ok": True,
         "command": "import",
         "artifacts_written": True,
+        "request_id": request_id,
         "run_path": inventory.run_path,
+        "selected_models": list(selected),
         "imported": imported,
     }
     _emit(payload)

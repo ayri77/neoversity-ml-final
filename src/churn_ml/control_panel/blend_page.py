@@ -36,6 +36,9 @@ from src.churn_ml.control_panel.blend_workspace import (
     selection_fingerprint,
     verify_search_result,
 )
+from src.churn_ml.control_panel.candidate_preparation_page import (
+    render_prepare_candidates_tab,
+)
 from src.churn_ml.control_panel.command_builder import build_command
 from src.churn_ml.control_panel.jobs import JobError, JobManager
 from src.churn_ml.control_panel.launch import (
@@ -101,7 +104,38 @@ def render_blend_workspace_page(
         "evaluate a leakage-safe blend, and prepare the result for submission."
     )
 
+    tab_labels = ("Prepare candidates", "Build blend", "Materialized blends")
+    preferred = st.session_state.pop(_state_key("active_tab"), None)
+    if preferred in tab_labels:
+        # Streamlit tabs do not support programmatic selection reliably; surface
+        # a clear cue when another tab requested navigation.
+        st.info(f"Open the **{preferred}** tab to continue.")
+    prepare_tab, build_tab, materialized_tab = st.tabs(tab_labels)
+    with prepare_tab:
+        render_prepare_candidates_tab(
+            repository_root=repository_root,
+            registry=registry,
+            job_manager=job_manager,
+        )
+    with build_tab:
+        _render_build_blend_tab(
+            repository_root=repository_root,
+            registry=registry,
+            job_manager=job_manager,
+        )
+    with materialized_tab:
+        _render_materialized_blends(repository_root)
+
+
+def _render_build_blend_tab(
+    *,
+    repository_root: Path,
+    registry: ControlPanelRegistry,
+    job_manager: JobManager,
+) -> None:
     fingerprint = candidate_inventory_fingerprint(repository_root)
+    if st.session_state.pop("blend_workspace:force_refresh_candidates", None):
+        _load_candidate_rows_cached.clear()
     if st.button("Refresh candidates", key=_state_key("refresh")):
         _load_candidate_rows_cached.clear()
         for key in (
@@ -139,7 +173,6 @@ def render_blend_workspace_page(
             "At least two canonical candidates are required. "
             "Import or prepare another candidate before running a blend."
         )
-        _render_materialized_blends(repository_root)
         return
     if len(selected_ids) > 10:
         st.error("At most 10 candidates can be selected.")
@@ -148,7 +181,6 @@ def render_blend_workspace_page(
     _render_selected_details(rows, selected_ids)
     compatibility = _render_compatibility(repository_root, selected_ids)
     if compatibility is None or not compatibility.get("ok"):
-        _render_materialized_blends(repository_root)
         return
 
     _render_diversity(repository_root, selected_ids)
@@ -161,7 +193,6 @@ def render_blend_workspace_page(
             request=request,
             rows=rows,
         )
-    _render_materialized_blends(repository_root)
 
 
 def _render_candidate_inventory(rows: list[dict[str, Any]]) -> None:
