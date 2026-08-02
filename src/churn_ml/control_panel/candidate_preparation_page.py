@@ -8,21 +8,31 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from src.churn_ml.control_panel.blend_workspace import parse_job_stdout_json
 from src.churn_ml.control_panel.candidate_preparation import (
     CACHE_CONTRACT_VERSION,
+    INDEPENDENT_CANDIDATE_COPY,
     MAX_MODELS,
     CandidatePreparationError,
     authorized_preparation_argv_values,
     discover_managed_autogluon_runs,
+    durable_preparation_context_from_session,
     ensemble_component_warning,
     filter_managed_runs,
+    independent_candidate_summary,
     list_jobs_for_preparation_request,
     managed_runs_inventory_fingerprint,
+    package_status_label,
+    persist_preparation_context,
     prepare_preparation_request,
+    preparation_button_label,
+    preview_independent_candidate_rows,
+    preview_request_for_selection,
+    recover_validation_for_request,
+    resolve_request_for_selection,
+    restore_selection_from_jobs,
     verify_preparation_result,
-    verify_validation_result,
 )
+from src.churn_ml.control_panel.blend_workspace import parse_job_stdout_json
 from src.churn_ml.control_panel.command_builder import build_command
 from src.churn_ml.control_panel.jobs import JobError, JobManager
 from src.churn_ml.control_panel.launch import (
@@ -38,6 +48,7 @@ from src.churn_ml.control_panel.python_runtimes import (
 )
 from src.churn_ml.control_panel.registry import ControlPanelRegistry
 from src.churn_ml.prediction_candidates.preparation_request_v1 import (
+    PreparationRequest,
     PreparationRequestError,
 )
 
@@ -47,6 +58,13 @@ STATE_PREFIX = "candidate_prep"
 
 def _state_key(name: str) -> str:
     return f"{STATE_PREFIX}:{name}"
+
+
+def _jobs_root(repository_root: Path, registry: ControlPanelRegistry) -> Path:
+    jobs_root = Path(registry.settings.jobs_root)
+    if not jobs_root.is_absolute():
+        jobs_root = repository_root / jobs_root
+    return jobs_root
 
 
 @st.cache_data(show_spinner="Loading managed AutoGluon runs…")
@@ -102,9 +120,10 @@ def render_prepare_candidates_tab(
         for key in (
             "validation_result",
             "preparation_result",
-            "request_obj",
             "request_id",
-            "selected_models",
+            "validate_job_id",
+            "prepare_job_id",
+            "selection_fp",
         ):
             st.session_state.pop(_state_key(key), None)
 
@@ -117,6 +136,14 @@ def render_prepare_candidates_tab(
     if not runs:
         st.warning("No managed AutoGluon runs were found under artifacts/autogluon_runs/.")
         return
+
+    jobs_root = _jobs_root(repository_root, registry)
+    available_paths = [str(row["run_path"]) for row in runs]
+    _seed_selection_widgets(
+        repository_root=repository_root,
+        jobs_root=jobs_root,
+        available_run_paths=available_paths,
+    )
 
     datasets = sorted({str(row.get("dataset_id") or "") for row in runs if row.get("dataset_id")})
     deps = sorted(
@@ -154,6 +181,13 @@ def render_prepare_candidates_tab(
 
     options = [str(row["run_path"]) for row in filtered]
     labels = {str(row["run_path"]): str(row.get("label") or row["run_path"]) for row in filtered}
+    current_run = st.session_state.get(_state_key("run_path"))
+    if current_run not in options:
+        # Prefer durable/job restored run when filters still include it.
+        preferred = st.session_state.get(_state_key("preferred_run_path"))
+        st.session_state[_state_key("run_path")] = (
+            preferred if preferred in options else options[0]
+        )
     selected_run_path = st.selectbox(
         "Managed AutoGluon run",
         options,
@@ -202,27 +236,6 @@ def render_prepare_candidates_tab(
         "They are descriptive selection evidence, not the final blend evaluation."
     )
     models = list(run.get("models") or [])
-    model_frame = pd.DataFrame(
-        [
-            {
-                "Model": item.get("label"),
-                "Type": item.get("model_type"),
-                "Validation score": item.get("validation_score"),
-                "Stack": item.get("stack_level"),
-                "Fit time": item.get("fit_time"),
-                "Prediction time": item.get("prediction_time"),
-                "Best": item.get("is_best"),
-                "Ensemble": item.get("is_ensemble"),
-                "Already prepared": item.get("already_prepared"),
-                "Preparation state": item.get("preparation_state"),
-                "Candidate ID": item.get("candidate_id"),
-            }
-            for item in models
-        ]
-    )
-    st.dataframe(model_frame, width="stretch", hide_index=True)
-
-    # Never auto-select models; the user must choose explicitly.
     include_prepared = st.checkbox(
         "Include already prepared models in selection",
         key=_state_key("include_prepared"),
@@ -237,15 +250,27 @@ def render_prepare_candidates_tab(
         str(item["model_name"]): str(item.get("label") or item["model_name"])
         for item in models
     }
+
     previous_run = st.session_state.get(_state_key("models_for_run"))
     if previous_run != selected_run_path:
-        st.session_state[_state_key("selected_models")] = []
+        restored = _models_for_run(
+            selected_run_path,
+            selectable=selectable,
+            jobs_root=jobs_root,
+            repository_root=repository_root,
+        )
+        st.session_state[_state_key("selected_models")] = restored
         st.session_state[_state_key("models_for_run")] = selected_run_path
-        for key in ("validation_result", "preparation_result", "request_obj", "request_id"):
+        for key in ("validation_result", "preparation_result", "selection_fp"):
             st.session_state.pop(_state_key(key), None)
     elif _state_key("selected_models") not in st.session_state:
-        st.session_state[_state_key("selected_models")] = []
-    # Drop selections that are no longer selectable after filter changes.
+        st.session_state[_state_key("selected_models")] = _models_for_run(
+            selected_run_path,
+            selectable=selectable,
+            jobs_root=jobs_root,
+            repository_root=repository_root,
+        )
+
     current = [
         name
         for name in list(st.session_state.get(_state_key("selected_models")) or [])
@@ -260,30 +285,227 @@ def render_prepare_candidates_tab(
         key=_state_key("selected_models"),
         format_func=lambda value: model_labels.get(value, value),
     )
-    selection_fp = ",".join(selected_models)
-    if st.session_state.get(_state_key("selection_fp")) != selection_fp:
-        for key in ("validation_result", "preparation_result", "request_obj", "request_id"):
+    selection_fp = f"{selected_run_path}|{','.join(selected_models)}"
+    previous_fp = st.session_state.get(_state_key("selection_fp"))
+    if previous_fp is not None and previous_fp != selection_fp:
+        for key in ("validation_result", "preparation_result"):
             st.session_state.pop(_state_key(key), None)
-        st.session_state[_state_key("selection_fp")] = selection_fp
+    st.session_state[_state_key("selection_fp")] = selection_fp
 
     warning = ensemble_component_warning(selected_models)
     if warning:
         st.warning(warning)
     if not selected_models:
         st.info("Select at least one model to validate.")
+        persist_preparation_context(
+            st.session_state,
+            run_path=selected_run_path,
+            selected_models=[],
+            request_id=None,
+        )
         return
     if len(selected_models) > MAX_MODELS:
         st.error(f"At most {MAX_MODELS} models can be selected.")
         return
 
+    try:
+        preview = preview_request_for_selection(
+            repository_root=repository_root,
+            run_path=selected_run_path,
+            selected_models=selected_models,
+        )
+    except (PreparationRequestError, CandidatePreparationError) as error:
+        st.error(str(error))
+        with st.expander("Technical details", expanded=False):
+            st.write({"reason_code": getattr(error, "reason_code", None)})
+        return
+
+    persist_preparation_context(
+        st.session_state,
+        run_path=selected_run_path,
+        selected_models=selected_models,
+        request_id=preview.request_id,
+    )
+    st.session_state[_state_key("request_id")] = preview.request_id
+
+    st.info(INDEPENDENT_CANDIDATE_COPY)
+    st.caption(independent_candidate_summary(len(selected_models)))
+    st.dataframe(
+        pd.DataFrame(preview_independent_candidate_rows(preview)),
+        width="stretch",
+        hide_index=True,
+    )
+
+    request = None
+    try:
+        request = resolve_request_for_selection(
+            repository_root=repository_root,
+            run_path=selected_run_path,
+            selected_models=selected_models,
+        )
+    except PreparationRequestError as error:
+        st.warning(f"Existing request could not be recovered: {error}")
+        with st.expander("Technical details", expanded=False):
+            st.write({"reason_code": error.reason_code, "request_id": preview.request_id})
+
+    validation_payload = None
+    validation_job_id = None
+    validation_state = "Not validated"
+    if request is not None:
+        try:
+            recovered = recover_validation_for_request(
+                jobs_root=jobs_root,
+                request=request,
+            )
+        except CandidatePreparationError as error:
+            st.error(str(error))
+            with st.expander("Technical details", expanded=False):
+                st.write({"reason_code": error.reason_code})
+            recovered = None
+        if recovered is not None:
+            validation_job_id = recovered.get("job_id")
+            if recovered.get("recovery_state") == "succeeded" and recovered.get("payload"):
+                validation_payload = recovered["payload"]
+                st.session_state[_state_key("validation_result")] = validation_payload
+                validation_state = "Validated"
+            elif recovered.get("recovery_state") in {"running", "queued", "starting"}:
+                validation_state = "Validation running"
+            elif recovered.get("recovery_state") in {"failed", "stopped", "orphaned"}:
+                validation_state = "Validation failed"
+            else:
+                validation_state = "Not validated"
+        elif st.session_state.get(_state_key("validation_result")):
+            cached = st.session_state.get(_state_key("validation_result"))
+            if (
+                isinstance(cached, dict)
+                and cached.get("request_id") == preview.request_id
+                and list(cached.get("selected_models") or []) == list(selected_models)
+            ):
+                validation_payload = cached
+                validation_state = "Validated"
+
+    model_frame = pd.DataFrame(
+        [
+            {
+                "Model": item.get("label"),
+                "Type": item.get("model_type"),
+                "Validation score": item.get("validation_score"),
+                "Stack": item.get("stack_level"),
+                "Fit time": item.get("fit_time"),
+                "Prediction time": item.get("prediction_time"),
+                "Best": item.get("is_best"),
+                "Ensemble": item.get("is_ensemble"),
+                "Candidate package": package_status_label(item.get("preparation_state")),
+                "Current validation": (
+                    validation_state
+                    if item.get("model_name") in selected_models
+                    else "—"
+                ),
+                "Candidate ID": item.get("candidate_id"),
+            }
+            for item in models
+        ]
+    )
+    st.dataframe(model_frame, width="stretch", hide_index=True)
+    with st.expander("Technical details — package states", expanded=False):
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "model": item.get("model_name"),
+                        "preparation_state": item.get("preparation_state"),
+                        "package_status": item.get("package_status"),
+                        "candidate_id": item.get("candidate_id"),
+                    }
+                    for item in models
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.markdown("#### Current selection validation")
+    st.write(
+        {
+            "Expected request": preview.request_id,
+            "Request file": "present" if request is not None else "not materialized yet",
+            "Validation status": validation_state,
+            "Validation job": validation_job_id,
+        }
+    )
+
     _render_validate_and_prepare(
         repository_root=repository_root,
         registry=registry,
         job_manager=job_manager,
+        jobs_root=jobs_root,
         run=run,
         selected_models=list(selected_models),
+        preview_request_id=preview.request_id,
+        request=request,
+        validation_payload=validation_payload,
+        validation_state=validation_state,
         runtime_available=runtime.available,
     )
+
+
+def _seed_selection_widgets(
+    *,
+    repository_root: Path,
+    jobs_root: Path,
+    available_run_paths: list[str],
+) -> None:
+    durable = durable_preparation_context_from_session(st.session_state)
+    if durable and durable["run_path"] in available_run_paths:
+        st.session_state[_state_key("preferred_run_path")] = durable["run_path"]
+        if _state_key("run_path") not in st.session_state:
+            st.session_state[_state_key("run_path")] = durable["run_path"]
+        if _state_key("selected_models") not in st.session_state:
+            st.session_state[_state_key("selected_models")] = list(
+                durable["selected_models"]
+            )
+        return
+    restored = restore_selection_from_jobs(
+        jobs_root=jobs_root,
+        repository_root=repository_root,
+        available_run_paths=available_run_paths,
+    )
+    if restored is None:
+        return
+    st.session_state[_state_key("preferred_run_path")] = restored["run_path"]
+    if _state_key("run_path") not in st.session_state:
+        st.session_state[_state_key("run_path")] = restored["run_path"]
+    if _state_key("selected_models") not in st.session_state:
+        st.session_state[_state_key("selected_models")] = list(
+            restored["selected_models"]
+        )
+    persist_preparation_context(
+        st.session_state,
+        run_path=restored["run_path"],
+        selected_models=restored["selected_models"],
+        request_id=restored.get("request_id"),
+    )
+
+
+def _models_for_run(
+    run_path: str,
+    *,
+    selectable: list[str],
+    jobs_root: Path,
+    repository_root: Path,
+) -> list[str]:
+    durable = durable_preparation_context_from_session(st.session_state)
+    if durable and durable["run_path"] == run_path:
+        return [name for name in durable["selected_models"] if name in selectable]
+    restored = restore_selection_from_jobs(
+        jobs_root=jobs_root,
+        repository_root=repository_root,
+        available_run_paths=[run_path],
+        preferred_run_path=run_path,
+    )
+    if restored is None:
+        return []
+    return [name for name in restored["selected_models"] if name in selectable]
 
 
 def _render_validate_and_prepare(
@@ -291,8 +513,13 @@ def _render_validate_and_prepare(
     repository_root: Path,
     registry: ControlPanelRegistry,
     job_manager: JobManager,
+    jobs_root: Path,
     run: dict[str, Any],
     selected_models: list[str],
+    preview_request_id: str,
+    request: PreparationRequest | None,
+    validation_payload: dict[str, Any] | None,
+    validation_state: str,
     runtime_available: bool,
 ) -> None:
     st.markdown("#### Validation")
@@ -305,14 +532,20 @@ def _render_validate_and_prepare(
     ):
         try:
             runtime = require_autogluon_python(repository_root)
-            request = prepare_preparation_request(
+            materialized = prepare_preparation_request(
                 repository_root=repository_root,
                 run_path=str(run["run_path"]),
                 selected_models=selected_models,
             )
-            st.session_state[_state_key("request_obj")] = request
-            st.session_state[_state_key("request_id")] = request.request_id
-            values = authorized_preparation_argv_values(request.relative_path)
+            request = materialized
+            persist_preparation_context(
+                st.session_state,
+                run_path=materialized.run_path,
+                selected_models=materialized.selected_models,
+                request_id=materialized.request_id,
+            )
+            st.session_state[_state_key("request_id")] = materialized.request_id
+            values = authorized_preparation_argv_values(materialized.relative_path)
             built = build_command(
                 registry.commands,
                 "autogluon_candidate_preparation_v1",
@@ -346,16 +579,21 @@ def _render_validate_and_prepare(
                 command_id="autogluon_candidate_preparation_v1",
                 action_id="validate",
                 references={
-                    "request_id": request.request_id,
-                    "run_path": request.run_path,
-                    "dataset_id": str(request.payload.get("dataset_id") or ""),
-                    "selected_models": ",".join(request.selected_models),
+                    "request_id": materialized.request_id,
+                    "run_path": materialized.run_path,
+                    "dataset_id": str(materialized.payload.get("dataset_id") or ""),
+                    "selected_models": ",".join(materialized.selected_models),
                     "source_type": "managed_autogluon",
                     "operation": "validate",
                 },
             )
             st.session_state[_state_key("validate_job_id")] = record.job_id
-            st.success(f"Started validation job `{record.job_id}`.")
+            st.session_state.pop(_state_key("validation_result"), None)
+            st.success(
+                "Validation Job started. You may open Jobs and return here; "
+                "this selection and result will be recovered."
+            )
+            st.info(f"Validation job `{record.job_id}`")
         except (
             PreparationRequestError,
             CandidatePreparationError,
@@ -372,60 +610,61 @@ def _render_validate_and_prepare(
                     }
                 )
 
-    request = st.session_state.get(_state_key("request_obj"))
-    if request is None:
+    if st.button("Open Jobs", key=_state_key("open_jobs")):
+        try:
+            st.switch_page("Jobs")
+        except Exception:  # noqa: BLE001
+            st.info("Open the Jobs page from the top navigation.")
+
+    if validation_payload is not None:
+        results = validation_payload.get("results") or []
+        st.success(
+            "Validation succeeded\n\n"
+            f"Request: `{validation_payload.get('request_id')}`\n\n"
+            f"Models validated: {len(results)} of {len(selected_models)}\n\n"
+            "Artifacts written: No"
+        )
+        st.caption(
+            "Validated proves importability. Prepared means a candidate package exists. "
+            "Validation does not create candidate packages."
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Model": item.get("model_name"),
+                        "Valid": item.get("ok") is True,
+                        "Train rows": item.get("train_row_count"),
+                        "Test rows": item.get("test_row_count"),
+                        "Positive class": item.get("positive_class_label"),
+                        "Future candidate ID": item.get("candidate_id"),
+                    }
+                    for item in results
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    elif validation_state == "Validation running":
+        st.info("Validation is still running. Open Jobs for live status, then return here.")
+    elif validation_state == "Validation failed":
+        st.error("Validation failed. Re-run Validate after inspecting Jobs.")
+
+    if request is None or validation_payload is None:
         return
     if list(request.selected_models) != selected_models or request.run_path != run["run_path"]:
         st.warning("Selection changed after the prepared request. Re-validate.")
         return
-
-    jobs_root = Path(registry.settings.jobs_root)
-    if not jobs_root.is_absolute():
-        jobs_root = repository_root / jobs_root
-    related = list_jobs_for_preparation_request(jobs_root, request.request_id)
-    validate_jobs = [item for item in related if item.get("action_id") == "validate"]
-    if validate_jobs:
-        latest = validate_jobs[0]
-        st.write(
-            {
-                "Validation job": latest.get("job_id"),
-                "Status": latest.get("state"),
-                "Started": latest.get("started_at_utc") or latest.get("created_at_utc"),
-            }
-        )
-        if latest.get("state") == "succeeded":
-            try:
-                stdout = (
-                    jobs_root / str(latest["job_id"]) / "stdout.log"
-                ).read_text(encoding="utf-8", errors="replace")
-                payload = verify_validation_result(
-                    parse_job_stdout_json(stdout),
-                    request_id=request.request_id,
-                    run_path=request.run_path,
-                    selected_models=request.selected_models,
-                )
-                st.session_state[_state_key("validation_result")] = payload
-                st.success("Validation succeeded for the exact prepared request.")
-            except (CandidatePreparationError, Exception) as error:  # noqa: BLE001
-                st.error(str(error))
-                with st.expander("Technical details", expanded=False):
-                    st.code(
-                        (jobs_root / str(latest["job_id"]) / "stderr.log")
-                        .read_text(encoding="utf-8", errors="replace")[-4000:]
-                    )
-        elif latest.get("state") in {"failed", "stopped", "orphaned"}:
-            st.error(f"Validation job {latest.get('state')}")
-            with st.expander("Technical details", expanded=False):
-                st.code(
-                    (jobs_root / str(latest["job_id"]) / "stderr.log")
-                    .read_text(encoding="utf-8", errors="replace")[-4000:]
-                )
-
-    validation = st.session_state.get(_state_key("validation_result"))
-    if not validation:
+    if request.request_id != preview_request_id:
+        st.warning("Request identity no longer matches the current selection.")
         return
 
-    st.markdown("#### Preparation")
+    count = len(selected_models)
+    st.markdown(f"#### Prepare {count} independent candidates")
+    st.write(
+        "The importer will create one immutable prediction_candidate_v1 package per "
+        "selected model. The models are not merged during preparation."
+    )
     st.write(
         "This loads the existing predictor and exports genuine OOF and test "
         "probabilities. It does not retrain models."
@@ -435,7 +674,7 @@ def _render_validate_and_prepare(
         key=_state_key("confirm_prepare"),
     )
     if st.button(
-        "Prepare selected candidates",
+        preparation_button_label(count),
         type="primary",
         disabled=not confirm or not runtime_available,
         key=_state_key("prepare"),
@@ -495,6 +734,7 @@ def _render_validate_and_prepare(
         ) as error:
             st.error(str(error))
 
+    related = list_jobs_for_preparation_request(jobs_root, request.request_id)
     prepare_jobs = [item for item in related if item.get("action_id") == "prepare"]
     if not prepare_jobs:
         return

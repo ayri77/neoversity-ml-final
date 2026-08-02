@@ -430,14 +430,29 @@ def test_selection_helpers_and_warnings() -> None:
 
 
 def test_result_verification_helpers(repo: Path) -> None:
+    del repo
     payload = {
         "ok": True,
         "command": "validate",
         "artifacts_written": False,
+        "all_models_valid": True,
         "request_id": "apr1_x",
         "run_path": "artifacts/autogluon_runs/r",
         "selected_models": ["A", "B"],
-        "results": [{"ok": True}, {"ok": True}],
+        "results": [
+            {
+                "ok": True,
+                "model_name": "A",
+                "train_row_count": 1,
+                "test_row_count": 1,
+            },
+            {
+                "ok": True,
+                "model_name": "B",
+                "train_row_count": 1,
+                "test_row_count": 1,
+            },
+        ],
     }
     verify_validation_result(
         payload,

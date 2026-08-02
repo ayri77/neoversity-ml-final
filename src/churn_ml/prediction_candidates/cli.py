@@ -184,6 +184,12 @@ def _cmd_list(args: argparse.Namespace, root: Path) -> int:
     return EXIT_OK
 
 
+def _all_models_valid(results: list[Any]) -> bool:
+    return bool(results) and all(
+        isinstance(item, dict) and item.get("ok") is True for item in results
+    )
+
+
 def _cmd_validate(args: argparse.Namespace, root: Path) -> int:
     run_dir, selected, request_id = _resolve_selection(args, root)
     inventory = inventory_autogluon_run(run_dir, repository_root=root)
@@ -197,19 +203,24 @@ def _cmd_validate(args: argparse.Namespace, root: Path) -> int:
         )
         for model_name in selected
     ]
-    all_ok = all(bool(item.get("ok", True)) for item in results if isinstance(item, dict))
-    # validate_autogluon_model_import may return dict without ok; treat exceptions as failure.
+    all_models_valid = _all_models_valid(results)
     payload = {
-        "ok": True if results else False,
+        "ok": all_models_valid,
         "command": "validate",
         "artifacts_written": False,
         "request_id": request_id,
         "run_path": inventory.run_path,
         "selected_models": list(selected),
         "results": results,
-        "all_models_valid": all_ok or bool(results),
+        "all_models_valid": all_models_valid,
     }
     _emit(payload)
+    if not all_models_valid:
+        print(
+            f"STATUS: validation failed for {len(results)} model(s); no artifacts written",
+            file=sys.stderr,
+        )
+        return EXIT_INVALID
     print(
         f"STATUS: validated {len(results)} model(s); no artifacts written",
         file=sys.stderr,

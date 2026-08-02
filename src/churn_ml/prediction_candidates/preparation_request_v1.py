@@ -13,14 +13,19 @@ from typing import Any, Mapping, Sequence
 
 from src.churn_ml.dataset_registry.api import resolve_dataset_package
 from src.churn_ml.prediction_candidates.autogluon_v1 import (
+    OOF_PROTOCOL,
     SOURCE_KIND,
     inventory_autogluon_run,
     resolve_run_dir,
     resolve_selected_models,
 )
 from src.churn_ml.prediction_candidates.contract_v1 import (
+    POSITIVE_CLASS_LABEL,
+    PROBABILITY_SEMANTICS,
+    SCHEMA_VERSION as CANDIDATE_SCHEMA_VERSION,
     CandidateConflictError,
     PredictionCandidateError,
+    build_candidate_id,
     file_sha256,
     resolve_under_repository,
 )
@@ -57,6 +62,19 @@ class PreparationRequest:
     @property
     def run_path(self) -> str:
         return str(self.payload["run_path"])
+
+
+@dataclass(frozen=True)
+class PreparationRequestPreview:
+    """Pure deterministic request identity without writing artifacts."""
+
+    request_id: str
+    relative_path: str
+    run_path: str
+    selected_models: tuple[str, ...]
+    payload: dict[str, Any]
+    candidate_ids: tuple[str, ...]
+    run_identity: dict[str, str | None]
 
 
 def utc_now() -> str:
@@ -225,13 +243,14 @@ def build_preparation_request_payload(
     }
 
 
-def materialize_preparation_request(
+def preview_preparation_request(
     *,
     repository_root: Path,
     run_path: str,
     selected_models: Sequence[str],
     candidate_root: str | None = None,
-) -> PreparationRequest:
+) -> PreparationRequestPreview:
+    """Compute deterministic request identity without writing a request file."""
     root = repository_root.resolve()
     payload = build_preparation_request_payload(
         repository_root=root,
@@ -241,9 +260,107 @@ def materialize_preparation_request(
     )
     request_id = str(payload["request_id"])
     relative = f"{REQUEST_ROOT_RELATIVE}/{request_id}.json"
+    models = tuple(str(item) for item in payload["selected_models"])
+    candidate_ids = tuple(
+        build_candidate_id(
+            {
+                "schema_version": CANDIDATE_SCHEMA_VERSION,
+                "source_kind": SOURCE_KIND,
+                "dataset_id": payload["dataset_id"],
+                "source_run_path": payload["run_path"],
+                "source_config_sha256": payload["config_sha256"],
+                "source_model_name": model_name,
+                "oof_protocol": OOF_PROTOCOL,
+                "positive_class_label": POSITIVE_CLASS_LABEL,
+                "probability_semantics": PROBABILITY_SEMANTICS,
+            }
+        )
+        for model_name in models
+    )
+    run_identity = {
+        "run_metadata_sha256": payload.get("run_metadata_sha256"),
+        "worker_result_sha256": payload.get("worker_result_sha256"),
+        "resolved_config_sha256": payload.get("resolved_config_sha256"),
+        "leaderboard_sha256": payload.get("leaderboard_sha256"),
+        "success_marker_sha256": payload.get("success_marker_sha256"),
+        "config_sha256": payload.get("config_sha256"),
+    }
+    return PreparationRequestPreview(
+        request_id=request_id,
+        relative_path=relative,
+        run_path=str(payload["run_path"]),
+        selected_models=models,
+        payload=dict(payload),
+        candidate_ids=candidate_ids,
+        run_identity=run_identity,
+    )
+
+
+def resolve_existing_preparation_request(
+    *,
+    repository_root: Path,
+    run_path: str,
+    selected_models: Sequence[str],
+    candidate_root: str | None = None,
+) -> PreparationRequest | None:
+    """Load and authenticate an existing request for the exact selection.
+
+    Returns ``None`` when the expected request file is absent. Does not write.
+    """
+    root = repository_root.resolve()
+    preview = preview_preparation_request(
+        repository_root=root,
+        run_path=run_path,
+        selected_models=selected_models,
+        candidate_root=candidate_root,
+    )
+    absolute = resolve_under_repository(preview.relative_path, root)
+    if not absolute.is_file():
+        return None
+    request = load_preparation_request(preview.relative_path, repository_root=root)
+    if request.request_id != preview.request_id:
+        raise PreparationRequestError(
+            "Existing request ID does not match the deterministic preview.",
+            reason_code="request_id_mismatch",
+        )
+    if request.run_path != preview.run_path:
+        raise PreparationRequestError(
+            "Existing request run_path does not match the current selection.",
+            reason_code="run_path_mismatch",
+        )
+    if list(request.selected_models) != list(preview.selected_models):
+        raise PreparationRequestError(
+            "Existing request selected models do not match the current selection.",
+            reason_code="selected_models_mismatch",
+        )
+    if _identity_view(request.payload) != _identity_view(preview.payload):
+        raise PreparationRequestError(
+            "Existing request content does not match the current selection identity.",
+            reason_code="request_identity_mismatch",
+        )
+    verify_request_run_identity(request, repository_root=root)
+    return request
+
+
+def materialize_preparation_request(
+    *,
+    repository_root: Path,
+    run_path: str,
+    selected_models: Sequence[str],
+    candidate_root: str | None = None,
+) -> PreparationRequest:
+    root = repository_root.resolve()
+    preview = preview_preparation_request(
+        repository_root=root,
+        run_path=run_path,
+        selected_models=selected_models,
+        candidate_root=candidate_root,
+    )
+    request_id = preview.request_id
+    relative = preview.relative_path
     absolute = resolve_under_repository(relative, root)
     absolute.parent.mkdir(parents=True, exist_ok=True)
-    body = {**payload, "created_at_utc": utc_now()}
+    body = {**preview.payload, "created_at_utc": utc_now()}
     raw = (json.dumps(body, indent=2, sort_keys=True, default=str) + "\n").encode(
         "utf-8"
     )
@@ -253,12 +370,14 @@ def materialize_preparation_request(
             raise CandidateConflictError(
                 f"Preparation request {request_id} already exists with different content."
             )
-        return PreparationRequest(
+        request = PreparationRequest(
             request_id=request_id,
             payload=dict(existing),
             relative_path=relative,
             absolute_path=absolute,
         )
+        verify_request_run_identity(request, repository_root=root)
+        return request
     _atomic_write_bytes(absolute, raw)
     return PreparationRequest(
         request_id=request_id,
@@ -409,10 +528,13 @@ __all__ = [
     "SCHEMA_VERSION",
     "PreparationRequest",
     "PreparationRequestError",
+    "PreparationRequestPreview",
     "build_preparation_request_payload",
     "collect_run_identity_hashes",
     "load_preparation_request",
     "materialize_preparation_request",
+    "preview_preparation_request",
+    "resolve_existing_preparation_request",
     "resolve_request_selection",
     "validate_managed_run_path",
     "validate_selected_models",

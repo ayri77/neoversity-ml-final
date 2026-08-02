@@ -7,6 +7,11 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from src.churn_ml.control_panel.blend_workspace import parse_job_stdout_json
+from src.churn_ml.control_panel.selection_state import (
+    get_durable_value,
+    set_durable_value,
+)
 from src.churn_ml.dataset_registry.api import resolve_dataset_package
 from src.churn_ml.prediction_candidates.autogluon_v1 import (
     OOF_PROTOCOL,
@@ -30,9 +35,14 @@ from src.churn_ml.prediction_candidates.preparation_request_v1 import (
     MAX_MODELS,
     MIN_MODELS,
     PreparationRequest,
+    PreparationRequestPreview,
     collect_run_identity_hashes,
+    load_preparation_request,
     materialize_preparation_request,
+    preview_preparation_request,
+    resolve_existing_preparation_request,
     validate_selected_models,
+    verify_request_run_identity,
 )
 from src.churn_ml.prediction_candidates.submission_v1 import (
     evaluate_submission_readiness,
@@ -42,6 +52,12 @@ from src.churn_ml.research_data import canonical_sha256
 
 CACHE_CONTRACT_VERSION = "candidate_preparation_cache_v1"
 ENSEMBLE_PREFIX = re.compile(r"^WeightedEnsemble_")
+PREPARATION_COMMAND_ID = "autogluon_candidate_preparation_v1"
+DURABLE_CONTEXT_KEY = "autogluon_candidate_preparation_v1::context"
+INDEPENDENT_CANDIDATE_COPY = (
+    "Each selected model is prepared as a separate canonical candidate. "
+    "Selecting multiple models only groups the work into one Job."
+)
 
 
 class CandidatePreparationError(ValueError):
@@ -414,15 +430,56 @@ def filter_managed_runs(
 
 def ensemble_component_warning(selected_models: Sequence[str]) -> str | None:
     names = list(selected_models)
-    has_ensemble = any(ENSEMBLE_PREFIX.match(name) for name in names)
-    has_component = any(not ENSEMBLE_PREFIX.match(name) for name in names)
-    if has_ensemble and has_component:
+    ensembles = [name for name in names if ENSEMBLE_PREFIX.match(name)]
+    components = [name for name in names if not ENSEMBLE_PREFIX.match(name)]
+    if ensembles and components:
+        ensemble_label = ensembles[0]
         return (
-            "The selected ensemble depends on models from the same run. "
-            "Preparing both is allowed, but do not place the macro candidate and "
-            "its own components in the same initial blend without an explicit reason."
+            f"{ensemble_label} and some of its same-run components are selected. "
+            "Preparing them together is allowed: each becomes a separate candidate. "
+            "For the first blend, avoid using the ensemble together with all of its "
+            "own components unless there is an explicit reason. "
+            "This warning concerns later blend selection only. "
+            "Preparation still creates independent candidates and is safe."
         )
     return None
+
+
+def package_status_label(preparation_state: str | None) -> str:
+    mapping = {
+        "already_prepared": "Prepared",
+        "invalid_existing_candidate": "Invalid",
+        "blocked": "Blocked",
+        "ready_to_validate": "Not prepared",
+    }
+    return mapping.get(str(preparation_state or ""), "Not prepared")
+
+
+def preparation_button_label(count: int) -> str:
+    if count == 1:
+        return "Prepare 1 independent candidate"
+    return f"Prepare {count} independent candidates"
+
+
+def independent_candidate_summary(count: int) -> str:
+    return f"{count} selected models → {count} independent prediction candidates"
+
+
+def preview_independent_candidate_rows(
+    preview: PreparationRequestPreview,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for model_name, candidate_id in zip(
+        preview.selected_models, preview.candidate_ids, strict=True
+    ):
+        rows.append(
+            {
+                "Model": model_name,
+                "Future candidate ID": candidate_id,
+                "Output type": "Independent prediction_candidate_v1 package",
+            }
+        )
+    return rows
 
 
 def prepare_preparation_request(
@@ -433,6 +490,34 @@ def prepare_preparation_request(
 ) -> PreparationRequest:
     validate_selected_models(selected_models)
     return materialize_preparation_request(
+        repository_root=Path(repository_root).resolve(),
+        run_path=run_path,
+        selected_models=selected_models,
+    )
+
+
+def preview_request_for_selection(
+    *,
+    repository_root: Path | str,
+    run_path: str,
+    selected_models: Sequence[str],
+) -> PreparationRequestPreview:
+    validate_selected_models(selected_models)
+    return preview_preparation_request(
+        repository_root=Path(repository_root).resolve(),
+        run_path=run_path,
+        selected_models=selected_models,
+    )
+
+
+def resolve_request_for_selection(
+    *,
+    repository_root: Path | str,
+    run_path: str,
+    selected_models: Sequence[str],
+) -> PreparationRequest | None:
+    validate_selected_models(selected_models)
+    return resolve_existing_preparation_request(
         repository_root=Path(repository_root).resolve(),
         run_path=run_path,
         selected_models=selected_models,
@@ -471,6 +556,11 @@ def verify_validation_result(
             "Validation result must report artifacts_written=false.",
             reason_code="validation_artifacts_unexpected",
         )
+    if payload.get("all_models_valid") is not True:
+        raise CandidatePreparationError(
+            "Validation result must report all_models_valid=true.",
+            reason_code="all_models_valid_false",
+        )
     if str(payload.get("request_id") or "") != request_id:
         raise CandidatePreparationError(
             "Validation result request_id mismatch.",
@@ -482,23 +572,238 @@ def verify_validation_result(
             reason_code="run_path_mismatch",
         )
     actual_models = [str(item) for item in (payload.get("selected_models") or [])]
-    if actual_models != list(selected_models):
+    expected_models = list(selected_models)
+    if actual_models != expected_models:
         raise CandidatePreparationError(
             "Validation result selected model list mismatch.",
             reason_code="selected_models_mismatch",
         )
     results = payload.get("results") or []
-    if len(results) != len(selected_models):
+    if not isinstance(results, list):
+        raise CandidatePreparationError(
+            "Validation results must be a list.",
+            reason_code="validation_result_malformed",
+        )
+    if len(results) != len(expected_models):
         raise CandidatePreparationError(
             "Validation result model count mismatch.",
             reason_code="validation_result_incomplete",
         )
-    if not all(isinstance(item, Mapping) and item.get("ok") is True for item in results):
-        raise CandidatePreparationError(
-            "One or more model validations failed.",
-            reason_code="model_validation_failed",
-        )
+    seen_models: list[str] = []
+    for index, item in enumerate(results):
+        if not isinstance(item, Mapping):
+            raise CandidatePreparationError(
+                "Malformed per-model validation result.",
+                reason_code="validation_result_malformed",
+            )
+        if item.get("ok") is not True:
+            raise CandidatePreparationError(
+                "One or more model validations failed.",
+                reason_code="model_validation_failed",
+            )
+        model_name = str(item.get("model_name") or "")
+        if model_name != expected_models[index]:
+            raise CandidatePreparationError(
+                "Per-model validation result order/name mismatch.",
+                reason_code="selected_models_mismatch",
+            )
+        if model_name in seen_models:
+            raise CandidatePreparationError(
+                "Duplicate model validation result.",
+                reason_code="duplicate_model_result",
+            )
+        seen_models.append(model_name)
+        if item.get("train_row_count") is None or item.get("test_row_count") is None:
+            raise CandidatePreparationError(
+                "Validation result missing row counts.",
+                reason_code="validation_row_counts_missing",
+            )
     return dict(payload)
+
+
+def recover_validation_for_request(
+    *,
+    jobs_root: Path,
+    request: PreparationRequest,
+) -> dict[str, Any] | None:
+    """Recover a succeeded validation result for an authenticated request."""
+    related = list_jobs_for_preparation_request(jobs_root, request.request_id)
+    validate_jobs = [
+        item
+        for item in related
+        if item.get("action_id") == "validate"
+        and str((item.get("references") or {}).get("source_type") or "")
+        == "managed_autogluon"
+        and str((item.get("references") or {}).get("run_path") or "")
+        == request.run_path
+    ]
+    if not validate_jobs:
+        return None
+    latest = validate_jobs[0]
+    state = latest.get("state")
+    if state != "succeeded":
+        return {
+            "recovery_state": state or "unknown",
+            "job_id": latest.get("job_id"),
+            "payload": None,
+        }
+    stdout_path = jobs_root / str(latest["job_id"]) / "stdout.log"
+    try:
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+        payload = parse_job_stdout_json(stdout)
+        verified = verify_validation_result(
+            payload,
+            request_id=request.request_id,
+            run_path=request.run_path,
+            selected_models=request.selected_models,
+        )
+    except (CandidatePreparationError, OSError, ValueError, json.JSONDecodeError) as error:
+        raise CandidatePreparationError(
+            f"Validation job recovery failed: {error}",
+            reason_code=getattr(error, "reason_code", "validation_recovery_failed"),
+        ) from error
+    return {
+        "recovery_state": "succeeded",
+        "job_id": latest.get("job_id"),
+        "payload": verified,
+    }
+
+
+def durable_preparation_context_from_session(session_state: Any) -> dict[str, Any] | None:
+    value = get_durable_value(session_state, DURABLE_CONTEXT_KEY)
+    if not isinstance(value, dict):
+        return None
+    run_path = str(value.get("run_path") or "")
+    models = value.get("selected_models")
+    if not run_path or not isinstance(models, list) or not models:
+        return None
+    return {
+        "run_path": run_path,
+        "selected_models": [str(item) for item in models],
+        "request_id": str(value.get("request_id") or "") or None,
+    }
+
+
+def persist_preparation_context(
+    session_state: Any,
+    *,
+    run_path: str,
+    selected_models: Sequence[str],
+    request_id: str | None = None,
+) -> None:
+    set_durable_value(
+        session_state,
+        DURABLE_CONTEXT_KEY,
+        {
+            "run_path": run_path,
+            "selected_models": list(selected_models),
+            "request_id": request_id,
+        },
+    )
+
+
+def restore_selection_from_jobs(
+    *,
+    jobs_root: Path,
+    repository_root: Path,
+    available_run_paths: Sequence[str],
+    preferred_run_path: str | None = None,
+) -> dict[str, Any] | None:
+    """Restore ordered models from the latest non-stale preparation Job/request."""
+    root = Path(repository_root).resolve()
+    available = set(available_run_paths)
+    jobs = list_preparation_jobs(
+        jobs_root,
+        run_path=preferred_run_path,
+        source_type="managed_autogluon",
+    )
+    for job in jobs:
+        references = job.get("references") or {}
+        run_path = str(references.get("run_path") or "")
+        request_id = str(references.get("request_id") or "")
+        if not run_path or run_path not in available or not request_id:
+            continue
+        try:
+            request = load_preparation_request(request_id, repository_root=root)
+            verify_request_run_identity(request, repository_root=root)
+        except Exception:  # noqa: BLE001 - skip stale/invalid recovery candidates
+            continue
+        if request.run_path != run_path:
+            continue
+        inventory = inventory_autogluon_run(
+            resolve_under_repository(run_path, root),
+            repository_root=root,
+        )
+        if any(name not in inventory.model_names for name in request.selected_models):
+            continue
+        return {
+            "run_path": request.run_path,
+            "selected_models": list(request.selected_models),
+            "request_id": request.request_id,
+            "job_id": job.get("job_id"),
+            "action_id": job.get("action_id"),
+        }
+    return None
+
+
+def list_preparation_jobs(
+    jobs_root: Path,
+    *,
+    run_path: str | None = None,
+    request_id: str | None = None,
+    source_type: str | None = "managed_autogluon",
+    command_id: str = PREPARATION_COMMAND_ID,
+) -> list[dict[str, Any]]:
+    if not jobs_root.is_dir():
+        return []
+    matches: list[dict[str, Any]] = []
+    for entry in sorted(jobs_root.iterdir(), key=lambda item: item.name):
+        if not entry.is_dir():
+            continue
+        job_path = entry / "job.json"
+        if not job_path.is_file():
+            continue
+        try:
+            job = json.loads(job_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if job.get("schema_version") != 2:
+            continue
+        if job.get("command_id") != command_id:
+            continue
+        references = job.get("references")
+        if not isinstance(references, dict):
+            continue
+        if source_type is not None and str(references.get("source_type") or "") != source_type:
+            continue
+        if request_id is not None and str(references.get("request_id") or "") != request_id:
+            continue
+        if run_path is not None and str(references.get("run_path") or "") != run_path:
+            continue
+        status_payload: dict[str, Any] = {}
+        status_path = entry / "status.json"
+        if status_path.is_file():
+            try:
+                loaded = json.loads(status_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    status_payload = loaded
+            except (OSError, json.JSONDecodeError):
+                status_payload = {}
+        matches.append(
+            {
+                "job_id": str(job.get("job_id") or entry.name),
+                "command_id": job.get("command_id"),
+                "action_id": job.get("action_id"),
+                "created_at_utc": job.get("created_at_utc"),
+                "references": dict(references),
+                "state": status_payload.get("state"),
+                "exit_code": status_payload.get("exit_code"),
+                "started_at_utc": status_payload.get("started_at_utc"),
+                "finished_at_utc": status_payload.get("finished_at_utc"),
+            }
+        )
+    matches.sort(key=lambda item: str(item.get("created_at_utc") or ""), reverse=True)
+    return matches
 
 
 def verify_preparation_result(
@@ -656,18 +961,32 @@ def _read_json(path: Path) -> Any:
 
 __all__ = [
     "CACHE_CONTRACT_VERSION",
+    "DURABLE_CONTEXT_KEY",
+    "INDEPENDENT_CANDIDATE_COPY",
     "MAX_MODELS",
     "MIN_MODELS",
+    "PREPARATION_COMMAND_ID",
     "CandidatePreparationError",
     "authorized_preparation_argv_values",
     "build_model_rows",
     "discover_managed_autogluon_runs",
     "discover_managed_run_directories",
+    "durable_preparation_context_from_session",
     "ensemble_component_warning",
     "filter_managed_runs",
+    "independent_candidate_summary",
     "list_jobs_for_preparation_request",
+    "list_preparation_jobs",
     "managed_runs_inventory_fingerprint",
+    "package_status_label",
+    "persist_preparation_context",
     "prepare_preparation_request",
+    "preparation_button_label",
+    "preview_independent_candidate_rows",
+    "preview_request_for_selection",
+    "recover_validation_for_request",
+    "resolve_request_for_selection",
+    "restore_selection_from_jobs",
     "summarize_managed_run",
     "verify_preparation_result",
     "verify_validation_result",
