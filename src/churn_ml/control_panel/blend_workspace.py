@@ -34,11 +34,23 @@ from src.churn_ml.control_panel.blend_ui_request_v1 import (
     validate_candidate_ids,
 )
 from src.churn_ml.control_panel.candidate_display import (
+    load_candidate_metadata,
     resolve_candidate_display,
 )
 from src.churn_ml.control_panel.command_builder import SAFE_STRING
+from src.churn_ml.control_panel.fs_signatures import (
+    cheap_inventory_fingerprint,
+    path_stat_mapping,
+)
+from src.churn_ml.control_panel.performance import (
+    note_files_inspected,
+    note_files_read,
+    performance_stage,
+    record_counter,
+)
 from src.churn_ml.prediction_candidates.contract_v1 import (
     MANIFEST_FILENAME,
+    SOURCE_METADATA_FILENAME,
     SUCCESS_FILENAME,
     PredictionCandidateError,
     file_sha256,
@@ -48,14 +60,13 @@ from src.churn_ml.prediction_candidates.contract_v1 import (
 from src.churn_ml.prediction_candidates.submission_v1 import (
     MANIFEST_FILENAME as SUBMISSION_MANIFEST_FILENAME,
     CandidateSubmissionError,
-    evaluate_submission_readiness,
     extract_final_deployment_threshold,
     normalize_submission_root_relative,
 )
 from src.churn_ml.research_data import canonical_sha256
 
 
-CACHE_CONTRACT_VERSION = "blend_workspace_candidate_cache_v1"
+CACHE_CONTRACT_VERSION = "blend_workspace_candidate_cache_v2"
 CANONICAL_SUBMISSION_HANDOFF_KEY = "canonical_submission_handoff"
 
 _SOURCE_KIND_LABELS = {
@@ -176,33 +187,50 @@ def candidate_inventory_fingerprint(
     repository_root: Path | str,
     candidates_root_relative: str | None = None,
 ) -> str:
+    """Cheap cache key for candidate inventory (path/size/mtime, no content hash).
+
+    Cache contract:
+    - what: inventory projection validity token
+    - key inputs: candidate_id + manifest/success/source_metadata stats
+    - invalidation: any tracked file size/mtime change, or new/removed package
+    - incomplete packages: absence of ``_SUCCESS`` changes the signature
+    - manual refresh: clear ``_load_candidate_rows_cached``
+    """
     root = Path(repository_root).resolve()
-    summaries = list_candidates(
-        repository_root=root,
-        candidates_root=candidates_root_relative,
-    )
     relative_root, absolute_root = resolve_candidates_root(root, candidates_root_relative)
-    entries: list[tuple[str, str, str]] = []
-    for summary in summaries:
-        candidate_id = str(summary["candidate_id"])
-        package_dir = absolute_root / candidate_id
-        manifest_path = package_dir / MANIFEST_FILENAME
-        success_path = package_dir / SUCCESS_FILENAME
-        if not manifest_path.is_file() or not success_path.is_file():
+    del relative_root
+    if not absolute_root.is_dir():
+        return cheap_inventory_fingerprint([])
+    entries: list[dict[str, Any]] = []
+    try:
+        children = sorted(absolute_root.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return cheap_inventory_fingerprint([])
+    for child in children:
+        if not child.is_dir() or child.name.startswith("."):
             continue
+        manifest_path = child / MANIFEST_FILENAME
+        success_path = child / SUCCESS_FILENAME
+        metadata_path = child / SOURCE_METADATA_FILENAME
+        if not manifest_path.is_file() and not success_path.is_file():
+            continue
+        note_files_inspected(3)
         entries.append(
-            (
-                candidate_id,
-                file_sha256(manifest_path),
-                file_sha256(success_path),
-            )
+            {
+                "path": child.name,
+                "exists": True,
+                "size": None,
+                "mtime_ns": None,
+                "manifest": path_stat_mapping(manifest_path, relative="manifest"),
+                "success": path_stat_mapping(success_path, relative="success"),
+                "source_metadata": path_stat_mapping(
+                    metadata_path, relative="source_metadata"
+                ),
+            }
         )
-    entries.sort()
+    # Nested stats are flattened into a stable content hash via JSON.
     return canonical_sha256(
-        [
-            {"candidate_id": item[0], "manifest_sha256": item[1], "success_sha256": item[2]}
-            for item in entries
-        ]
+        {"contract": CACHE_CONTRACT_VERSION, "entries": entries}
     )
 
 
@@ -211,150 +239,198 @@ def discover_candidate_rows(
     *,
     candidates_root_relative: str | None = None,
     include_readiness: bool = True,
+    include_payloads: bool = False,
 ) -> list[dict[str, Any]]:
-    root = Path(repository_root).resolve()
-    relative_root, absolute_root = resolve_candidates_root(root, candidates_root_relative)
-    if not absolute_root.is_dir():
-        return []
-    # Canonical discover skips unreadable packages; the UI still surfaces them
-    # as invalid so operators can see tampered/incomplete inventory entries.
-    summaries_by_id = {
-        str(item["candidate_id"]): item
-        for item in list_candidates(
-            repository_root=root,
-            candidates_root=candidates_root_relative,
-        )
-    }
-    directory_ids: list[str] = []
-    for child in sorted(absolute_root.iterdir(), key=lambda item: item.name):
-        if not child.is_dir() or child.name.startswith("."):
-            continue
-        if not (child / SUCCESS_FILENAME).is_file() and not (
-            child / MANIFEST_FILENAME
-        ).is_file():
-            continue
-        directory_ids.append(child.name)
+    """Discover UI inventory rows for canonical prediction candidates.
 
-    rows: list[dict[str, Any]] = []
-    for candidate_id in directory_ids:
-        summary = summaries_by_id.get(candidate_id) or {
-            "candidate_id": candidate_id,
-            "source_model_name": candidate_id,
-            "source_kind": None,
-            "dataset_id": None,
-        }
-        package_dir = absolute_root / candidate_id
-        manifest_path = package_dir / MANIFEST_FILENAME
-        success_path = package_dir / SUCCESS_FILENAME
-        manifest_sha256 = (
-            file_sha256(manifest_path) if manifest_path.is_file() else None
+    By default this is a lightweight JSON projection: manifests and
+    ``source_metadata.json`` only. OOF/test Parquet payloads are not read for
+    selectors. Strict package validation and readiness evaluation remain
+    available for selected candidates / operation boundaries.
+    """
+    with performance_stage("candidate_discovery"):
+        root = Path(repository_root).resolve()
+        relative_root, absolute_root = resolve_candidates_root(
+            root, candidates_root_relative
         )
-        success_sha256 = file_sha256(success_path) if success_path.is_file() else None
-        package_status = "completed" if success_path.is_file() else "incomplete"
-        readiness_state: str | None = None
-        readiness_blockers: list[dict[str, str]] = []
-        final_threshold: float | None = None
-        parent_dataset_id = summary.get("parent_dataset_id")
-        target_dependency = summary.get("target_dependency")
-        exploratory = summary.get("exploratory")
-        probability_min: float | None = None
-        probability_max: float | None = None
-        loaded_package = None
-        try:
-            loaded_package = load_candidate_package(
-                package_dir,
+        if not absolute_root.is_dir():
+            return []
+        # Canonical discover skips unreadable packages; the UI still surfaces them
+        # as invalid so operators can see tampered/incomplete inventory entries.
+        summaries_by_id = {
+            str(item["candidate_id"]): item
+            for item in list_candidates(
+                repository_root=root,
+                candidates_root=candidates_root_relative,
+            )
+        }
+        directory_ids: list[str] = []
+        for child in sorted(absolute_root.iterdir(), key=lambda item: item.name):
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            if not (child / SUCCESS_FILENAME).is_file() and not (
+                child / MANIFEST_FILENAME
+            ).is_file():
+                continue
+            directory_ids.append(child.name)
+            note_files_inspected(1)
+
+        rows: list[dict[str, Any]] = []
+        for candidate_id in directory_ids:
+            summary = summaries_by_id.get(candidate_id) or {
+                "candidate_id": candidate_id,
+                "source_model_name": candidate_id,
+                "source_kind": None,
+                "dataset_id": None,
+            }
+            package_dir = absolute_root / candidate_id
+            manifest_path = package_dir / MANIFEST_FILENAME
+            success_path = package_dir / SUCCESS_FILENAME
+            metadata = load_candidate_metadata(
+                candidate_id,
                 repository_root=root,
                 candidates_root_relative=relative_root,
             )
-            manifest = loaded_package.manifest
-            parent_dataset_id = manifest.get("parent_dataset_id", parent_dataset_id)
-            target_dependency = manifest.get("target_dependency", target_dependency)
-            exploratory = bool(manifest.get("exploratory", exploratory))
-            probs = loaded_package.test["probability_positive"].to_numpy(dtype=np.float64)
-            if probs.size:
-                probability_min = float(np.min(probs))
-                probability_max = float(np.max(probs))
-            threshold = extract_final_deployment_threshold(
-                loaded_package.source_metadata
+            note_files_read(1)
+            record_counter("candidate_manifest_reads", 1)
+            missing_reason = metadata.get("missing_reason")
+            package_status = "completed" if success_path.is_file() else "incomplete"
+            if missing_reason or not manifest_path.is_file():
+                package_status = "invalid"
+            # Inventory projections intentionally avoid hashing every file. SHA
+            # values are filled only when a caller requests payload inspection.
+            manifest_sha256: str | None = None
+            success_sha256: str | None = None
+            if include_payloads:
+                manifest_sha256 = (
+                    file_sha256(manifest_path) if manifest_path.is_file() else None
+                )
+                success_sha256 = (
+                    file_sha256(success_path) if success_path.is_file() else None
+                )
+            readiness_state: str | None = None
+            readiness_blockers: list[dict[str, str]] = []
+            final_threshold: float | None = None
+            parent_dataset_id = metadata.get("parent_dataset_id") or summary.get(
+                "parent_dataset_id"
             )
+            target_dependency = metadata.get("target_dependency") or summary.get(
+                "target_dependency"
+            )
+            exploratory = bool(
+                metadata.get("exploratory", summary.get("exploratory", False))
+            )
+            probability_min: float | None = None
+            probability_max: float | None = None
+            source_model_name = metadata.get("source_model_name") or summary.get(
+                "source_model_name"
+            )
+            source_kind = metadata.get("source_kind") or summary.get("source_kind")
+            dataset_id = metadata.get("dataset_id") or summary.get("dataset_id")
+            source_metadata = metadata.get("source_metadata")
+            if not isinstance(source_metadata, Mapping):
+                source_metadata = {}
+            threshold = extract_final_deployment_threshold(source_metadata)
+            if threshold is None:
+                threshold = extract_final_deployment_threshold(metadata)
             if threshold is not None and np.isfinite(threshold):
                 final_threshold = float(threshold)
+            if include_payloads:
+                try:
+                    loaded_package = load_candidate_package(
+                        package_dir,
+                        repository_root=root,
+                        candidates_root_relative=relative_root,
+                    )
+                    probs = loaded_package.test["probability_positive"].to_numpy(
+                        dtype=np.float64
+                    )
+                    if probs.size:
+                        probability_min = float(np.min(probs))
+                        probability_max = float(np.max(probs))
+                    package_status = "completed"
+                except (
+                    PredictionCandidateError,
+                    OSError,
+                    json.JSONDecodeError,
+                    ValueError,
+                ):
+                    package_status = "invalid"
             if include_readiness:
-                readiness = evaluate_submission_readiness(
-                    candidate_id,
-                    repository_root=root,
-                    candidates_root_relative=relative_root,
-                )
-                readiness_state = str(readiness["state"])
-                readiness_blockers = list(readiness.get("blockers") or [])
-                if final_threshold is None and readiness.get("threshold") is not None:
-                    final_threshold = float(readiness["threshold"])
-        except (PredictionCandidateError, OSError, json.JSONDecodeError, ValueError):
-            package_status = "invalid"
-            loaded_package = None
-            if include_readiness:
-                readiness_state = "blocked"
-                readiness_blockers = [
-                    {
-                        "code": "candidate_invalid",
-                        "message": "Candidate package failed strict validation.",
-                    }
-                ]
-        if loaded_package is not None:
+                if package_status == "invalid" or not success_path.is_file():
+                    readiness_state = "blocked"
+                    readiness_blockers = [
+                        {
+                            "code": "candidate_invalid",
+                            "message": "Candidate package failed inventory checks.",
+                        }
+                    ]
+                else:
+                    # Projected readiness for selectors: threshold present and
+                    # success marker exists. Strict evaluation happens for the
+                    # selected candidate on the Run submission path.
+                    if final_threshold is not None and np.isfinite(final_threshold):
+                        readiness_state = "ready"
+                        readiness_blockers = []
+                    else:
+                        readiness_state = "blocked"
+                        readiness_blockers = [
+                            {
+                                "code": "final_threshold_missing",
+                                "message": (
+                                    "Final deployment threshold is missing from "
+                                    "source metadata."
+                                ),
+                            }
+                        ]
             label_payload: dict[str, Any] = {
                 "candidate_id": candidate_id,
-                "source_model_name": loaded_package.manifest.get(
-                    "source_model_name", summary.get("source_model_name")
-                ),
-                "source_kind": loaded_package.manifest.get(
-                    "source_kind", summary.get("source_kind")
-                ),
-                "dataset_id": loaded_package.manifest.get(
-                    "dataset_id", summary.get("dataset_id")
-                ),
-                "source_metadata": loaded_package.source_metadata,
-                "exploratory": loaded_package.manifest.get("exploratory"),
-            }
-        else:
-            label_payload = {
-                "candidate_id": candidate_id,
-                "source_model_name": summary.get("source_model_name"),
-                "source_kind": summary.get("source_kind"),
-                "dataset_id": summary.get("dataset_id"),
-            }
-        display = resolve_candidate_display(label_payload, repository_root=root)
-        label = display.primary_label
-        rows.append(
-            {
-                "candidate_id": candidate_id,
-                "label": label,
-                "compact_label": display.compact_label,
-                "source_model_name": summary.get("source_model_name"),
-                "source_kind": summary.get("source_kind"),
-                "source_kind_label": source_kind_label(
-                    str(summary.get("source_kind") or "")
-                ),
-                "dataset_id": summary.get("dataset_id"),
-                "dataset_label": display.dataset_label,
-                "parent_dataset_id": parent_dataset_id,
-                "target_dependency": target_dependency,
+                "source_model_name": source_model_name,
+                "source_kind": source_kind,
+                "dataset_id": dataset_id,
+                "source_metadata": {
+                    "parent_candidate_ids": metadata.get("parent_candidate_ids") or [],
+                    "final_deployment_weights": metadata.get(
+                        "final_deployment_weights"
+                    )
+                    or {},
+                    "strategy": metadata.get("strategy"),
+                    "optimizer_backend": metadata.get("optimizer_backend"),
+                    "blend_id": metadata.get("blend_id"),
+                    "final_deployment_threshold": final_threshold,
+                },
                 "exploratory": exploratory,
-                "source_metric_name": summary.get("source_metric_name"),
-                "source_metric_value": summary.get("source_metric_value"),
-                "oof_protocol": summary.get("oof_protocol"),
-                "readiness_state": readiness_state,
-                "readiness_blockers": readiness_blockers,
-                "final_threshold": final_threshold,
-                "package_status": package_status,
-                "manifest_sha256": manifest_sha256,
-                "success_sha256": success_sha256,
-                "train_row_count": summary.get("train_row_count"),
-                "test_row_count": summary.get("test_row_count"),
-                "probability_min": probability_min,
-                "probability_max": probability_max,
             }
-        )
-    return rows
+            display = resolve_candidate_display(label_payload, repository_root=root)
+            rows.append(
+                {
+                    "candidate_id": candidate_id,
+                    "label": display.primary_label,
+                    "compact_label": display.compact_label,
+                    "source_model_name": source_model_name,
+                    "source_kind": source_kind,
+                    "source_kind_label": source_kind_label(str(source_kind or "")),
+                    "dataset_id": dataset_id,
+                    "dataset_label": display.dataset_label,
+                    "parent_dataset_id": parent_dataset_id,
+                    "target_dependency": target_dependency,
+                    "exploratory": exploratory,
+                    "source_metric_name": summary.get("source_metric_name"),
+                    "source_metric_value": summary.get("source_metric_value"),
+                    "oof_protocol": summary.get("oof_protocol"),
+                    "readiness_state": readiness_state,
+                    "readiness_blockers": readiness_blockers,
+                    "final_threshold": final_threshold,
+                    "package_status": package_status,
+                    "manifest_sha256": manifest_sha256,
+                    "success_sha256": success_sha256,
+                    "train_row_count": summary.get("train_row_count"),
+                    "test_row_count": summary.get("test_row_count"),
+                    "probability_min": probability_min,
+                    "probability_max": probability_max,
+                }
+            )
+        return rows
 
 
 def filter_candidate_rows(
@@ -677,28 +753,178 @@ def list_jobs_for_request(
     return matches
 
 
-def discover_materialized_blends(
+def materialized_blends_fingerprint(
     repository_root: Path | str,
     blend_root_relative: str | None = None,
-) -> list[dict[str, Any]]:
+) -> str:
+    """Cheap cache key for materialized blend inventory."""
     root = Path(repository_root).resolve()
     blend_root_rel = normalize_blend_root_relative(blend_root_relative)
     blend_root = resolve_under_repository(blend_root_rel, root)
     if not blend_root.is_dir():
-        return []
-    rows: list[dict[str, Any]] = []
-    for child in sorted(blend_root.iterdir(), key=lambda item: item.name):
+        return cheap_inventory_fingerprint([])
+    entries: list[dict[str, Any]] = []
+    try:
+        children = sorted(blend_root.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return cheap_inventory_fingerprint([])
+    for child in children:
         if not child.is_dir() or child.name.startswith("."):
             continue
-        blend_id = child.name
-        try:
-            loaded = load_blend_artifact(
-                blend_id,
-                repository_root=root,
-                blend_root_relative=blend_root_rel,
-            )
-            manifest = loaded["manifest"]
+        note_files_inspected(2)
+        entries.append(
+            {
+                "path": child.name,
+                "exists": True,
+                "size": None,
+                "mtime_ns": None,
+                "manifest": path_stat_mapping(
+                    child / "blend_manifest.json", relative="manifest"
+                ),
+                "success": path_stat_mapping(child / SUCCESS_FILENAME, relative="success"),
+            }
+        )
+    return canonical_sha256(
+        {"contract": "materialized_blends_cache_v1", "entries": entries}
+    )
+
+
+def discover_materialized_blends(
+    repository_root: Path | str,
+    blend_root_relative: str | None = None,
+    *,
+    include_loaded: bool = False,
+) -> list[dict[str, Any]]:
+    """Discover materialized blends.
+
+    Default inventory is a lightweight JSON projection. Pass
+    ``include_loaded=True`` only when a caller needs the full validated
+    artifact payload for every blend.
+    """
+    with performance_stage("materialized_blend_discovery"):
+        root = Path(repository_root).resolve()
+        blend_root_rel = normalize_blend_root_relative(blend_root_relative)
+        blend_root = resolve_under_repository(blend_root_rel, root)
+        if not blend_root.is_dir():
+            return []
+        rows: list[dict[str, Any]] = []
+        for child in sorted(blend_root.iterdir(), key=lambda item: item.name):
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            blend_id = child.name
+            note_files_inspected(1)
+            success_path = child / SUCCESS_FILENAME
+            manifest_path = child / "blend_manifest.json"
+            if include_loaded:
+                try:
+                    loaded = load_blend_artifact(
+                        blend_id,
+                        repository_root=root,
+                        blend_root_relative=blend_root_rel,
+                    )
+                except BlendArtifactError as error:
+                    rows.append(
+                        {
+                            "blend_id": blend_id,
+                            "status": "blocked",
+                            "label": blend_id,
+                            "reason": str(error),
+                            "reason_code": error.reason_code,
+                        }
+                    )
+                    continue
+                manifest = loaded["manifest"]
+                readiness = manifest.get("submission_readiness") or {}
+                rows.append(
+                    {
+                        "blend_id": blend_id,
+                        "status": "completed",
+                        "label": blend_display_label(
+                            {
+                                **manifest,
+                                "optimizer_backend": loaded.get("optimizer_backend"),
+                                "final_deployment_weights": loaded.get(
+                                    "final_deployment_weights"
+                                ),
+                                "canonical_candidate_id": loaded.get(
+                                    "canonical_candidate_id"
+                                ),
+                            },
+                            repository_root=root,
+                        ),
+                        "candidate_ids": list(manifest.get("candidate_ids") or []),
+                        "optimizer_backend": loaded.get("optimizer_backend"),
+                        "honest_meta_cv_metrics": loaded.get("honest_meta_cv_metrics"),
+                        "final_deployment_threshold": loaded.get(
+                            "final_deployment_threshold"
+                        ),
+                        "final_deployment_weights": loaded.get(
+                            "final_deployment_weights"
+                        ),
+                        "exploratory": bool(manifest.get("exploratory")),
+                        "submission_readiness": readiness,
+                        "created_at_utc": manifest.get("created_at_utc"),
+                        "canonical_candidate_id": loaded.get("canonical_candidate_id"),
+                        "manifest_sha256": loaded.get("manifest_sha256"),
+                        "loaded": loaded,
+                    }
+                )
+                continue
+            if not success_path.is_file() or not manifest_path.is_file():
+                rows.append(
+                    {
+                        "blend_id": blend_id,
+                        "status": "blocked",
+                        "label": blend_id,
+                        "reason": "Blend artifact missing _SUCCESS or manifest.",
+                        "reason_code": "success_missing",
+                    }
+                )
+                continue
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                note_files_read(1, bytes_read=manifest_path.stat().st_size)
+            except (OSError, json.JSONDecodeError) as error:
+                rows.append(
+                    {
+                        "blend_id": blend_id,
+                        "status": "blocked",
+                        "label": blend_id,
+                        "reason": str(error),
+                        "reason_code": "json_invalid",
+                    }
+                )
+                continue
+            if not isinstance(manifest, dict):
+                rows.append(
+                    {
+                        "blend_id": blend_id,
+                        "status": "blocked",
+                        "label": blend_id,
+                        "reason": "Blend manifest must be a JSON object.",
+                        "reason_code": "json_invalid",
+                    }
+                )
+                continue
+            deployment = manifest.get("deployment")
+            if not isinstance(deployment, Mapping):
+                deployment = {}
             readiness = manifest.get("submission_readiness") or {}
+            weights = deployment.get("weights") or manifest.get(
+                "final_deployment_weights"
+            )
+            optimizer = (
+                deployment.get("optimizer_backend")
+                or manifest.get("optimizer_backend")
+            )
+            threshold = deployment.get("threshold")
+            if threshold is None:
+                threshold = manifest.get("final_deployment_threshold")
+            canonical_candidate_id = (
+                manifest.get("canonical_candidate_id")
+                or deployment.get("canonical_candidate_id")
+            )
+            honest = manifest.get("honest_meta_cv_metrics") or {}
             rows.append(
                 {
                     "blend_id": blend_id,
@@ -706,41 +932,67 @@ def discover_materialized_blends(
                     "label": blend_display_label(
                         {
                             **manifest,
-                            "optimizer_backend": loaded.get("optimizer_backend"),
-                            "final_deployment_weights": loaded.get(
-                                "final_deployment_weights"
-                            ),
-                            "canonical_candidate_id": loaded.get(
-                                "canonical_candidate_id"
-                            ),
+                            "optimizer_backend": optimizer,
+                            "final_deployment_weights": weights,
+                            "canonical_candidate_id": canonical_candidate_id,
                         },
                         repository_root=root,
                     ),
                     "candidate_ids": list(manifest.get("candidate_ids") or []),
-                    "optimizer_backend": loaded.get("optimizer_backend"),
-                    "honest_meta_cv_metrics": loaded.get("honest_meta_cv_metrics"),
-                    "final_deployment_threshold": loaded.get(
-                        "final_deployment_threshold"
-                    ),
+                    "optimizer_backend": optimizer,
+                    "honest_meta_cv_metrics": honest,
+                    "final_deployment_threshold": threshold,
+                    "final_deployment_weights": weights,
                     "exploratory": bool(manifest.get("exploratory")),
                     "submission_readiness": readiness,
                     "created_at_utc": manifest.get("created_at_utc"),
-                    "canonical_candidate_id": loaded.get("canonical_candidate_id"),
-                    "manifest_sha256": loaded.get("manifest_sha256"),
-                    "loaded": loaded,
+                    "canonical_candidate_id": canonical_candidate_id,
+                    "manifest_sha256": None,
+                    "loaded": None,
                 }
             )
-        except BlendArtifactError as error:
-            rows.append(
-                {
-                    "blend_id": blend_id,
-                    "status": "blocked",
-                    "label": blend_id,
-                    "reason": str(error),
-                    "reason_code": error.reason_code,
-                }
-            )
-    return rows
+        return rows
+
+
+def load_materialized_blend_details(
+    blend_id: str,
+    *,
+    repository_root: Path | str,
+    blend_root_relative: str | None = None,
+) -> dict[str, Any]:
+    """Strictly load one materialized blend for inspection/handoff."""
+    root = Path(repository_root).resolve()
+    blend_root_rel = normalize_blend_root_relative(blend_root_relative)
+    loaded = load_blend_artifact(
+        blend_id,
+        repository_root=root,
+        blend_root_relative=blend_root_rel,
+    )
+    manifest = loaded["manifest"]
+    return {
+        "blend_id": blend_id,
+        "status": "completed",
+        "label": blend_display_label(
+            {
+                **manifest,
+                "optimizer_backend": loaded.get("optimizer_backend"),
+                "final_deployment_weights": loaded.get("final_deployment_weights"),
+                "canonical_candidate_id": loaded.get("canonical_candidate_id"),
+            },
+            repository_root=root,
+        ),
+        "candidate_ids": list(manifest.get("candidate_ids") or []),
+        "optimizer_backend": loaded.get("optimizer_backend"),
+        "honest_meta_cv_metrics": loaded.get("honest_meta_cv_metrics"),
+        "final_deployment_threshold": loaded.get("final_deployment_threshold"),
+        "final_deployment_weights": loaded.get("final_deployment_weights"),
+        "exploratory": bool(manifest.get("exploratory")),
+        "submission_readiness": manifest.get("submission_readiness") or {},
+        "created_at_utc": manifest.get("created_at_utc"),
+        "canonical_candidate_id": loaded.get("canonical_candidate_id"),
+        "manifest_sha256": loaded.get("manifest_sha256"),
+        "loaded": loaded,
+    }
 
 
 def apply_canonical_submission_handoff(
@@ -948,7 +1200,9 @@ __all__ = [
     "expected_blend_id",
     "filter_candidate_rows",
     "list_jobs_for_request",
+    "load_materialized_blend_details",
     "load_validated_submission_csv_bytes",
+    "materialized_blends_fingerprint",
     "method_label",
     "optimizer_label",
     "parse_job_stdout_json",

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.churn_ml.control_panel.blend_workspace import parse_job_stdout_json
+from src.churn_ml.control_panel.fs_signatures import path_stat_mapping
 from src.churn_ml.control_panel.selection_state import (
     get_durable_value,
     set_durable_value,
@@ -50,7 +51,7 @@ from src.churn_ml.prediction_candidates.submission_v1 import (
 from src.churn_ml.research_data import canonical_sha256
 
 
-CACHE_CONTRACT_VERSION = "candidate_preparation_cache_v1"
+CACHE_CONTRACT_VERSION = "candidate_preparation_cache_v2"
 ENSEMBLE_PREFIX = re.compile(r"^WeightedEnsemble_")
 PREPARATION_COMMAND_ID = "autogluon_candidate_preparation_v1"
 DURABLE_CONTEXT_KEY = "autogluon_candidate_preparation_v1::context"
@@ -88,16 +89,32 @@ def discover_managed_run_directories(repository_root: Path | str) -> list[Path]:
 
 
 def managed_runs_inventory_fingerprint(repository_root: Path | str) -> str:
+    """Cheap cache key for managed AutoGluon run inventory.
+
+    Uses directory entry stats instead of hashing every identity file on each
+    Blend Prepare rerun. Strict identity hashes remain at prepare/validate time.
+    """
     root = Path(repository_root).resolve()
-    entries: list[dict[str, str | None]] = []
+    identity_names = (
+        "run_metadata.json",
+        "worker_result.json",
+        "resolved_config.yaml",
+        "_SUCCESS",
+        "_FAILED",
+        "execution_status.json",
+    )
+    entries: list[dict[str, Any]] = []
     for run_dir in discover_managed_run_directories(root):
-        hashes = collect_run_identity_hashes(run_dir)
-        entries.append(
-            {
-                "run_path": run_dir.relative_to(root).as_posix().replace("\\", "/"),
-                **hashes,
-            }
+        relative = run_dir.relative_to(root).as_posix().replace("\\", "/")
+        files = {
+            name: path_stat_mapping(run_dir / name, relative=name)
+            for name in identity_names
+        }
+        leaderboard = run_dir / "inspection" / "leaderboard.csv"
+        files["leaderboard.csv"] = path_stat_mapping(
+            leaderboard, relative="inspection/leaderboard.csv"
         )
+        entries.append({"run_path": relative, "files": files})
     return canonical_sha256(
         {"contract": CACHE_CONTRACT_VERSION, "runs": entries}
     )

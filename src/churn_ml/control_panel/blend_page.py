@@ -30,11 +30,17 @@ from src.churn_ml.control_panel.blend_workspace import (
     expected_blend_id,
     filter_candidate_rows,
     list_jobs_for_request,
+    load_materialized_blend_details,
+    materialized_blends_fingerprint,
     parse_job_stdout_json,
     readiness_label,
     run_compatibility,
     run_diversity,
     selection_fingerprint,
+)
+from src.churn_ml.control_panel.performance import (
+    performance_stage,
+    record_counter,
 )
 from src.churn_ml.control_panel.candidate_display import (
     candidate_display_map,
@@ -77,6 +83,12 @@ except Exception:  # pragma: no cover
 
 
 STATE_PREFIX = "blend_workspace"
+BLEND_VIEW_OPTIONS = (
+    "Prepare candidates",
+    "Build blend",
+    "Search history",
+    "Materialized blends",
+)
 METHOD_OPTIONS = {
     "Equal": "Equal weights",
     "manual": "Manual weights",
@@ -97,6 +109,14 @@ def _load_candidate_rows_cached(
     return discover_candidate_rows(Path(root), include_readiness=True)
 
 
+@st.cache_data(show_spinner="Loading materialized blends…")
+def _load_materialized_blends_cached(
+    root: str, fingerprint: str, contract: str
+) -> list[dict[str, Any]]:
+    del fingerprint, contract
+    return discover_materialized_blends(Path(root), include_loaded=False)
+
+
 def _cached_candidate_rows(
     repository_root: Path,
     inventory_fingerprint: str,
@@ -106,6 +126,59 @@ def _cached_candidate_rows(
         inventory_fingerprint,
         CACHE_CONTRACT_VERSION,
     )
+
+
+def load_cached_candidate_inventory(
+    repository_root: Path,
+    *,
+    force_refresh: bool = False,
+) -> list[dict[str, Any]]:
+    """Public cached candidate inventory for Run and Blend pages.
+
+    Cache contract:
+    - what: lightweight candidate row projections
+    - key: repository root + cheap inventory fingerprint + cache contract
+    - invalidation: manifest/success/source_metadata size/mtime changes
+    - incomplete packages: absence of ``_SUCCESS`` changes the fingerprint
+    - manual refresh: ``force_refresh=True`` or Refresh candidates button
+    """
+    if force_refresh:
+        _load_candidate_rows_cached.clear()
+    fingerprint = candidate_inventory_fingerprint(repository_root)
+    return _cached_candidate_rows(repository_root, fingerprint)
+
+
+def _cached_materialized_blends(
+    repository_root: Path,
+    inventory_fingerprint: str,
+) -> list[dict[str, Any]]:
+    return _load_materialized_blends_cached(
+        str(repository_root.resolve()),
+        inventory_fingerprint,
+        "materialized_blends_cache_v1",
+    )
+
+
+def _resolve_active_blend_view() -> str:
+    """Return the durable active Blend workspace view label."""
+    view_key = _state_key("active_view")
+    preferred = st.session_state.pop(_state_key("active_tab"), None)
+    if preferred in BLEND_VIEW_OPTIONS:
+        st.session_state[view_key] = preferred
+        set_durable_value(
+            st.session_state,
+            ui_durable_key("blend", "active_view"),
+            preferred,
+        )
+    current = st.session_state.get(view_key)
+    if current not in BLEND_VIEW_OPTIONS:
+        durable = st.session_state.get(ui_durable_key("blend", "active_view"))
+        if durable in BLEND_VIEW_OPTIONS:
+            current = durable
+        else:
+            current = BLEND_VIEW_OPTIONS[1]
+        st.session_state[view_key] = current
+    return str(current)
 
 
 def render_blend_workspace_page(
@@ -120,41 +193,50 @@ def render_blend_workspace_page(
         "evaluate a leakage-safe blend, and prepare the result for submission."
     )
 
-    # Apply durable loaded configuration before any tab widgets are created.
+    # Apply durable loaded configuration before any view widgets are created.
     _apply_loaded_blend_configuration(repository_root)
 
-    tab_labels = (
-        "Prepare candidates",
-        "Build blend",
-        "Search history",
-        "Materialized blends",
+    view_key = _state_key("active_view")
+    _resolve_active_blend_view()
+    selected_view = st.segmented_control(
+        "Workspace view",
+        options=list(BLEND_VIEW_OPTIONS),
+        key=view_key,
+        help=(
+            "Only the selected heavy view runs on each rerun. "
+            "Switch views explicitly to load Prepare, Build, History, or Materialized."
+        ),
     )
-    preferred = st.session_state.pop(_state_key("active_tab"), None)
-    if preferred in tab_labels:
-        # Streamlit tabs do not support programmatic selection reliably; surface
-        # a clear cue when another tab requested navigation.
-        st.info(f"Open the **{preferred}** tab to continue.")
-    prepare_tab, build_tab, history_tab, materialized_tab = st.tabs(tab_labels)
-    with prepare_tab:
-        render_prepare_candidates_tab(
-            repository_root=repository_root,
-            registry=registry,
-            job_manager=job_manager,
-        )
-    with build_tab:
-        _render_build_blend_tab(
-            repository_root=repository_root,
-            registry=registry,
-            job_manager=job_manager,
-        )
-    with history_tab:
-        render_search_history_tab(
-            repository_root=repository_root,
-            registry=registry,
-            job_manager=job_manager,
-        )
-    with materialized_tab:
-        _render_materialized_blends(repository_root)
+    if selected_view not in BLEND_VIEW_OPTIONS:
+        selected_view = _resolve_active_blend_view()
+        st.session_state[view_key] = selected_view
+    set_durable_value(
+        st.session_state,
+        ui_durable_key("blend", "active_view"),
+        selected_view,
+    )
+    record_counter("blend_active_view_render", 1)
+    with performance_stage(f"blend_view:{selected_view}"):
+        if selected_view == "Prepare candidates":
+            render_prepare_candidates_tab(
+                repository_root=repository_root,
+                registry=registry,
+                job_manager=job_manager,
+            )
+        elif selected_view == "Build blend":
+            _render_build_blend_tab(
+                repository_root=repository_root,
+                registry=registry,
+                job_manager=job_manager,
+            )
+        elif selected_view == "Search history":
+            render_search_history_tab(
+                repository_root=repository_root,
+                registry=registry,
+                job_manager=job_manager,
+            )
+        else:
+            _render_materialized_blends(repository_root)
 
 
 def _render_build_blend_tab(
@@ -1138,7 +1220,10 @@ def _render_materialize_controls(
 
 def _render_materialized_blends(repository_root: Path) -> None:
     st.subheader("Materialized blends")
-    blends = discover_materialized_blends(repository_root)
+    fingerprint = materialized_blends_fingerprint(repository_root)
+    if st.button("Refresh materialized blends", key=_state_key("refresh_materialized")):
+        _load_materialized_blends_cached.clear()
+    blends = _cached_materialized_blends(repository_root, fingerprint)
     if not blends:
         st.caption("No materialized canonical blends found.")
         return
@@ -1197,6 +1282,13 @@ def _render_materialized_blends(repository_root: Path) -> None:
         ),
     )
     chosen = next(item for item in blends if item.get("blend_id") == selected)
+    try:
+        chosen = load_materialized_blend_details(
+            str(selected), repository_root=repository_root
+        )
+    except Exception as error:  # noqa: BLE001
+        st.error(f"Selected blend could not be loaded: {error}")
+        return
     parent_ids = list(chosen.get("candidate_ids") or [])
     parent_displays = candidate_display_map(parent_ids, repository_root=repository_root)
     loaded = chosen.get("loaded") or {}

@@ -227,12 +227,37 @@ def row_position_hash(row_count: int) -> str:
     return canonical_sha256(list(range(row_count)))
 
 
+_FILE_SHA256_MEMO: dict[tuple[str, int, int], str] = {}
+_FILE_SHA256_MEMO_MAX = 4096
+
+
+def clear_file_sha256_memo() -> None:
+    """Clear process-local SHA256 memoization used by ``file_sha256``."""
+    _FILE_SHA256_MEMO.clear()
+
+
 def file_sha256(path: Path) -> str:
+    """Return SHA256 of a file, memoized by resolved path + size + mtime_ns.
+
+    The digest is never reused when size or mtime changes. Callers that need a
+    forced re-read after an in-place rewrite with identical size/mtime should
+    call ``clear_file_sha256_memo()``.
+    """
+    resolved = path.resolve()
+    stat = resolved.stat()
+    key = (str(resolved), int(stat.st_size), int(stat.st_mtime_ns))
+    cached = _FILE_SHA256_MEMO.get(key)
+    if cached is not None:
+        return cached
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with resolved.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+    hex_digest = digest.hexdigest()
+    if len(_FILE_SHA256_MEMO) >= _FILE_SHA256_MEMO_MAX:
+        _FILE_SHA256_MEMO.pop(next(iter(_FILE_SHA256_MEMO)))
+    _FILE_SHA256_MEMO[key] = hex_digest
+    return hex_digest
 
 
 def build_file_reference(

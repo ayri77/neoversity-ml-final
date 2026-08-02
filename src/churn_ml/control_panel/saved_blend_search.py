@@ -22,17 +22,17 @@ from src.churn_ml.control_panel.blend_workspace import (
 )
 from src.churn_ml.control_panel.candidate_display import (
     compact_model_name,
+    load_candidate_metadata,
     resolve_candidate_display,
 )
+from src.churn_ml.control_panel.fs_signatures import path_stat_mapping
 from src.churn_ml.control_panel.selection_state import (
     get_durable_value,
     set_durable_value,
 )
 from src.churn_ml.prediction_candidates.contract_v1 import (
     MANIFEST_FILENAME,
-    PredictionCandidateError,
     file_sha256,
-    load_candidate_package,
     resolve_under_repository,
 )
 from src.churn_ml.research_data import canonical_sha256
@@ -122,10 +122,15 @@ def experiment_label_for(
 
 
 def jobs_search_fingerprint(jobs_root: Path | str) -> str:
+    """Cheap cache key for saved blend-search discovery.
+
+    Uses path/size/mtime tokens for job.json, status.json, and stdout.log.
+    Does not hash stdout contents on every Blend rerun.
+    """
     root = Path(jobs_root)
-    entries: list[dict[str, str | None]] = []
+    entries: list[dict[str, Any]] = []
     if not root.is_dir():
-        return canonical_sha256({"contract": "saved_blend_search_v1", "jobs": []})
+        return canonical_sha256({"contract": "saved_blend_search_v2", "jobs": []})
     for entry in sorted(root.iterdir(), key=lambda item: item.name):
         if not entry.is_dir():
             continue
@@ -145,12 +150,12 @@ def jobs_search_fingerprint(jobs_root: Path | str) -> str:
         entries.append(
             {
                 "job_id": str(job.get("job_id") or entry.name),
-                "job_sha256": file_sha256(job_path),
-                "status_sha256": file_sha256(status_path) if status_path.is_file() else None,
-                "stdout_sha256": file_sha256(stdout_path) if stdout_path.is_file() else None,
+                "job": path_stat_mapping(job_path, relative="job.json"),
+                "status": path_stat_mapping(status_path, relative="status.json"),
+                "stdout": path_stat_mapping(stdout_path, relative="stdout.log"),
             }
         )
-    return canonical_sha256({"contract": "saved_blend_search_v1", "jobs": entries})
+    return canonical_sha256({"contract": "saved_blend_search_v2", "jobs": entries})
 
 
 def discover_saved_blend_searches(
@@ -305,22 +310,22 @@ def _project_search_job(
         except BlendUIRequestError:
             method = str(request.payload.get("method") or None)
         budget = _search_budget_from_payload(request.payload)
+        # Inventory projection: JSON metadata only. Strict package validation and
+        # blend-id recomputation happen when a search is loaded/resumed.
         for candidate_id in candidate_ids:
-            try:
-                package = load_candidate_package(
-                    resolve_under_repository(
-                        f"artifacts/prediction_candidates/{candidate_id}",
-                        repository_root,
-                    ),
-                    repository_root=repository_root,
-                    candidates_root_relative=str(
-                        request.payload.get("candidate_root")
-                        or "artifacts/prediction_candidates"
-                    ),
-                )
-            except (PredictionCandidateError, OSError, ValueError) as error:
+            metadata = load_candidate_metadata(
+                candidate_id,
+                repository_root=repository_root,
+                candidates_root_relative=str(
+                    request.payload.get("candidate_root")
+                    or "artifacts/prediction_candidates"
+                ),
+            )
+            if metadata.get("missing_reason"):
                 blockers.append("candidate_missing")
-                technical.setdefault("candidate_errors", {})[candidate_id] = str(error)
+                technical.setdefault("candidate_errors", {})[candidate_id] = str(
+                    metadata.get("missing_reason")
+                )
                 candidate_labels.append(candidate_id)
                 candidate_datasets.append("")
                 manifest_hashes.append("")
@@ -328,12 +333,13 @@ def _project_search_job(
             display = resolve_candidate_display(
                 {
                     "candidate_id": candidate_id,
-                    "source_model_name": package.manifest.get("source_model_name"),
-                    "source_kind": package.manifest.get("source_kind"),
-                    "dataset_id": package.manifest.get("dataset_id"),
-                    "source_metadata": package.source_metadata,
-                    "exploratory": package.manifest.get("exploratory"),
-                }
+                    "source_model_name": metadata.get("source_model_name"),
+                    "source_kind": metadata.get("source_kind"),
+                    "dataset_id": metadata.get("dataset_id"),
+                    "source_metadata": metadata.get("source_metadata") or {},
+                    "exploratory": metadata.get("exploratory"),
+                },
+                repository_root=repository_root,
             )
             label = short_model_label(
                 display.model_name or candidate_id,
@@ -345,8 +351,15 @@ def _project_search_job(
                 f"artifacts/prediction_candidates/{candidate_id}",
                 repository_root,
             )
-            manifest_hashes.append(file_sha256(package_dir / MANIFEST_FILENAME))
-        if "candidate_missing" not in blockers:
+            manifest_path = package_dir / MANIFEST_FILENAME
+            manifest_hashes.append(
+                file_sha256(manifest_path) if manifest_path.is_file() else ""
+            )
+        expected_from_refs = references.get("expected_blend_id")
+        if expected_from_refs:
+            expected_id = str(expected_from_refs)
+        elif "candidate_missing" not in blockers:
+            # Fallback only when Jobs predate expected_blend_id references.
             try:
                 expected_id = expected_blend_id(request, repository_root)
             except Exception as error:  # noqa: BLE001

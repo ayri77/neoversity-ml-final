@@ -233,6 +233,12 @@ def load_candidate_metadata(
     merged["source_metadata"] = source_metadata
     merged["candidate_id"] = candidate_id
     meta = _metadata_from_mapping(merged)
+    meta["source_metadata"] = source_metadata
+    meta["parent_dataset_id"] = manifest.get("parent_dataset_id")
+    meta["target_dependency"] = manifest.get("target_dependency")
+    for key in ("final_deployment_threshold", "final_threshold"):
+        if key in source_metadata:
+            meta[key] = source_metadata.get(key)
     if not (package_dir / SUCCESS_FILENAME).is_file():
         meta["missing_reason"] = f"Missing {SUCCESS_FILENAME}"
     return meta

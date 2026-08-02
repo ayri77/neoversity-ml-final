@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -166,22 +167,56 @@ def _load_results(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AppTest:
 def test_results_page_has_research_workspace_tabs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _write_research_run(
-        tmp_path,
-        plan="telecom_v3_development_r2x5_t3_v1",
-        adapter="manual_lightgbm_te_v1_compat",
-        run_id="20260729T070702417916Z_38bbefe2",
-        ba=0.897453,
-    )
-    at = _load_results(monkeypatch, tmp_path)
-    assert not at.exception
-    tab_labels = [tab.label for tab in at.tabs]
-    assert tab_labels == [
+    del tmp_path, monkeypatch
+    import apps.experiment_control_panel as panel
+
+    view_labels = [
         "Experiments",
         "Inspect result",
         "Compare experiments",
         "Research Workspace",
     ]
+    calls: list[str] = []
+    loaded = panel.registry()
+
+    class _Session(dict):
+        def pop(self, key, default=None):
+            return dict.pop(self, key, default)
+
+    with (
+        patch.object(panel, "st") as fake_st,
+        patch.object(panel, "ArchiveRegistry"),
+        patch.object(
+            panel,
+            "_results_experiments_tab",
+            side_effect=lambda *a, **k: calls.append("Experiments"),
+        ),
+        patch.object(
+            panel,
+            "_results_inspect_tab",
+            side_effect=lambda *a, **k: calls.append("Inspect result"),
+        ),
+        patch.object(
+            panel,
+            "_results_compare_tab",
+            side_effect=lambda *a, **k: calls.append("Compare experiments"),
+        ),
+        patch.object(
+            panel,
+            "_results_research_workspace_tab",
+            side_effect=lambda *a, **k: calls.append("Research Workspace"),
+        ),
+    ):
+        fake_st.session_state = _Session({"results-active-view": "Research Workspace"})
+        fake_st.checkbox.return_value = False
+        fake_st.segmented_control.return_value = "Research Workspace"
+        panel.results_page()
+        options = fake_st.segmented_control.call_args.kwargs.get("options") or list(
+            fake_st.segmented_control.call_args.args[1]
+        )
+    assert options == view_labels
+    assert calls == ["Research Workspace"]
+    assert loaded is not None
 
 
 def test_experiment_table_has_required_columns(

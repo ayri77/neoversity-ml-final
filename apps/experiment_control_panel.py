@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections import Counter
 from dataclasses import replace
@@ -85,16 +86,27 @@ from src.churn_ml.competition_assets_v1 import (  # noqa: E402
 )
 from src.churn_ml.blending.artifact_v1 import load_blend_artifact  # noqa: E402
 from src.churn_ml.control_panel.blend_page import (  # noqa: E402
+    load_cached_candidate_inventory,
     render_blend_workspace_page,
 )
 from src.churn_ml.control_panel.blend_workspace import (  # noqa: E402
     apply_canonical_submission_handoff,
     authorized_submission_argv_values,
-    discover_candidate_rows,
     load_validated_submission_csv_bytes,
     readiness_label,
     resolve_canonical_submission_handoff,
     suggest_submission_id,
+)
+from src.churn_ml.control_panel.fs_signatures import (  # noqa: E402
+    path_stat_mapping,
+)
+from src.churn_ml.control_panel.performance import (  # noqa: E402
+    begin_render,
+    enable_performance,
+    performance_enabled,
+    performance_stage,
+    record_counter,
+    render_performance_expander,
 )
 from src.churn_ml.prediction_candidates.contract_v1 import (  # noqa: E402
     MANIFEST_FILENAME as CANDIDATE_MANIFEST_FILENAME,
@@ -323,7 +335,8 @@ def dashboard_page() -> None:
         "Local operational control panel. Filesystem experiment artifacts remain "
         "authoritative; UI job records do not."
     )
-    jobs = job_manager(loaded).list_jobs()
+    with performance_stage("dashboard_jobs_list"):
+        jobs = job_manager(loaded).list_jobs(refresh=False)
     counts = Counter(str(item.status["state"]) for item in jobs)
     columns = st.columns(4)
     for column, state in zip(
@@ -1253,6 +1266,39 @@ def _compare_id_widget(
     return str(comparison_id).strip() or suggested_id
 
 
+@st.cache_data(show_spinner=False)
+def _cached_selected_submission_readiness(
+    root: str,
+    candidate_id: str,
+    fingerprint: str,
+) -> dict[str, Any]:
+    del fingerprint
+    return evaluate_submission_readiness(
+        candidate_id, repository_root=Path(root)
+    )
+
+
+def _selected_candidate_readiness_fingerprint(candidate_id: str) -> str:
+    package_dir = (
+        REPOSITORY_ROOT / "artifacts" / "prediction_candidates" / candidate_id
+    )
+    return json.dumps(
+        {
+            "candidate_id": candidate_id,
+            "manifest": path_stat_mapping(
+                package_dir / CANDIDATE_MANIFEST_FILENAME, relative="manifest"
+            ),
+            "success": path_stat_mapping(
+                package_dir / "_SUCCESS", relative="success"
+            ),
+            "source_metadata": path_stat_mapping(
+                package_dir / "source_metadata.json", relative="source_metadata"
+            ),
+        },
+        sort_keys=True,
+    )
+
+
 def _canonical_candidate_submission_controls(
     loaded: ControlPanelRegistry,
     *,
@@ -1261,7 +1307,11 @@ def _canonical_candidate_submission_controls(
 ) -> None:
     """Generate submission path for canonical prediction candidates."""
     st.subheader("Canonical prediction candidate")
-    rows = discover_candidate_rows(REPOSITORY_ROOT, include_readiness=True)
+    if st.button("Refresh candidates", key="canonical-refresh-candidates"):
+        load_cached_candidate_inventory(REPOSITORY_ROOT, force_refresh=True)
+        _cached_selected_submission_readiness.clear()
+    with performance_stage("run_canonical_candidate_inventory"):
+        rows = load_cached_candidate_inventory(REPOSITORY_ROOT)
     if not rows:
         st.info("No canonical prediction candidates are available.")
         return
@@ -1296,9 +1346,13 @@ def _canonical_candidate_submission_controls(
         allowed=options,
     )
     selected = next(row for row in rows if row["candidate_id"] == selected_id)
-    readiness = evaluate_submission_readiness(
-        selected_id, repository_root=REPOSITORY_ROOT
-    )
+    with performance_stage("run_selected_readiness"):
+        readiness = _cached_selected_submission_readiness(
+            str(REPOSITORY_ROOT),
+            selected_id,
+            _selected_candidate_readiness_fingerprint(selected_id),
+        )
+        record_counter("selected_readiness_evaluations", 1)
     st.write(
         {
             "Model / Blend": selected.get("label"),
@@ -1782,7 +1836,9 @@ def jobs_page() -> None:
         st.error(f"Archive registry unavailable: {error}")
         return
     show_archived = st.checkbox("Show archived", value=False, key="jobs-show-archived")
-    jobs = manager.list_jobs()
+    # List from lightweight job.json/status.json; refresh only the selected job.
+    with performance_stage("jobs_list"):
+        jobs = manager.list_jobs(refresh=False)
     archived_ids = archive.archived_ui_job_ids()
     if show_archived:
         visible = jobs
@@ -1822,7 +1878,8 @@ def jobs_page() -> None:
         allowed=job_ids,
     )
     st.caption(f"Job ID: `{selected}`")
-    record = manager.refresh(selected)
+    with performance_stage("jobs_selected_refresh"):
+        record = manager.refresh(selected)
     status = record.status
     is_archived = selected in archived_ids
     if is_archived:
@@ -1852,33 +1909,63 @@ def jobs_page() -> None:
                 "separately without changing job status."
                 + (f" ({index_result.message})" if index_result.message else "")
             )
-    summary_tab, stdout_tab, stderr_tab, references_tab, technical_tab = st.tabs(
-        ["Summary", "stdout", "stderr", "References", "Technical details"]
+    job_view_options = (
+        "Summary",
+        "stdout",
+        "stderr",
+        "References",
+        "Technical details",
     )
-    with summary_tab:
-        _render_job_structured_summary(record)
-    with stdout_tab:
-        _render_job_log_viewer(
-            record,
-            log_name="stdout.log",
-            default_lines=loaded.settings.log_tail_lines,
-        )
-    with stderr_tab:
-        _render_job_log_viewer(
-            record,
-            log_name="stderr.log",
-            default_lines=loaded.settings.log_tail_lines,
-        )
-    with references_tab:
-        _render_job_references(record)
-    with technical_tab:
-        st.json(dict(record.job), expanded=False)
-        st.caption(
-            f"PID: {status.get('pid') or '—'}  |  "
-            f"Exit code: {status.get('exit_code') if status.get('exit_code') is not None else '—'}"
-        )
-        with st.expander("Technical command", expanded=False):
-            st.code(display_argv(tuple(record.command["argv"])), language="python")
+    job_view_key = "jobs-active-view"
+    job_view_durable = ui_durable_key("jobs", "active_view")
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=job_view_key,
+        durable_key=job_view_durable,
+        allowed=list(job_view_options),
+        default=job_view_options[0],
+    )
+    selected_view = st.segmented_control(
+        "Job details",
+        options=list(job_view_options),
+        key=job_view_key,
+    )
+    if selected_view not in job_view_options:
+        selected_view = job_view_options[0]
+        st.session_state[job_view_key] = selected_view
+    remember_durable_value(
+        st.session_state,
+        durable_key=job_view_durable,
+        value=selected_view,
+        allowed=list(job_view_options),
+    )
+    with performance_stage(f"jobs_view:{selected_view}"):
+        if selected_view == "Summary":
+            _render_job_structured_summary(record)
+        elif selected_view == "stdout":
+            _render_job_log_viewer(
+                record,
+                log_name="stdout.log",
+                default_lines=loaded.settings.log_tail_lines,
+            )
+        elif selected_view == "stderr":
+            _render_job_log_viewer(
+                record,
+                log_name="stderr.log",
+                default_lines=loaded.settings.log_tail_lines,
+            )
+        elif selected_view == "References":
+            _render_job_references(record)
+        else:
+            st.json(dict(record.job), expanded=False)
+            st.caption(
+                f"PID: {status.get('pid') or '—'}  |  "
+                f"Exit code: {status.get('exit_code') if status.get('exit_code') is not None else '—'}"
+            )
+            with st.expander("Technical command", expanded=False):
+                st.code(
+                    display_argv(tuple(record.command["argv"])), language="python"
+                )
     if loaded.settings.allow_process_stop and status["state"] == "running":
         stop_confirmed = st.checkbox(
             "I confirm that I want to stop this process group."
@@ -2270,26 +2357,122 @@ def results_page() -> None:
     show_archived = st.checkbox(
         "Show archived", value=False, key="results-show-archived"
     )
-    experiments_tab, inspect_tab, compare_tab, research_tab = st.tabs(
-        [
-            "Experiments",
-            "Inspect result",
-            "Compare experiments",
-            "Research Workspace",
-        ]
+    results_view_options = (
+        "Experiments",
+        "Inspect result",
+        "Compare experiments",
+        "Research Workspace",
     )
-    with experiments_tab:
-        _results_experiments_tab(
-            loaded, archive=archive, show_archived=show_archived
-        )
-    with inspect_tab:
-        _results_inspect_tab(loaded, archive=archive, show_archived=show_archived)
-    with compare_tab:
-        _results_compare_tab(loaded, archive=archive, show_archived=show_archived)
-    with research_tab:
-        _results_research_workspace_tab(
-            loaded, archive=archive, show_archived=show_archived
-        )
+    results_view_key = "results-active-view"
+    results_view_durable = ui_durable_key("results", "active_view")
+    sync_widget_with_durable(
+        st.session_state,
+        widget_key=results_view_key,
+        durable_key=results_view_durable,
+        allowed=list(results_view_options),
+        default=results_view_options[0],
+    )
+    selected_view = st.segmented_control(
+        "Results view",
+        options=list(results_view_options),
+        key=results_view_key,
+    )
+    if selected_view not in results_view_options:
+        selected_view = results_view_options[0]
+        st.session_state[results_view_key] = selected_view
+    remember_durable_value(
+        st.session_state,
+        durable_key=results_view_durable,
+        value=selected_view,
+        allowed=list(results_view_options),
+    )
+    with performance_stage(f"results_view:{selected_view}"):
+        if selected_view == "Experiments":
+            _results_experiments_tab(
+                loaded, archive=archive, show_archived=show_archived
+            )
+        elif selected_view == "Inspect result":
+            _results_inspect_tab(
+                loaded, archive=archive, show_archived=show_archived
+            )
+        elif selected_view == "Compare experiments":
+            _results_compare_tab(
+                loaded, archive=archive, show_archived=show_archived
+            )
+        else:
+            _results_research_workspace_tab(
+                loaded, archive=archive, show_archived=show_archived
+            )
+
+
+@st.cache_data(show_spinner="Scanning artifacts…")
+def _cached_discover_artifacts(
+    root: str,
+    reader_id: str,
+    fingerprint: str,
+) -> list[dict[str, Any]]:
+    """Cache contract: reader inventory rows keyed by cheap root fingerprint."""
+    del fingerprint
+    loaded = registry()
+    reader = loaded.readers[reader_id]
+    records = discover_artifacts(Path(root), reader)
+    return [
+        {
+            "reader_id": item.reader_id,
+            "root": str(item.root),
+            "relative_path": item.relative_path,
+            "state": item.state,
+            "summaries": dict(item.summaries),
+            "json_payloads": dict(item.json_payloads),
+            "diagnostic": item.diagnostic,
+        }
+        for item in records
+    ]
+
+
+def _reader_inventory_fingerprint(reader: Any) -> str:
+    entries: list[dict[str, Any]] = []
+    for configured_root in reader.artifact_roots:
+        absolute = REPOSITORY_ROOT / configured_root
+        if not absolute.is_dir():
+            entries.append(
+                {
+                    "root": configured_root,
+                    "exists": False,
+                    "size": None,
+                    "mtime_ns": None,
+                    "child_names": [],
+                }
+            )
+            continue
+        try:
+            stat = absolute.stat()
+            # Scandir names are cheap and invalidate when packages appear/disappear.
+            with os.scandir(absolute) as iterator:
+                child_names = sorted(entry.name for entry in iterator)
+            entries.append(
+                {
+                    "root": configured_root,
+                    "exists": True,
+                    "size": int(getattr(stat, "st_size", 0) or 0),
+                    "mtime_ns": int(getattr(stat, "st_mtime_ns", 0) or 0),
+                    "child_names": child_names,
+                }
+            )
+        except OSError:
+            entries.append(
+                {
+                    "root": configured_root,
+                    "exists": False,
+                    "size": None,
+                    "mtime_ns": None,
+                    "child_names": [],
+                }
+            )
+    return json.dumps(
+        {"reader_id": reader.id, "glob": reader.discovery_glob, "entries": entries},
+        sort_keys=True,
+    )
 
 
 def _visible_results_artifacts(
@@ -2300,7 +2483,33 @@ def _visible_results_artifacts(
     show_archived: bool,
 ) -> list[ArtifactRecord]:
     reader = loaded.readers[reader_id]
-    artifacts = discover_artifacts(REPOSITORY_ROOT, reader)
+    if st.session_state.pop(f"results-force-refresh-{reader_id}", None):
+        _cached_discover_artifacts.clear()
+    refresh = st.button(
+        "Refresh artifact inventory",
+        key=f"results-refresh-{reader_id}",
+    )
+    if refresh:
+        _cached_discover_artifacts.clear()
+    fingerprint = _reader_inventory_fingerprint(reader)
+    with performance_stage(f"results_discover:{reader_id}"):
+        payloads = _cached_discover_artifacts(
+            str(REPOSITORY_ROOT),
+            reader_id,
+            fingerprint,
+        )
+    artifacts = [
+        ArtifactRecord(
+            reader_id=item["reader_id"],
+            root=Path(item["root"]),
+            relative_path=item["relative_path"],
+            state=item["state"],
+            summaries=item["summaries"],
+            json_payloads=item["json_payloads"],
+            diagnostic=item.get("diagnostic"),
+        )
+        for item in payloads
+    ]
     return archive.filter_artifacts(
         artifacts, reader_id=reader_id, show_archived=show_archived
     )
@@ -3711,6 +3920,20 @@ def configuration_page() -> None:
     if st.button("Reload registry files"):
         registry.clear()
         st.rerun()
+    st.subheader("Diagnostics")
+    perf_enabled = st.checkbox(
+        "Enable performance diagnostics (session)",
+        value=performance_enabled(),
+        key="config-perf-enabled",
+        help=(
+            "Records stage timings in memory for this Streamlit process. "
+            "Also enabled by CHURN_ML_CONTROL_PANEL_PERF=1. Does not write "
+            "profiling files under artifacts/."
+        ),
+    )
+    enable_performance(perf_enabled)
+    if perf_enabled:
+        render_performance_expander()
     st.subheader("Registry overview")
     st.dataframe(
         [
@@ -4736,11 +4959,28 @@ def _all_artifacts(loaded: ControlPanelRegistry) -> list[ArtifactRecord]:
     except ArchiveError:
         archived = frozenset()
     records: list[ArtifactRecord] = []
-    for reader in loaded.readers.values():
-        for item in discover_artifacts(REPOSITORY_ROOT, reader):
-            if (reader.id, item.relative_path) in archived:
-                continue
-            records.append(item)
+    with performance_stage("dashboard_all_artifacts"):
+        for reader in loaded.readers.values():
+            fingerprint = _reader_inventory_fingerprint(reader)
+            payloads = _cached_discover_artifacts(
+                str(REPOSITORY_ROOT),
+                reader.id,
+                fingerprint,
+            )
+            for item in payloads:
+                if (reader.id, item["relative_path"]) in archived:
+                    continue
+                records.append(
+                    ArtifactRecord(
+                        reader_id=item["reader_id"],
+                        root=Path(item["root"]),
+                        relative_path=item["relative_path"],
+                        state=item["state"],
+                        summaries=item["summaries"],
+                        json_payloads=item["json_payloads"],
+                        diagnostic=item.get("diagnostic"),
+                    )
+                )
     return records
 
 
@@ -4793,6 +5033,7 @@ def blend_page() -> None:
 
 
 def main() -> None:
+    begin_render()
     try:
         registry()
     except SchemaError as error:
@@ -4807,6 +5048,7 @@ def main() -> None:
         st.Page(configuration_page, title="Configuration", icon=":material/settings:"),
     ]
     st.navigation(pages).run()
+    render_performance_expander()
 
 
 if __name__ == "__main__":
