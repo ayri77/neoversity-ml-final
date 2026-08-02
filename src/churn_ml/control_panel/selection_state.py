@@ -68,16 +68,23 @@ def get_durable_value(session_state: Any, key: str) -> Any | None:
 
 
 def set_durable_value(session_state: Any, key: str, value: Any) -> None:
-    store = _session_mapping_get(session_state, LOGICAL_SELECTION_KEY)
-    if not isinstance(store, dict):
-        store = {}
-        _session_mapping_set(session_state, LOGICAL_SELECTION_KEY, store)
+    existing = _session_mapping_get(session_state, LOGICAL_SELECTION_KEY)
+    store = dict(existing) if isinstance(existing, dict) else {}
     if value in (None, ""):
         store.pop(key, None)
-        _session_mapping_set(session_state, LOGICAL_SELECTION_KEY, store)
-        return
-    store[key] = value
+    else:
+        store[key] = value
     _session_mapping_set(session_state, LOGICAL_SELECTION_KEY, store)
+
+
+def force_session_value(session_state: Any, key: str, value: Any) -> None:
+    """Set session state even when a widget key already exists in this run.
+
+    Prefer calling this before widgets are instantiated. When a widget key is
+    already live, writes go through Streamlit's mutable inner mapping so Load /
+    resume flows do not raise StreamlitAPIException.
+    """
+    _session_mapping_set(session_state, key, value)
 
 
 def _session_mapping_get(session_state: Any, key: str, default: Any = None) -> Any:
@@ -97,13 +104,20 @@ def _session_mapping_set(session_state: Any, key: str, value: Any) -> None:
     if isinstance(session_state, dict):
         session_state[key] = value
         return
-    inner = getattr(getattr(session_state, "_state", None), "_new_session_state", None)
+    state = getattr(session_state, "_state", None)
+    inner = getattr(state, "_new_session_state", None)
     if isinstance(inner, dict):
         inner[key] = value
     try:
         session_state[key] = value
     except Exception:
         if isinstance(inner, dict):
+            return
+        # Last-resort write for environments where only the proxy rejects the key.
+        if state is not None and hasattr(state, "_new_session_state"):
+            if not isinstance(state._new_session_state, dict):
+                state._new_session_state = {}
+            state._new_session_state[key] = value
             return
         raise
 

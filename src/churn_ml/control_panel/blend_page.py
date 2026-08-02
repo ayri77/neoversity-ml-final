@@ -11,6 +11,7 @@ import streamlit as st
 from src.churn_ml.blending.artifact_v1 import load_blend_artifact
 from src.churn_ml.control_panel.blend_ui_request_v1 import (
     BlendUIRequestError,
+    load_blend_ui_request,
     materialize_blend_ui_request,
     method_to_strategy_optimizer,
 )
@@ -34,11 +35,17 @@ from src.churn_ml.control_panel.blend_workspace import (
     run_compatibility,
     run_diversity,
     selection_fingerprint,
-    verify_search_result,
 )
 from src.churn_ml.control_panel.candidate_preparation_page import (
     render_prepare_candidates_tab,
 )
+from src.churn_ml.control_panel.saved_blend_search import (
+    consume_loaded_blend_configuration_pending,
+    load_persisted_blend_configuration,
+    recover_search_for_request,
+    resolve_displayed_search_job_id,
+)
+from src.churn_ml.control_panel.search_history_page import render_search_history_tab
 from src.churn_ml.control_panel.command_builder import build_command
 from src.churn_ml.control_panel.jobs import JobError, JobManager
 from src.churn_ml.control_panel.launch import (
@@ -104,13 +111,21 @@ def render_blend_workspace_page(
         "evaluate a leakage-safe blend, and prepare the result for submission."
     )
 
-    tab_labels = ("Prepare candidates", "Build blend", "Materialized blends")
+    # Apply durable loaded configuration before any tab widgets are created.
+    _apply_loaded_blend_configuration(repository_root)
+
+    tab_labels = (
+        "Prepare candidates",
+        "Build blend",
+        "Search history",
+        "Materialized blends",
+    )
     preferred = st.session_state.pop(_state_key("active_tab"), None)
     if preferred in tab_labels:
         # Streamlit tabs do not support programmatic selection reliably; surface
         # a clear cue when another tab requested navigation.
         st.info(f"Open the **{preferred}** tab to continue.")
-    prepare_tab, build_tab, materialized_tab = st.tabs(tab_labels)
+    prepare_tab, build_tab, history_tab, materialized_tab = st.tabs(tab_labels)
     with prepare_tab:
         render_prepare_candidates_tab(
             repository_root=repository_root,
@@ -119,6 +134,12 @@ def render_blend_workspace_page(
         )
     with build_tab:
         _render_build_blend_tab(
+            repository_root=repository_root,
+            registry=registry,
+            job_manager=job_manager,
+        )
+    with history_tab:
+        render_search_history_tab(
             repository_root=repository_root,
             registry=registry,
             job_manager=job_manager,
@@ -142,6 +163,8 @@ def _render_build_blend_tab(
             "compatibility",
             "diversity",
             "search_result",
+            "search_job_id",
+            "search_request_id",
             "request_path",
             "request_id",
             "request_obj",
@@ -160,6 +183,8 @@ def _render_build_blend_tab(
             "compatibility",
             "diversity",
             "search_result",
+            "search_job_id",
+            "search_request_id",
             "request_path",
             "request_id",
             "request_obj",
@@ -404,12 +429,120 @@ def _render_diversity(repository_root: Path, selected_ids: list[str]) -> None:
         st.json(result.get("raw") or result)
 
 
+def _apply_loaded_blend_configuration(repository_root: Path) -> None:
+    config = load_persisted_blend_configuration(st.session_state)
+    if not config:
+        return
+    volatile_pending = bool(
+        st.session_state.pop(_state_key("pending_loaded_config"), None)
+    )
+    pending = consume_loaded_blend_configuration_pending(st.session_state) or (
+        volatile_pending
+    )
+    if pending:
+        # This runs before any Blend widgets are created, so direct assignment is safe
+        # and required for Streamlit number_input/radio keys to pick up values.
+        st.session_state[_state_key("show_loaded_config_message")] = True
+        selected = list(config.get("candidate_ids") or [])
+        st.session_state[_state_key("selected_ids")] = selected
+        st.session_state[_state_key("selection_fp")] = selection_fingerprint(selected)
+        st.session_state[_state_key("method")] = str(
+            config.get("method") or "optimized_native"
+        )
+        st.session_state[_state_key("folds")] = int(config.get("folds") or 5)
+        st.session_state[_state_key("repeats")] = int(config.get("repeats") or 2)
+        st.session_state[_state_key("seed")] = int(config.get("seed") or 42)
+        max_active = config.get("max_active_models")
+        st.session_state[_state_key("max_active")] = (
+            0 if max_active is None else int(max_active)
+        )
+        if config.get("dirichlet_draws") is not None:
+            st.session_state[_state_key("dirichlet_draws")] = int(
+                config["dirichlet_draws"]
+            )
+        if config.get("pairwise_grid_step") is not None:
+            st.session_state[_state_key("pairwise_grid_step")] = float(
+                config["pairwise_grid_step"]
+            )
+        if config.get("optuna_trials") is not None:
+            st.session_state[_state_key("optuna_trials")] = int(config["optuna_trials"])
+        if config.get("optuna_seed") is not None:
+            st.session_state[_state_key("optuna_seed")] = int(config["optuna_seed"])
+        st.session_state.pop(_state_key("search_job_id"), None)
+        st.session_state.pop(_state_key("search_result"), None)
+    else:
+        if _state_key("selected_ids") not in st.session_state and config.get(
+            "candidate_ids"
+        ):
+            st.session_state[_state_key("selected_ids")] = list(config["candidate_ids"])
+        for key, value in (
+            ("method", config.get("method")),
+            ("folds", config.get("folds")),
+            ("repeats", config.get("repeats")),
+            ("seed", config.get("seed")),
+        ):
+            if value is not None and _state_key(key) not in st.session_state:
+                st.session_state[_state_key(key)] = value
+        if _state_key("max_active") not in st.session_state:
+            max_active = config.get("max_active_models")
+            st.session_state[_state_key("max_active")] = (
+                0 if max_active is None else int(max_active)
+            )
+
+    if _state_key("request_obj") in st.session_state and not pending:
+        if st.session_state.pop(_state_key("show_loaded_config_message"), None):
+            st.info(
+                "Configuration loaded. Open Build blend to inspect or duplicate it."
+            )
+        return
+    request_path = str(config.get("request_path") or config.get("request_id") or "")
+    if not request_path:
+        if st.session_state.pop(_state_key("show_loaded_config_message"), None):
+            st.info(
+                "Configuration loaded. Open Build blend to inspect or duplicate it."
+            )
+        return
+    try:
+        request = load_blend_ui_request(
+            request_path, repository_root=repository_root
+        )
+        blend_id = expected_blend_id(request, repository_root)
+        st.session_state[_state_key("request_obj")] = request
+        st.session_state[_state_key("request_path")] = request.relative_path
+        st.session_state[_state_key("request_id")] = request.request_id
+        st.session_state[_state_key("expected_blend_id")] = blend_id
+        st.session_state[_state_key("search_request_id")] = request.request_id
+    except Exception as error:  # noqa: BLE001
+        if pending:
+            st.session_state[_state_key("loaded_config_warning")] = str(error)
+
+    if st.session_state.pop(_state_key("show_loaded_config_message"), None):
+        st.info("Configuration loaded. Open Build blend to inspect or duplicate it.")
+    warning = st.session_state.pop(_state_key("loaded_config_warning"), None)
+    if warning:
+        st.warning(f"Loaded configuration widgets, but request restore failed: {warning}")
+
+
 def _render_configuration_and_request(
     repository_root: Path,
     selected_ids: list[str],
     rows: list[dict[str, Any]],
 ):
     st.subheader("Blend configuration")
+    if _state_key("folds") not in st.session_state:
+        st.session_state[_state_key("folds")] = 5
+    if _state_key("repeats") not in st.session_state:
+        st.session_state[_state_key("repeats")] = 2
+    if _state_key("seed") not in st.session_state:
+        st.session_state[_state_key("seed")] = 42
+    if _state_key("max_active") not in st.session_state:
+        st.session_state[_state_key("max_active")] = 0
+    if _state_key("dirichlet_draws") not in st.session_state:
+        st.session_state[_state_key("dirichlet_draws")] = 32
+    if _state_key("pairwise_grid_step") not in st.session_state:
+        st.session_state[_state_key("pairwise_grid_step")] = 0.1
+    if _state_key("optuna_trials") not in st.session_state:
+        st.session_state[_state_key("optuna_trials")] = 200
     with st.form(_state_key("config_form")):
         method = st.radio(
             "Method",
@@ -417,19 +550,36 @@ def _render_configuration_and_request(
             format_func=lambda value: METHOD_OPTIONS[value],
             key=_state_key("method"),
         )
-        folds = st.number_input("Meta-CV folds", min_value=2, max_value=20, value=5)
-        repeats = st.number_input("Meta-CV repeats", min_value=1, max_value=20, value=2)
-        seed = st.number_input("Random seed", min_value=0, max_value=2_147_483_647, value=42)
+        folds = st.number_input(
+            "Meta-CV folds",
+            min_value=2,
+            max_value=20,
+            key=_state_key("folds"),
+        )
+        repeats = st.number_input(
+            "Meta-CV repeats",
+            min_value=1,
+            max_value=20,
+            key=_state_key("repeats"),
+        )
+        seed = st.number_input(
+            "Random seed",
+            min_value=0,
+            max_value=2_147_483_647,
+            key=_state_key("seed"),
+        )
         max_active = st.number_input(
             "Maximum active models (0 = unlimited)",
             min_value=0,
             max_value=10,
-            value=0,
+            key=_state_key("max_active"),
         )
         manual_weights: dict[str, float] = {}
-        dirichlet_draws = 32
-        pairwise_grid_step = 0.1
-        optuna_trials = 200
+        dirichlet_draws = int(st.session_state.get(_state_key("dirichlet_draws")) or 32)
+        pairwise_grid_step = float(
+            st.session_state.get(_state_key("pairwise_grid_step")) or 0.1
+        )
+        optuna_trials = int(st.session_state.get(_state_key("optuna_trials")) or 200)
         optuna_timeout: float | None = None
         optuna_seed = int(seed)
         if method == "manual":
@@ -454,25 +604,45 @@ def _render_configuration_and_request(
                 "from meta-training rows inside each fold."
             )
             optuna_trials = int(
-                st.number_input("Trials", min_value=1, max_value=5000, value=200)
+                st.number_input(
+                    "Trials",
+                    min_value=1,
+                    max_value=5000,
+                    key=_state_key("optuna_trials"),
+                )
             )
-            timeout_raw = st.text_input("Optional timeout seconds", value="")
+            timeout_raw = st.text_input(
+                "Optional timeout seconds",
+                value="",
+                key=_state_key("optuna_timeout"),
+            )
             optuna_timeout = float(timeout_raw) if timeout_raw.strip() else None
+            if _state_key("optuna_seed") not in st.session_state:
+                st.session_state[_state_key("optuna_seed")] = int(seed)
             optuna_seed = int(
-                st.number_input("Optuna seed", min_value=0, value=int(seed))
+                st.number_input(
+                    "Optuna seed",
+                    min_value=0,
+                    key=_state_key("optuna_seed"),
+                )
             )
         if method == "optimized_native":
             with st.expander("Advanced settings", expanded=False):
                 dirichlet_draws = int(
-                    st.number_input("Dirichlet draws", min_value=1, max_value=512, value=32)
+                    st.number_input(
+                        "Dirichlet draws",
+                        min_value=1,
+                        max_value=512,
+                        key=_state_key("dirichlet_draws"),
+                    )
                 )
                 pairwise_grid_step = float(
                     st.number_input(
                         "Pairwise grid step",
                         min_value=0.01,
                         max_value=0.5,
-                        value=0.1,
                         step=0.01,
+                        key=_state_key("pairwise_grid_step"),
                     )
                 )
         submitted = st.form_submit_button("Prepare blend request")
@@ -511,6 +681,8 @@ def _render_configuration_and_request(
             prior = st.session_state.get(_state_key("search_request_id"))
             if prior != request.request_id:
                 st.session_state.pop(_state_key("search_result"), None)
+                st.session_state.pop(_state_key("search_job_id"), None)
+                st.session_state.pop(_state_key("search_request_id"), None)
         except (BlendUIRequestError, BlendWorkspaceError, Exception) as error:
             st.error(str(error))
             return None
@@ -625,11 +797,7 @@ def _render_search_and_materialize(
         except (LaunchAuthorizationError, JobError) as error:
             st.error(str(error))
 
-    job_id = st.session_state.get(_state_key("search_job_id"))
-    if job_id:
-        st.info(f"Latest search job: `{job_id}`")
-
-    # Recover completed search for this request.
+    # Recover completed search for this exact request from durable Jobs.
     jobs_root = Path(registry.settings.jobs_root)
     if not jobs_root.is_absolute():
         jobs_root = repository_root / jobs_root
@@ -637,6 +805,22 @@ def _render_search_and_materialize(
         jobs_root, request.request_id, command_id="prediction_blend_v1"
     )
     search_jobs = [item for item in related if item.get("action_id") == "search"]
+    displayed_job_id = resolve_displayed_search_job_id(
+        session_job_id=st.session_state.get(_state_key("search_job_id")),
+        session_request_id=st.session_state.get(_state_key("search_request_id")),
+        current_request_id=request.request_id,
+        request_search_job_ids=[
+            str(item.get("job_id") or "") for item in search_jobs
+        ],
+    )
+    if displayed_job_id is None:
+        st.session_state.pop(_state_key("search_job_id"), None)
+        if st.session_state.get(_state_key("search_request_id")) != request.request_id:
+            st.session_state.pop(_state_key("search_result"), None)
+            st.session_state.pop(_state_key("search_request_id"), None)
+    else:
+        st.info(f"Latest search job: `{displayed_job_id}`")
+
     if search_jobs:
         latest = search_jobs[0]
         job_state = latest.get("state")
@@ -649,18 +833,21 @@ def _render_search_and_materialize(
         )
         if job_state == "succeeded":
             try:
-                stdout = (
-                    jobs_root / str(latest["job_id"]) / "stdout.log"
-                ).read_text(encoding="utf-8", errors="replace")
-                payload = verify_search_result(
-                    parse_job_stdout_json(stdout),
-                    request_id=request.request_id,
-                    expected_blend_id=st.session_state.get(
+                recovered = recover_search_for_request(
+                    jobs_root=jobs_root,
+                    request=request,
+                    expected_blend_id_value=st.session_state.get(
                         _state_key("expected_blend_id")
                     ),
                 )
-                st.session_state[_state_key("search_result")] = payload
-                st.session_state[_state_key("search_request_id")] = request.request_id
+                if recovered and recovered.get("payload") is not None:
+                    st.session_state[_state_key("search_result")] = recovered["payload"]
+                    st.session_state[_state_key("search_request_id")] = (
+                        request.request_id
+                    )
+                    st.session_state[_state_key("search_job_id")] = recovered.get(
+                        "job_id"
+                    )
             except BlendWorkspaceError as error:
                 st.error(str(error))
                 with st.expander("Technical details", expanded=False):
@@ -679,6 +866,10 @@ def _render_search_and_materialize(
     result = st.session_state.get(_state_key("search_result"))
     if not result or st.session_state.get(_state_key("search_request_id")) != request.request_id:
         return
+    st.success("Search completed and available in Search history.")
+    if st.button("Open Search history", key=_state_key("open_search_history")):
+        st.session_state[_state_key("active_tab")] = "Search history"
+        st.info("Open the **Search history** tab to continue.")
     _render_search_result(result, rows)
     _render_materialize_controls(
         repository_root=repository_root,
@@ -762,8 +953,10 @@ def _render_materialize_controls(
 ) -> None:
     st.subheader("Materialization")
     st.write(
-        "This writes an immutable detailed blend artifact and a canonical "
-        "prediction candidate."
+        "Materialization uses the exact prepared immutable request. "
+        "The current backend deterministically re-evaluates that request before "
+        "writing the immutable blend artifact and canonical candidate. "
+        "It does not retrain the source models."
     )
     confirm = st.checkbox(
         "I confirm materialization of this exact search request.",
